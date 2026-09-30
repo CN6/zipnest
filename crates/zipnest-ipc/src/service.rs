@@ -75,9 +75,7 @@ fn children_of<'a>(entries: &'a [ArchiveEntry], dir: &str) -> Vec<&'a ArchiveEnt
 pub struct IpcService {
     /// Exposed read-only for the Tauri glue (resolve an entry for preview).
     pub registry: ArchiveRegistry,
-    #[allow(dead_code)] // consumed by the extract step
     jobs: archive_jobs::JobManager,
-    #[allow(dead_code)] // consumed by the extract step
     emit: Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>,
 }
 
@@ -166,5 +164,103 @@ impl IpcService {
         self.registry
             .get(id)
             .ok_or_else(|| IpcError::new("error.not_an_archive"))
+    }
+
+    /// Cooperative cancel of a queued/running job. Unknown ids return false.
+    pub fn cancel(&self, job_id: u64) -> bool {
+        self.jobs.cancel(job_id)
+    }
+
+    /// Queue an extract job (behind any active one) and return its id.
+    ///
+    /// The runner holds the archive's mutex for the whole extraction —
+    /// other commands on the same archive wait (single-archive-at-a-time
+    /// is the M2 model; the UI only ever has one heavy job running).
+    pub fn extract(
+        &self,
+        id: u64,
+        paths: Vec<String>,
+        dest: String,
+        overwrite: bool,
+        password: Option<String>,
+    ) -> Result<u64, IpcError> {
+        if dest.trim().is_empty() {
+            return Err(IpcError::new("error.io"));
+        }
+        let shared = self.lock_archive(id)?;
+        let emit = Arc::clone(&self.emit);
+
+        let job_id = self.jobs.submit("extract", Box::new(move |ctx| {
+            let guard = shared.lock().map_err(|_| "error.engine".to_string())?;
+            let entries = guard.0.entries().map_err(|e| e.error_key().to_string())?;
+
+            // Expand the selection: directories contribute all nested files.
+            let sel_norm: Vec<String> = paths.iter().map(|p| p.replace('\\', "/")).collect();
+            let mut wanted: Vec<u32> = Vec::new();
+            for sel in &sel_norm {
+                let sel = sel.trim_end_matches('/');
+                let is_dir = entries
+                    .iter()
+                    .any(|e| e.path.replace('\\', "/").trim_end_matches('/') == sel && e.is_dir);
+                for e in &entries {
+                    let p = e.path.replace('\\', "/");
+                    let p = p.trim_end_matches('/');
+                    let hit = if is_dir {
+                        p.starts_with(&format!("{sel}/"))
+                    } else {
+                        p == sel
+                    };
+                    if hit && !e.is_dir && !wanted.contains(&e.index) {
+                        wanted.push(e.index);
+                    }
+                }
+            }
+            if wanted.is_empty() {
+                return Err("error.not_an_archive".into());
+            }
+            let total_items = wanted.len() as u64;
+            let total_bytes: u64 = entries
+                .iter()
+                .filter(|e| wanted.contains(&e.index))
+                .map(|e| e.size)
+                .sum();
+
+            let opts = archive_core::ExtractOptions {
+                dest: std::path::PathBuf::from(&dest),
+                entries: wanted,
+                // No quota in M2; the security layer still sanitizes paths.
+                max_total_bytes: u64::MAX,
+                overwrite,
+            };
+            let mut seen_paths = std::collections::HashSet::new();
+            let result = guard.0.extract(&opts, password.as_deref(), &mut |d| {
+                if ctx.cancelled() {
+                    return false;
+                }
+                // `ExtractProgress` has no item counter; count distinct
+                // paths observed as an approximation of files touched.
+                seen_paths.insert(d.current_path.clone());
+                ctx.report(
+                    seen_paths.len() as u64,
+                    total_items,
+                    d.done_bytes,
+                    total_bytes,
+                );
+                true
+            });
+            drop(guard);
+            result.map_err(|e| {
+                let key = e.error_key().to_string();
+                if key == "error.password_required" {
+                    emit(
+                        "password_required",
+                        serde_json::json!({ "archive_id": id }),
+                    );
+                }
+                key
+            })?;
+            Ok(())
+        }));
+        Ok(job_id)
     }
 }

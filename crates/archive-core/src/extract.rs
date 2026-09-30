@@ -29,6 +29,8 @@ use std::sync::{Arc, Mutex};
 
 /// `NExtract::NOperationResult` values we care about.
 const OP_OK: i32 = 0;
+const OP_DATA_ERROR: i32 = 2;
+const OP_CRC_ERROR: i32 = 3;
 const OP_WRONG_PASSWORD: i32 = 9;
 /// `NExtract::NAskMode::kExtract`.
 const ASK_EXTRACT: i32 = 0;
@@ -246,9 +248,17 @@ unsafe extern "system" fn cb_op_result(this: *mut c_void, op_res: i32) -> Hresul
     S_OK
 }
 
-fn map_op_res(op_res: i32) -> ZipnestError {
+/// Map `NExtract::NOperationResult` to a `ZipnestError`.
+///
+/// `password_provided` matters: the 7z handler reports a wrong AES key as
+/// `kDataError` (2), not `kWrongPassword` (9) — indistinguishable from real
+/// corruption at this layer. For encrypted extracts we surface the data/CRC
+/// classes as `password_incorrect` so the UI can offer a retry (matching
+/// 7-Zip's re-prompt behavior); without a password they stay engine errors.
+fn map_op_res(op_res: i32, password_provided: bool) -> ZipnestError {
     match op_res {
         OP_WRONG_PASSWORD => ZipnestError::PasswordIncorrect,
+        OP_DATA_ERROR | OP_CRC_ERROR if password_provided => ZipnestError::PasswordIncorrect,
         _ => ZipnestError::Engine(E_FAIL),
     }
 }
@@ -269,6 +279,7 @@ pub(crate) fn read_entry(
         refs: AtomicU32::new(1),
         state: Arc::clone(&state),
     }));
+    let password_provided = password.is_some();
     let crypto = callbacks::crypto_new(password);
     let cb = Box::into_raw(Box::new(MemExtractCallback {
         vt: &MEM_CB_VT,
@@ -298,7 +309,7 @@ pub(crate) fn read_entry(
         return Err(if op_res < 0 {
             ZipnestError::Engine(E_FAIL)
         } else {
-            map_op_res(op_res)
+            map_op_res(op_res, password_provided)
         });
     }
 
@@ -823,7 +834,7 @@ pub(crate) fn extract_to_disk(
     }
     let op_res = state.first_op_res.load(Ordering::SeqCst);
     if op_res != 0 {
-        return Err(map_op_res(op_res));
+        return Err(map_op_res(op_res, password.is_some()));
     }
     if hr != S_OK {
         return Err(crate::error::map_hresult(hr));

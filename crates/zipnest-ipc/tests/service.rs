@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+﻿use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 fn fx(name: &str) -> PathBuf {
@@ -21,7 +21,6 @@ fn service() -> (zipnest_ipc::IpcService, Events) {
     (svc, events)
 }
 
-#[allow(dead_code)] // used by the extract tests added in the next step
 fn wait_events(events: &Events, ms: u64, mut pred: impl FnMut(&[(String, serde_json::Value)]) -> bool) {
     let t0 = std::time::Instant::now();
     while t0.elapsed() < std::time::Duration::from_millis(ms) {
@@ -89,4 +88,45 @@ fn list_children_bad_dir_is_empty_not_panic() {
         .unwrap();
     let kids = svc.list_children(r.id, "nope/".into()).unwrap();
     assert!(kids.is_empty());
+}
+
+#[test]
+fn extract_emits_progress_and_finished_ok() {
+    let (svc, events) = service();
+    let r = svc
+        .open_archive(fx("plain.zip").to_string_lossy().into(), None)
+        .unwrap();
+    let dest = std::env::temp_dir().join(format!("zipnest-t4-{}", std::process::id()));
+    let job = svc
+        .extract(r.id, vec!["a.txt".into()], dest.to_string_lossy().into(), true, None)
+        .unwrap();
+    wait_events(&events, 5000, |v| v.iter().any(|(n, _)| n == "job_finished"));
+    let v = events.lock().unwrap();
+    let fin = v.iter().find(|(n, _)| n == "job_finished").unwrap();
+    assert_eq!(fin.1["job_id"], job);
+    assert_eq!(fin.1["ok"], true);
+    assert!(fin.1["error_key"].is_null());
+    assert!(v.iter().any(|(n, _)| n == "job_progress"));
+    let out = dest.join("a.txt");
+    assert!(out.exists(), "extracted file missing: {}", out.display());
+    std::fs::remove_dir_all(&dest).ok();
+}
+
+#[test]
+fn extract_wrong_password_reports_key() {
+    let (svc, events) = service();
+    let r = svc
+        .open_archive(fx("enc.7z").to_string_lossy().into(), Some("secret".into()))
+        .unwrap();
+    let dest = std::env::temp_dir().join(format!("zipnest-t4b-{}", std::process::id()));
+    let job = svc
+        .extract(r.id, vec!["a.txt".into()], dest.to_string_lossy().into(), true, Some("wrong".into()))
+        .unwrap();
+    wait_events(&events, 5000, |v| v.iter().any(|(n, _)| n == "job_finished"));
+    let v = events.lock().unwrap();
+    let fin = v.iter().find(|(n, _)| n == "job_finished").unwrap();
+    assert_eq!(fin.1["job_id"], job);
+    assert_eq!(fin.1["ok"], false);
+    assert_eq!(fin.1["error_key"].as_str(), Some("error.password_incorrect"));
+    std::fs::remove_dir_all(&dest).ok();
 }
