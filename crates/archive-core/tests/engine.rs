@@ -51,3 +51,28 @@ fn enc_zip_flags_encrypted() {
     let a = es.iter().find(|e| e.path == "a.txt").expect("a.txt");
     assert!(a.encrypted, "entry in password-protected zip must be flagged");
 }
+#[test]
+fn reads_entry_bytes_matching_source() {
+    let arc = Archive::open(&fx("nested.zip"), ArchiveOpenOptions::default()).unwrap();
+    let b = arc
+        .entries()
+        .unwrap()
+        .iter()
+        .find(|e| e.path.ends_with("b.txt"))
+        .unwrap()
+        .index;
+    let got = arc
+        .read_entry(b, &ArchiveOpenOptions::default(), None)
+        .unwrap();
+    assert_eq!(got, b"nested content");
+}
+
+#[test]
+fn read_entry_respects_max_bytes() {
+    let arc = Archive::open(&fx("nested.zip"), ArchiveOpenOptions::default()).unwrap();
+    let c = arc.entries().unwrap().iter().find(|e| e.path == "c.txt").unwrap().index;
+    let got = arc
+        .read_entry(c, &ArchiveOpenOptions::default(), Some(10))
+        .unwrap();
+    assert_eq!(got.len(), 10);
+}
