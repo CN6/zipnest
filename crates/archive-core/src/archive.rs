@@ -206,8 +206,9 @@ impl Archive {
 }
 
 fn map_open_error(hr: i32, state: &crate::com::callbacks::OpenState) -> ZipnestError {
-    if hr == crate::com::E_ABORT {
-        return ZipnestError::Cancelled;
+    // E_ABORT and friends go through the single mapping table first.
+    if !matches!(crate::error::map_hresult(hr), ZipnestError::Engine(_)) {
+        return crate::error::map_hresult(hr);
     }
     // The engine asked for a password during Open:
     //  - none supplied  -> password required

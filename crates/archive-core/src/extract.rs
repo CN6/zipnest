@@ -290,10 +290,8 @@ pub(crate) fn read_entry(
         (MEM_CB_VT.release)(cb as *mut c_void);
     }
 
-    if hr == E_ABORT {
-        return Err(ZipnestError::Cancelled);
-    }
     if hr != S_OK {
+        // map_hresult: E_ABORT -> Cancelled, everything else -> Engine.
         return Err(crate::error::map_hresult(hr));
     }
     if op_res != OP_OK {
@@ -820,7 +818,7 @@ pub(crate) fn extract_to_disk(
     if let Some(e) = state.io_error.lock().ok().and_then(|mut s| s.take()) {
         return Err(ZipnestError::Io(e));
     }
-    if hr == E_ABORT {
+    if matches!(crate::error::map_hresult(hr), ZipnestError::Cancelled) {
         return Err(ZipnestError::Cancelled);
     }
     let op_res = state.first_op_res.load(Ordering::SeqCst);

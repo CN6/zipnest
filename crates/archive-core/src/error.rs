@@ -45,6 +45,12 @@ impl ZipnestError {
             ZipnestError::Io(_) => "error.io",
         }
     }
+
+    /// Alias for [`Self::error_key`] — errors are not `Clone`, so callers
+    /// compare by stable kind instead of by value.
+    pub fn kind(&self) -> &'static str {
+        self.error_key()
+    }
 }
 
 impl fmt::Display for ZipnestError {

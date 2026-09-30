@@ -244,3 +244,23 @@ fn encrypted_zip_extract_with_password_succeeds() {
     assert!(dest.join("a.txt").exists());
     let _ = std::fs::remove_dir_all(&dest);
 }
+// ---- Task 10: centralized HRESULT mapping ----
+
+#[test]
+fn hresult_mapping_table() {
+    assert_eq!(
+        archive_core::map_hresult(0x8000_4004u32 as i32).error_key(),
+        "error.cancelled"
+    );
+    assert_eq!(
+        archive_core::map_hresult(0x8000_4005u32 as i32).error_key(),
+        "error.engine"
+    );
+    assert_eq!(
+        archive_core::map_hresult(0x8000_4001u32 as i32).error_key(),
+        "error.engine"
+    );
+    // kind() mirrors error_key()
+    let e = archive_core::map_hresult(0x8000_4004u32 as i32);
+    assert_eq!(e.kind(), e.error_key());
+}
