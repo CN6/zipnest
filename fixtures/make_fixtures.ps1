@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 $7z = "C:\Program Files\7-Zip\7z.exe"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+Remove-Item (Join-Path $here "*.zip"), (Join-Path $here "*.7z") -Force -ErrorAction SilentlyContinue
 $tmp = Join-Path $env:TEMP "zipnest-fx"
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $tmp | Out-Null
@@ -25,9 +26,11 @@ if ($LASTEXITCODE -ne 0) { throw "enc.7z failed" }
 if ($LASTEXITCODE -ne 0) { throw "corrupt.zip failed" }
 Pop-Location
 
-# corrupt: flip a byte inside the zip data area (central directory intact enough to attempt open)
+# corrupt: wipe local-file-header signature AND EOCD signature so no
+# recognizable structure remains (7z can otherwise self-recover from either)
 $bytes = [IO.File]::ReadAllBytes((Join-Path $here "corrupt.zip"))
-$bytes[$bytes.Length - 5] = $bytes[$bytes.Length - 5] -bxor 0xFF
+for ($i = 0; $i -lt 4; $i++) { $bytes[$i] = 0 }                      # PK\x03\x04
+for ($i = $bytes.Length - 22; $i -lt $bytes.Length - 18; $i++) { $bytes[$i] = 0 }  # PK\x05\x06
 [IO.File]::WriteAllBytes((Join-Path $here "corrupt.zip"), $bytes)
 
 Write-Host "fixtures ok"
