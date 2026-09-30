@@ -1,0 +1,12 @@
+//! IPC service layer between the Tauri glue and the archive engine.
+//!
+//! Framework-free on purpose: the Tauri app wires an emit callback, tests
+//! wire a recording vector. No file-system access beyond what the engine
+//! performs through [`IpcService`].
+
+pub mod error;
+pub mod registry;
+pub mod service;
+
+pub use error::IpcError;
+pub use service::{EntryDto, IpcService, OpenArchiveResult};

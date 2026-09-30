@@ -1,0 +1,170 @@
+//! The IPC facade: open/list/read today, extract/cancel in the next step.
+//! Emits `job_*` / `password_required` events through the emit callback.
+
+use crate::error::IpcError;
+use crate::registry::{ArchiveRegistry, SharedArchive};
+use archive_core::{Archive, ArchiveEntry, ArchiveOpenOptions};
+use serde::Serialize;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// One archive row in the UI. Serialized camel-free: fields match the
+/// frontend `EntryDto` interface verbatim.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryDto {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime_ms: Option<u64>,
+    pub encrypted: bool,
+}
+
+/// Response of `open_archive`: metadata plus the archive's root entries.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenArchiveResult {
+    pub id: u64,
+    pub encrypted: bool,
+    pub format: String,
+    pub entries: Vec<EntryDto>,
+}
+
+fn to_dto(e: &ArchiveEntry) -> EntryDto {
+    let name = e
+        .path
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&e.path)
+        .to_string();
+    EntryDto {
+        path: e.path.clone(),
+        name,
+        is_dir: e.is_dir,
+        size: e.size,
+        mtime_ms: e
+            .mtime
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64),
+        encrypted: e.encrypted,
+    }
+}
+
+/// Direct children of `dir` (`""` = root); tolerates trailing-slash forms.
+/// Archives may store Windows-style backslash separators (`sub\b.txt`), so
+/// matching normalizes to `/` without mutating the stored path (the UI and
+/// `read_entry` see the engine's original path verbatim).
+fn children_of<'a>(entries: &'a [ArchiveEntry], dir: &str) -> Vec<&'a ArchiveEntry> {
+    fn norm(s: &str) -> String {
+        s.replace('\\', "/")
+    }
+    let dir = norm(dir.trim_end_matches(['/', '\\']));
+    entries
+        .iter()
+        .filter(|e| {
+            let p = norm(e.path.trim_end_matches(['/', '\\']));
+            if dir.is_empty() {
+                !p.contains('/')
+            } else {
+                matches!(p.strip_prefix(&format!("{dir}/")), Some(rest) if !rest.contains('/'))
+            }
+        })
+        .collect()
+}
+
+pub struct IpcService {
+    /// Exposed read-only for the Tauri glue (resolve an entry for preview).
+    pub registry: ArchiveRegistry,
+    #[allow(dead_code)] // consumed by the extract step
+    jobs: archive_jobs::JobManager,
+    #[allow(dead_code)] // consumed by the extract step
+    emit: Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>,
+}
+
+impl IpcService {
+    /// `emit(event_name, payload)` is called from job worker threads —
+    /// the callback must be thread-safe. `throttle` controls progress
+    /// event spacing (200ms in production, 0ms in tests).
+    pub fn new(
+        emit: Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>,
+        throttle: Duration,
+    ) -> Self {
+        let emit2 = Arc::clone(&emit);
+        let sink = Box::new(move |ev: archive_jobs::JobEvent| {
+            use archive_jobs::JobEvent;
+            match ev {
+                JobEvent::Progress {
+                    job_id,
+                    done_items,
+                    total_items,
+                    done_bytes,
+                    total_bytes,
+                    speed_bps,
+                    eta_secs,
+                } => emit2(
+                    "job_progress",
+                    serde_json::json!({
+                        "job_id": job_id,
+                        "done_items": done_items,
+                        "total_items": total_items,
+                        "done_bytes": done_bytes,
+                        "total_bytes": total_bytes,
+                        "speed_bps": speed_bps,
+                        "eta_secs": eta_secs,
+                    }),
+                ),
+                JobEvent::Finished { job_id, ok, error_key } => emit2(
+                    "job_finished",
+                    serde_json::json!({
+                        "job_id": job_id,
+                        "ok": ok,
+                        "error_key": error_key,
+                    }),
+                ),
+            }
+        });
+        IpcService {
+            registry: ArchiveRegistry::default(),
+            jobs: archive_jobs::JobManager::with_throttle(sink, throttle),
+            emit,
+        }
+    }
+
+    pub fn open_archive(&self, path: String, password: Option<String>) -> Result<OpenArchiveResult, IpcError> {
+        let archive = Archive::open(std::path::Path::new(&path), ArchiveOpenOptions { password })?;
+        let entries = archive.entries()?;
+        let encrypted = entries.iter().any(|e| e.encrypted);
+        let format = std::path::Path::new(&path)
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let root = children_of(&entries, "").into_iter().map(to_dto).collect();
+        let (id, _) = self.registry.insert(archive);
+        Ok(OpenArchiveResult { id, encrypted, format, entries: root })
+    }
+
+    pub fn list_children(&self, id: u64, dir: String) -> Result<Vec<EntryDto>, IpcError> {
+        let shared = self.lock_archive(id)?;
+        let guard = shared.lock().map_err(|_| IpcError::new("error.engine"))?;
+        let entries = guard.0.entries()?;
+        Ok(children_of(&entries, &dir).into_iter().map(to_dto).collect())
+    }
+
+    pub fn read_entry_bytes(&self, id: u64, path: String, max_bytes: u64) -> Result<Vec<u8>, IpcError> {
+        let shared = self.lock_archive(id)?;
+        let guard = shared.lock().map_err(|_| IpcError::new("error.engine"))?;
+        let entries = guard.0.entries()?;
+        let idx = entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.index)
+            .ok_or_else(|| IpcError::new("error.not_an_archive"))?;
+        Ok(guard.0.read_entry(idx, &ArchiveOpenOptions::default(), Some(max_bytes))?)
+    }
+
+    fn lock_archive(&self, id: u64) -> Result<SharedArchive, IpcError> {
+        self.registry
+            .get(id)
+            .ok_or_else(|| IpcError::new("error.not_an_archive"))
+    }
+}
