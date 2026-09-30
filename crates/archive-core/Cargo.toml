@@ -1,0 +1,10 @@
+[package]
+name = "archive-core"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+archive-security = { path = "../archive-security" }
+
+[dev-dependencies]
+zip = "6"

@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/archive-security", "crates/archive-core"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
