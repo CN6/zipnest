@@ -1,9 +1,9 @@
-//! Extraction paths: `read_entry` (in-memory) and `extract_to_disk`.
+﻿//! Extraction paths: `read_entry` (in-memory) and `extract_to_disk`.
 //!
 //! Both drive `IInArchive::Extract` with our own
 //! `IArchiveExtractCallback` implementations.
 //!
-//! Threading contract (vendor README §9): `GetStream`/`PrepareOperation`/
+//! Threading contract (vendor README 搂9): `GetStream`/`PrepareOperation`/
 //! `SetOperationResult` are serialized by the handler; `SetTotal`/
 //! `SetCompleted` (IProgress) *may* run on another thread concurrently.
 //! The user progress closure therefore lives behind a `Mutex` and is only
@@ -39,7 +39,7 @@ const BLOCK_SECURITY: u8 = 1;
 const BLOCK_QUOTA: u8 = 2;
 
 // ===========================================================================
-// In-memory output stream (ISequentialOutStream) — used by read_entry
+// In-memory output stream (ISequentialOutStream) 鈥?used by read_entry
 // ===========================================================================
 
 struct SinkState {
@@ -366,7 +366,7 @@ impl DiskState {
 
     /// Invoke the user closure; `false` arms the cancellation flag.
     fn tick(&self) -> bool {
-        let mut cell = match self.progress.lock() {
+        let cell = match self.progress.lock() {
             Ok(c) => c,
             Err(p) => p.into_inner(),
         };
