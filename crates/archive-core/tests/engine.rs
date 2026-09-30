@@ -264,3 +264,43 @@ fn hresult_mapping_table() {
     let e = archive_core::map_hresult(0x8000_4004u32 as i32);
     assert_eq!(e.kind(), e.error_key());
 }
+// ---- Task 11: one-off compatibility probe (slow) ----
+
+#[test]
+#[ignore = "slow: builds a 5000-entry archive first; run with -- --ignored"]
+fn enumerates_5000_entries_within_budget() {
+    use std::process::Command;
+    let sevenzip = r"C:\Program Files\7-Zip\7z.exe";
+    if !std::path::Path::new(sevenzip).exists() {
+        eprintln!("7z.exe not found; skipping compatibility probe");
+        return;
+    }
+    let pid = std::process::id();
+    let work = std::env::temp_dir().join(format!("zn-bigwork-{pid}"));
+    let zip = std::env::temp_dir().join(format!("zn-big-{pid}.zip"));
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_file(&zip);
+    std::fs::create_dir_all(&work).unwrap();
+    for i in 0..5000u32 {
+        std::fs::write(work.join(format!("f{i:04}.txt")), format!("entry {i}")).unwrap();
+    }
+    let st = Command::new(sevenzip)
+        .args(["a", "-tzip", "-y"])
+        .arg(&zip)
+        .arg(format!("{}\\", work.display()))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("run 7z");
+    assert!(st.success(), "7z archive creation failed");
+
+    let t0 = std::time::Instant::now();
+    let arc = Archive::open(&zip, ArchiveOpenOptions::default()).expect("open big zip");
+    let es = arc.entries().expect("enumerate big zip");
+    let elapsed = t0.elapsed();
+    assert!(es.len() >= 5000, "expected >=5000 items, got {}", es.len());
+    assert!(elapsed < std::time::Duration::from_secs(5), "took {elapsed:?}");
+
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_file(&zip);
+}
