@@ -1,17 +1,18 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 $7z = "C:\Program Files\7-Zip\7z.exe"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Remove-Item (Join-Path $here "*.zip"), (Join-Path $here "*.7z") -Force -ErrorAction SilentlyContinue
 $tmp = Join-Path $env:TEMP "zipnest-fx"
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $tmp | Out-Null
-Set-Content (Join-Path $tmp "a.txt") "hello zipnest`nline2" -Encoding UTF8
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[IO.File]::WriteAllText((Join-Path $tmp "a.txt"), "hello zipnest`nline2", $utf8)
 New-Item -ItemType Directory (Join-Path $tmp "sub") | Out-Null
-Set-Content (Join-Path $tmp "sub\b.txt") "nested content" -Encoding UTF8
+[IO.File]::WriteAllText((Join-Path $tmp "sub\b.txt"), "nested content", $utf8)
 # c.txt: padding file so big.zip-ish streams exist (kept in plain set for size tests)
-$c = @("padding header")
-1..500 | ForEach-Object { $c += "padding line $_" }
-Set-Content (Join-Path $tmp "c.txt") ($c -join "`n") -Encoding UTF8
+$lines = @("padding header")
+1..500 | ForEach-Object { $lines += "padding line $_" }
+[IO.File]::WriteAllText((Join-Path $tmp "c.txt"), ($lines -join "`n"), $utf8)
 
 Push-Location $tmp
 & $7z a -tzip -y (Join-Path $here "plain.zip") a.txt sub c.txt | Out-Null
