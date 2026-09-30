@@ -1,8 +1,13 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   EntryDto,
+  JobFinishedEvent,
+  JobProgressEvent,
   OpenArchiveResult,
   errKey,
+  extract as ipcExtract,
+  jobCancel,
   listChildren,
   openArchive,
 } from "../ipc";
@@ -12,20 +17,34 @@ export interface SortState {
   key: SortKey;
   asc: boolean;
 }
-export type Status = "closed" | "opening" | "open";
+export type Status = "closed" | "opening" | "open" | "extracting";
+
+export interface JobState {
+  jobId: number;
+  doneItems: number;
+  totalItems: number;
+  doneBytes: number;
+  totalBytes: number;
+  speedBps: number;
+  etaSecs: number;
+  /** No progress event yet → still queued behind another job. */
+  started: boolean;
+}
+
+/** What the password dialog is retrying. */
+export type PendingPassword =
+  | { kind: "open"; path: string }
+  | { kind: "extract"; paths: string[]; dest: string; overwrite: boolean };
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
 function sortRows(rows: EntryDto[], sort: SortState): EntryDto[] {
   const dirFirst = (a: EntryDto, b: EntryDto) =>
     Number(b.is_dir) - Number(a.is_dir) || collator.compare(a.name, b.name);
-  const bySize = (a: EntryDto, b: EntryDto) => a.size - b.size || dirFirst(a, b);
-  const byMtime = (a: EntryDto, b: EntryDto) =>
-    (a.mtime_ms ?? 0) - (b.mtime_ms ?? 0) || dirFirst(a, b);
   const cmp: Record<SortKey, (a: EntryDto, b: EntryDto) => number> = {
     name: dirFirst,
-    size: bySize,
-    mtime: byMtime,
+    size: (a, b) => a.size - b.size || dirFirst(a, b),
+    mtime: (a, b) => (a.mtime_ms ?? 0) - (b.mtime_ms ?? 0) || dirFirst(a, b),
   };
   const base = [...rows].sort(cmp[sort.key]);
   return sort.asc ? base : base.reverse();
@@ -45,15 +64,28 @@ export function useArchive() {
   const [sort, setSort] = useState<SortState>({ key: "name", asc: true });
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [errorKey, setErrorKey] = useState<string | null>(null);
+  /** i18n key shown as a non-error notice (success, canceled …). */
+  const [notice, setNotice] = useState<string | null>(null);
+  const [job, setJob] = useState<JobState | null>(null);
+  /** Args the password dialog will retry with (holder, dialog is separate). */
+  const [pendingPassword, setPendingPassword] = useState<PendingPassword | null>(null);
+  const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
+  /** True after a submitted password was rejected (dialog shows a hint). */
+  const [passwordWrong, setPasswordWrong] = useState(false);
+  const [extractDest, setExtractDest] = useState("");
   const anchorRef = useRef<string | null>(null);
+  const jobRef = useRef<number | null>(null);
 
   const rows = useMemo(() => sortRows(rawRows, sort), [rawRows, sort]);
 
   const clearError = useCallback(() => setErrorKey(null), []);
+  const clearNotice = useCallback(() => setNotice(null), []);
 
   const openByPath = useCallback(async (path: string, password?: string) => {
     setStatus("opening");
     setErrorKey(null);
+    setPendingPassword(null);
+    setPasswordWrong(false);
     try {
       const r = await openArchive(path, password);
       setArchive(r);
@@ -65,7 +97,13 @@ export function useArchive() {
       setStatus("open");
       return r;
     } catch (e) {
-      setErrorKey(errKey(e));
+      const key = errKey(e);
+      if (key === "error.password_required") {
+        setPendingPassword({ kind: "open", path });
+        setPasswordDialogOpen(true);
+      } else {
+        setErrorKey(key);
+      }
       setStatus("closed");
       return null;
     }
@@ -91,21 +129,14 @@ export function useArchive() {
   const navigateUp = useCallback(() => {
     if (!cwd) return;
     const trimmed = norm(cwd);
-    const parent = trimmed.includes("/")
-      ? trimmed.slice(0, trimmed.lastIndexOf("/"))
-      : "";
+    const parent = trimmed.includes("/") ? trimmed.slice(0, trimmed.lastIndexOf("/")) : "";
     void navigate(parent);
   }, [cwd, navigate]);
 
-  /** Sort toggle: same key flips direction, new key starts ascending. */
   const toggleSort = useCallback((key: SortKey) => {
     setSort((s) => (s.key === key ? { key, asc: !s.asc } : { key, asc: true }));
   }, []);
 
-  /**
-   * Click semantics: plain = single select, ctrl = toggle,
-   * shift = range over the currently displayed (sorted) rows.
-   */
   const clickSelect = useCallback(
     (entry: EntryDto, index: number, e: { ctrlKey: boolean; shiftKey: boolean }) => {
       const path = entry.path;
@@ -136,16 +167,118 @@ export function useArchive() {
   const selectAll = useCallback(() => setSelected(new Set(rows.map((r) => r.path))), [rows]);
   const clearSelection = useCallback(() => setSelected(new Set()), []);
 
-  /** Selected entries as they appear in the current listing. */
   const selectedEntries = useMemo(
     () => rows.filter((r) => selected.has(r.path)),
     [rows, selected],
   );
 
-  /** Parent segment of a cwd path (handles `/` and `\`). */
   const parentOf = useCallback((dir: string) => {
     const t = norm(dir);
     return t.includes("/") ? t.slice(0, t.lastIndexOf("/")) : "";
+  }, []);
+
+  // ---- extract lifecycle -------------------------------------------------
+
+  const startExtract = useCallback(
+    async (paths: string[], dest: string, overwrite: boolean, password?: string) => {
+      if (!archive || paths.length === 0) return;
+      setErrorKey(null);
+      setNotice(null);
+      setPasswordWrong(false);
+      try {
+        const jobId = await ipcExtract(archive.id, paths, dest, overwrite, password);
+        // Holder for a possible password retry; dialog only opens on failure.
+        setPendingPassword({ kind: "extract", paths, dest, overwrite });
+        jobRef.current = jobId;
+        setJob({
+          jobId,
+          doneItems: 0,
+          totalItems: 0,
+          doneBytes: 0,
+          totalBytes: 0,
+          speedBps: 0,
+          etaSecs: 0,
+          started: false,
+        });
+        setExtractDest(dest);
+        setStatus("extracting");
+      } catch (e) {
+        setErrorKey(errKey(e));
+      }
+    },
+    [archive],
+  );
+
+  const cancelJob = useCallback(() => {
+    if (jobRef.current != null) void jobCancel(jobRef.current);
+  }, []);
+
+  const submitPassword = useCallback(
+    (password: string) => {
+      const pending = pendingPassword;
+      if (!pending) return;
+      if (pending.kind === "open") {
+        void openByPath(pending.path, password);
+      } else {
+        void startExtract(pending.paths, pending.dest, pending.overwrite, password);
+      }
+    },
+    [pendingPassword, openByPath, startExtract],
+  );
+
+  const dismissPassword = useCallback(() => {
+    setPasswordDialogOpen(false);
+    setPendingPassword(null);
+  }, []);
+
+  // Job events arrive on worker threads through the Tauri event bridge.
+  useEffect(() => {
+    const unsubs: Promise<() => void>[] = [
+      listen<JobProgressEvent>("job_progress", (e) => {
+        const p = e.payload;
+        if (p.job_id !== jobRef.current) return;
+        setJob((prev) =>
+          prev && prev.jobId === p.job_id
+            ? {
+                jobId: p.job_id,
+                doneItems: p.done_items,
+                totalItems: p.total_items,
+                doneBytes: p.done_bytes,
+                totalBytes: p.total_bytes,
+                speedBps: p.speed_bps,
+                etaSecs: p.eta_secs,
+                started: true,
+              }
+            : prev,
+        );
+      }),
+      listen<JobFinishedEvent>("job_finished", (e) => {
+        const p = e.payload;
+        if (p.job_id !== jobRef.current) return;
+        jobRef.current = null;
+        setJob(null);
+        setStatus("open");
+        if (p.ok) {
+          setNotice("extract.success");
+          setPendingPassword(null);
+          setPasswordDialogOpen(false);
+          return;
+        }
+        const key = p.error_key ?? "error.engine";
+        if (key === "error.password_incorrect") {
+          // Keep the holder args; open the dialog for a retry.
+          setPasswordDialogOpen(true);
+          setPasswordWrong(true);
+        } else if (key === "error.cancelled") {
+          setNotice("job.canceled");
+        } else {
+          setErrorKey(key);
+        }
+      }),
+    ];
+    return () => {
+      unsubs.forEach((u) => u.then((fn) => fn()).catch(() => {}));
+    };
   }, []);
 
   return {
@@ -158,6 +291,12 @@ export function useArchive() {
     selected,
     selectedEntries,
     errorKey,
+    notice,
+    job,
+    pendingPassword,
+    passwordDialogOpen,
+    passwordWrong,
+    extractDest,
     parentOf,
     openByPath,
     navigate,
@@ -167,7 +306,13 @@ export function useArchive() {
     selectAll,
     clearSelection,
     clearError,
+    clearNotice,
     setErrorKey,
+    startExtract,
+    cancelJob,
+    submitPassword,
+    dismissPassword,
+    setPasswordDialogOpen,
   };
 }
 
