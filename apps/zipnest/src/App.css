@@ -277,6 +277,35 @@ body,
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- context menu ---- */
+.ctx-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 160px;
+  background: #ffffff;
+  border: 1px solid #d6d6d6;
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+}
+
+.ctx-item {
+  border: none;
+  background: none;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  padding: 7px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.ctx-item:hover {
+  background: #eef3fb;
+}
+
 /* ---- error bar / status ---- */
 .errorbar {
   display: flex;

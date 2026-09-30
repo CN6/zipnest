@@ -730,6 +730,10 @@ unsafe extern "system" fn disk_op_result(this: *mut c_void, op_res: i32) -> Hres
     S_OK
 }
 
+// DiskState carries the progress-closure raw cell, so clippy sees a
+// non-Send Arc. The cell lives exactly for this call: 7z invokes our
+// callbacks synchronously on this thread, and it is freed before return.
+#[allow(clippy::arc_with_non_send_sync)]
 pub(crate) fn extract_to_disk(
     arc: &Archive,
     opts: &ExtractOptions,

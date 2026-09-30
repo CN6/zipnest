@@ -15,6 +15,12 @@ pub struct SevenZip {
 }
 
 impl SevenZip {
+    /// Call `CreateObject` on the loaded 7z.dll.
+    ///
+    /// # Safety
+    /// `clsid`/`iid` must point to valid GUIDs and `out` to a writable
+    /// pointer slot; on success `*out` holds a reference-counted interface
+    /// pointer the caller must `Release`.
     pub unsafe fn create_object(
         &self,
         clsid: *const Guid,
@@ -80,7 +86,7 @@ fn load_impl() -> Result<SevenZip, String> {
             if module.is_null() {
                 continue;
             }
-            let sym = GetProcAddress(module, b"CreateObject\0".as_ptr() as *const i8);
+            let sym = GetProcAddress(module, c"CreateObject".as_ptr());
             if sym.is_null() {
                 continue;
             }

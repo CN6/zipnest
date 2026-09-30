@@ -41,15 +41,15 @@ static OPEN_VT: ArchiveOpenCallbackVt = ArchiveOpenCallbackVt {
     query_interface: open_qi,
     add_ref: open_add_ref,
     release: open_release,
-    set_total: set_total,
-    set_completed: set_completed,
+    set_total,
+    set_completed,
 };
 
 static CRYPTO_VT: CryptoGetTextPasswordVt = CryptoGetTextPasswordVt {
     query_interface: crypto_qi,
     add_ref: crypto_add_ref,
     release: crypto_release,
-    get_text_password: get_text_password,
+    get_text_password,
 };
 
 // ---- IArchiveOpenCallback object ----

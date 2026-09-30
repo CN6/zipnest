@@ -248,7 +248,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    fn recorder() -> (Arc<Mutex<Vec<JobEvent>>>, Box<dyn Fn(JobEvent) + Send + Sync>) {
+    /// (event log, sink) pair handed to a test JobManager.
+    type Recording = (Arc<Mutex<Vec<JobEvent>>>, Box<dyn Fn(JobEvent) + Send + Sync>);
+
+    fn recorder() -> Recording {
         let v = Arc::new(Mutex::new(Vec::new()));
         let v2 = v.clone();
         (v, Box::new(move |e| v2.lock().unwrap().push(e)))

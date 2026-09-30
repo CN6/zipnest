@@ -26,10 +26,10 @@ pub struct InFileStream {
 
 static IN_STREAM_VT: InStreamVt = InStreamVt {
     query_interface: qi,
-    add_ref: add_ref,
-    release: release,
-    read: read,
-    seek: seek,
+    add_ref,
+    release,
+    read,
+    seek,
 };
 
 const KNOWN_IIDS: [Guid; 3] = [IID_IUNKNOWN, IID_ISEQ_IN_STREAM, IID_IIN_STREAM];

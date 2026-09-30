@@ -72,21 +72,22 @@ fn children_of<'a>(entries: &'a [ArchiveEntry], dir: &str) -> Vec<&'a ArchiveEnt
         .collect()
 }
 
+/// `emit(event_name, json_payload)` — thread-safe callback the glue layer
+/// wires to Tauri events (tests wire a recorder).
+pub type Emit = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
+
 pub struct IpcService {
     /// Exposed read-only for the Tauri glue (resolve an entry for preview).
     pub registry: ArchiveRegistry,
     jobs: archive_jobs::JobManager,
-    emit: Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>,
+    emit: Emit,
 }
 
 impl IpcService {
-    /// `emit(event_name, payload)` is called from job worker threads —
-    /// the callback must be thread-safe. `throttle` controls progress
-    /// event spacing (200ms in production, 0ms in tests).
-    pub fn new(
-        emit: Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>,
-        throttle: Duration,
-    ) -> Self {
+    /// `emit` is called from job worker threads — the callback must be
+    /// thread-safe. `throttle` controls progress event spacing (200ms in
+    /// production, 0ms in tests).
+    pub fn new(emit: Emit, throttle: Duration) -> Self {
         let emit2 = Arc::clone(&emit);
         let sink = Box::new(move |ev: archive_jobs::JobEvent| {
             use archive_jobs::JobEvent;
