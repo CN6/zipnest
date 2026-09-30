@@ -1,3 +1,6 @@
+﻿// MSVC linker emits info lines (lib/exp paths); not a code issue.
+#![allow(linker_messages)]
+
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 fn greet(name: &str) -> String {

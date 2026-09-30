@@ -76,6 +76,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "archive-jobs"
+version = "0.1.0"
+
+[[package]]
 name = "archive-security"
 version = "0.1.0"
 

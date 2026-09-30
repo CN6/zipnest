@@ -1,0 +1,8 @@
+[package]
+name = "archive-jobs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Job system: single active job, FIFO queue, throttled progress, cooperative cancel"
+
+[dependencies]

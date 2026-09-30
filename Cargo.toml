@@ -1,6 +1,6 @@
-[workspace]
+﻿[workspace]
 resolver = "2"
-members = ["crates/archive-security", "crates/archive-core", "apps/zipnest/src-tauri"]
+members = ["crates/archive-security", "crates/archive-core", "apps/zipnest/src-tauri", "crates/archive-jobs"]
 
 [workspace.package]
 edition = "2021"
