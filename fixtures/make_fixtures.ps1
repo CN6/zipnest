@@ -21,7 +21,7 @@ if ($LASTEXITCODE -ne 0) { throw "plain.zip failed" }
 if ($LASTEXITCODE -ne 0) { throw "nested.zip failed" }
 & $7z a -tzip -y -psecret "-mem=AES256" (Join-Path $here "enc.zip") a.txt | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "enc.zip failed" }
-& $7z a -t7z -y -psecret (Join-Path $here "enc.7z") a.txt | Out-Null
+& $7z a -t7z -y -psecret -mhe=on (Join-Path $here "enc.7z") a.txt | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "enc.7z failed" }
 & $7z a -tzip -y (Join-Path $here "corrupt.zip") a.txt | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "corrupt.zip failed" }

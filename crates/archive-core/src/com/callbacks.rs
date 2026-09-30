@@ -13,9 +13,13 @@ use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-/// Password material for one open operation 鈥?memory only, never logged.
+/// Password material for one open operation — memory only, never logged.
 pub struct OpenState {
     pub password: Option<String>,
+    /// Set when the engine actually asked for a password (via
+    /// `ICryptoGetTextPassword`). Lets `Archive::open` distinguish
+    /// "password required/incorrect" from "not an archive".
+    pub asked: std::sync::atomic::AtomicU8,
 }
 
 #[repr(C)]
@@ -153,6 +157,9 @@ unsafe extern "system" fn get_text_password(
     }
     let this = this as *mut CryptoCallback;
     let obj: &CryptoCallback = &*this;
+    obj.state
+        .asked
+        .store(1, std::sync::atomic::Ordering::SeqCst);
     match &obj.state.password {
         Some(p) => {
             *password = alloc_bstr(p);
@@ -176,7 +183,10 @@ unsafe extern "system" fn get_text_password(
 
 /// Create a standalone `ICryptoGetTextPassword` with refcount 1 (ours).
 pub(crate) fn crypto_new(password: Option<String>) -> *mut CryptoCallback {
-    let state = Arc::new(OpenState { password });
+    let state = Arc::new(OpenState {
+        password,
+        asked: std::sync::atomic::AtomicU8::new(0),
+    });
     Box::into_raw(Box::new(CryptoCallback {
         obj: ComObject { vt: &CRYPTO_VT },
         refs: AtomicU32::new(1),
@@ -200,7 +210,10 @@ pub struct OpenCallbackOwner {
 
 impl OpenCallbackOwner {
     pub fn new(password: Option<String>) -> Self {
-        let state = Arc::new(OpenState { password });
+        let state = Arc::new(OpenState {
+            password,
+            asked: std::sync::atomic::AtomicU8::new(0),
+        });
         let crypto = Box::new(CryptoCallback {
             obj: ComObject { vt: &CRYPTO_VT },
             refs: AtomicU32::new(1),
@@ -221,6 +234,13 @@ impl OpenCallbackOwner {
 
     pub fn as_void(&self) -> *mut c_void {
         as_void(self.open)
+    }
+
+    /// Shared open state; survives `release_own` when cloned, so callers
+    /// can classify an `Open` failure after the callback is gone.
+    pub fn state(&self) -> &Arc<OpenState> {
+        // Safe: the owner keeps the OpenCallback object alive.
+        unsafe { &(*self.open).state }
     }
 
     /// Release our own references after the engine call returns. Any

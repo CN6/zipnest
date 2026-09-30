@@ -83,6 +83,7 @@ impl Archive {
             }
 
             let cb = OpenCallbackOwner::new(opts.password.clone());
+            let state = std::sync::Arc::clone(cb.state());
             let hr = unsafe {
                 let vt = &**(raw as *const *const InArchiveVt);
                 (vt.open)(raw, stream.as_void(), std::ptr::null(), cb.as_void())
@@ -103,7 +104,7 @@ impl Archive {
                 (vt.release)(raw);
                 stream.release_own();
             }
-            last_err = map_open_error(hr);
+            last_err = map_open_error(hr, &state);
         }
         Err(last_err)
     }
@@ -204,14 +205,24 @@ impl Archive {
     }
 }
 
-fn map_open_error(hr: i32) -> ZipnestError {
-    // Task 9 refines this with kpidErrorFlags (password detection).
-    // For now every non-S_OK open result means "not a readable archive".
+fn map_open_error(hr: i32, state: &crate::com::callbacks::OpenState) -> ZipnestError {
     if hr == crate::com::E_ABORT {
-        ZipnestError::Cancelled
-    } else {
-        ZipnestError::NotAnArchive
+        return ZipnestError::Cancelled;
     }
+    // The engine asked for a password during Open:
+    //  - none supplied  -> password required
+    //  - supplied but Open still failed -> it was rejected
+    // (header-encrypted 7z asks before decoding anything; the ask flag is
+    // the reliable discriminator across handlers.)
+    let asked = state.asked.load(std::sync::atomic::Ordering::SeqCst) == 1;
+    if asked {
+        return if state.password.is_some() {
+            ZipnestError::PasswordIncorrect
+        } else {
+            ZipnestError::PasswordRequired
+        };
+    }
+    ZipnestError::NotAnArchive
 }
 
 impl std::fmt::Debug for Archive {

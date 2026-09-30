@@ -173,3 +173,74 @@ fn zip_slip_entry_is_blocked() {
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_file(&evil);
 }
+// ---- Task 9: password callback loop ----
+
+#[test]
+fn encrypted_7z_open_requires_password() {
+    let err = Archive::open(&fx("enc.7z"), ArchiveOpenOptions::default())
+        .expect_err("need pw");
+    assert_eq!(err.error_key(), "error.password_required");
+}
+
+#[test]
+fn encrypted_7z_wrong_password_rejected() {
+    let err = Archive::open(
+        &fx("enc.7z"),
+        ArchiveOpenOptions { password: Some("nope".into()) },
+    )
+    .expect_err("wrong pw");
+    assert_eq!(err.error_key(), "error.password_incorrect");
+}
+
+#[test]
+fn encrypted_7z_with_password_opens_and_extracts() {
+    let arc = Archive::open(
+        &fx("enc.7z"),
+        ArchiveOpenOptions { password: Some("secret".into()) },
+    )
+    .expect("open with pw");
+    let dest = tmpdir("pw");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        overwrite: true,
+    };
+    arc.extract(&opts, Some("secret"), &mut |_p| true)
+        .expect("extract");
+    assert!(dest.join("a.txt").exists());
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn encrypted_zip_wrong_password_on_extract() {
+    let arc = Archive::open(&fx("enc.zip"), ArchiveOpenOptions::default()).expect("zip opens");
+    let dest = tmpdir("zpw");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        overwrite: true,
+    };
+    let err = arc
+        .extract(&opts, Some("wrong"), &mut |_p| true)
+        .expect_err("wrong pw");
+    assert_eq!(err.error_key(), "error.password_incorrect");
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn encrypted_zip_extract_with_password_succeeds() {
+    let arc = Archive::open(&fx("enc.zip"), ArchiveOpenOptions::default()).expect("zip opens");
+    let dest = tmpdir("zpwok");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        overwrite: true,
+    };
+    arc.extract(&opts, Some("secret"), &mut |_p| true)
+        .expect("extract with correct pw");
+    assert!(dest.join("a.txt").exists());
+    let _ = std::fs::remove_dir_all(&dest);
+}
