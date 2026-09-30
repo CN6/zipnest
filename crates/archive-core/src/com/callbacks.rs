@@ -168,6 +168,30 @@ unsafe extern "system" fn get_text_password(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Standalone crypto objects for the extract/read callbacks (Task 8/9).
+// The extract callback QIs `IID_ICRYPTO_GET_TEXT_PASSWORD` on itself and
+// hands out this companion object, exactly like the open path above.
+// ---------------------------------------------------------------------------
+
+/// Create a standalone `ICryptoGetTextPassword` with refcount 1 (ours).
+pub(crate) fn crypto_new(password: Option<String>) -> *mut CryptoCallback {
+    let state = Arc::new(OpenState { password });
+    Box::into_raw(Box::new(CryptoCallback {
+        obj: ComObject { vt: &CRYPTO_VT },
+        refs: AtomicU32::new(1),
+        state,
+    }))
+}
+
+pub(crate) unsafe fn crypto_addref_void(p: *mut c_void) -> u32 {
+    crypto_add_ref(p)
+}
+
+pub(crate) unsafe fn crypto_release_void(p: *mut c_void) -> u32 {
+    crypto_release(p)
+}
+
 /// Owns the callback pair for one `Open` call.
 pub struct OpenCallbackOwner {
     open: *mut OpenCallback,

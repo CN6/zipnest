@@ -76,3 +76,100 @@ fn read_entry_respects_max_bytes() {
         .unwrap();
     assert_eq!(got.len(), 10);
 }
+// ---- Task 8: secure extraction / progress / cancel ----
+
+use archive_core::ExtractOptions;
+
+fn tmpdir(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("zn-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+#[test]
+fn extracts_plain_zip_to_disk() {
+    let arc = Archive::open(&fx("plain.zip"), ArchiveOpenOptions::default()).unwrap();
+    let dest = tmpdir("ex");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        overwrite: true,
+    };
+    let mut ticks = 0;
+    let stats = arc
+        .extract(&opts, None, &mut |_p| {
+            ticks += 1;
+            true
+        })
+        .expect("extract");
+    assert!(stats.files >= 3, "3 files expected, got {}", stats.files);
+    assert!(ticks >= 1, "progress must tick");
+    assert!(std::fs::read_to_string(dest.join("a.txt"))
+        .unwrap()
+        .contains("hello zipnest"));
+    assert_eq!(
+        std::fs::read_to_string(dest.join("sub/b.txt")).unwrap().trim(),
+        "nested content"
+    );
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn extract_cancel_returns_cancelled() {
+    let arc = Archive::open(&fx("nested.zip"), ArchiveOpenOptions::default()).unwrap();
+    let dest = tmpdir("cancel");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        overwrite: true,
+    };
+    let err = arc.extract(&opts, None, &mut |_p| false).expect_err("must cancel");
+    assert_eq!(err.error_key(), "error.cancelled");
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn extract_quota_enforced() {
+    let arc = Archive::open(&fx("nested.zip"), ArchiveOpenOptions::default()).unwrap();
+    let dest = tmpdir("quota");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: 10,
+        overwrite: true,
+    };
+    let err = arc.extract(&opts, None, &mut |_p| true).expect_err("quota must trip");
+    assert_eq!(err.error_key(), "error.quota_exceeded");
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn zip_slip_entry_is_blocked() {
+    use std::io::Write as _;
+    // Craft an archive with a malicious relative path.
+    let evil = std::env::temp_dir().join(format!("zn-slip-{}.zip", std::process::id()));
+    {
+        let f = std::fs::File::create(&evil).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        w.start_file::<_, ()>("../../evil.txt", Default::default()).unwrap();
+        w.write_all(b"pwned").unwrap();
+        w.finish().unwrap();
+    }
+    let arc = Archive::open(&evil, ArchiveOpenOptions::default()).expect("open evil");
+    let dest = tmpdir("slipdest");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        overwrite: true,
+    };
+    let err = arc.extract(&opts, None, &mut |_p| true).expect_err("must be blocked");
+    assert_eq!(err.error_key(), "error.security_blocked");
+    // double insurance: nothing may land outside dest
+    let escaped = std::env::temp_dir().join("evil.txt");
+    assert!(!escaped.exists(), "must not escape temp");
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_file(&evil);
+}

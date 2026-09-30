@@ -183,10 +183,10 @@ impl Archive {
     pub fn read_entry(
         &self,
         index: u32,
-        _opts: &ArchiveOpenOptions,
+        opts: &ArchiveOpenOptions,
         max_bytes: Option<u64>,
     ) -> Result<Vec<u8>, ZipnestError> {
-        crate::extract::read_entry(self, index, max_bytes)
+        crate::extract::read_entry(self, index, opts.password.clone(), max_bytes)
     }
 
     /// Extract entries to disk with security/progress/cancel (Task 8).

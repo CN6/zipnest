@@ -1,9 +1,9 @@
 ﻿//! Stage-by-stage smoke probe for the 7z.dll FFI (debug aid).
 
 use archive_core::dll;
-use archive_core::com::vtables::{ArchiveOpenCallbackVt, InArchiveVt, InStreamVt};
+use archive_core::com::vtables::InArchiveVt;
 use archive_core::com::{
-    Guid, CLSID_FORMAT_ZIP, IID_IARCHIVE_OPEN_CALLBACK, IID_IIN_ARCHIVE, IID_IIN_STREAM, S_OK,
+    Guid, CLSID_FORMAT_ZIP, IID_IIN_ARCHIVE, S_OK,
 };
 
 fn main() {
