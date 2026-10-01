@@ -2,10 +2,12 @@
 //!
 //! Task 1 implemented the `Store` + `Copy` subset (no password, no volumes, no
 //! SFX) for ZIP and 7Z. Task 2 wires `ISetProperties` so the requested
-//! compression level (`x`) and method (`m`) reach the handler. The guard below
-//! still rejects the not-yet-wired options (password/volumes/SFX/TAR) so later
-//! tasks can fill them in; the callback/stream plumbing already carries the
-//! fields they need.
+//! compression level (`x`) and method (`m`) reach the handler. Task 4 adds the
+//! TAR family: plain TAR writes directly through `CLSID_FORMAT_TAR`, while
+//! `TarGz`/`TarBz2`/`TarXz` first write a temporary `.tar` and then wrap it with
+//! the GZIP/BZIP2/XZ handler. The guard below still rejects the not-yet-wired
+//! options (password/volumes/SFX); the callback/stream plumbing already carries
+//! the fields they need.
 
 use crate::com::callbacks;
 use crate::com::outcallback::{self, SourceItem, UpdateState};
@@ -13,12 +15,12 @@ use crate::com::outstream;
 use crate::com::propvariant::PropVariant;
 use crate::com::vtables::{OutArchiveVt, SetPropertiesVt};
 use crate::com::{
-    Guid, S_OK, CLSID_FORMAT_7Z, CLSID_FORMAT_ZIP, E_NOTIMPL, IID_IOUT_ARCHIVE,
-    IID_ISET_PROPERTIES,
+    Guid, S_OK, CLSID_FORMAT_7Z, CLSID_FORMAT_BZIP2, CLSID_FORMAT_GZIP, CLSID_FORMAT_TAR,
+    CLSID_FORMAT_XZ, CLSID_FORMAT_ZIP, E_NOTIMPL, IID_IOUT_ARCHIVE, IID_ISET_PROPERTIES,
 };
 use crate::dll;
 use crate::error::ZipnestError;
-use crate::types::{CreateFormat, CreateOptions, CreateProgress, CreateStats};
+use crate::types::{CompressionMethod, CreateFormat, CreateOptions, CreateProgress, CreateStats};
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -102,17 +104,72 @@ fn collect_one(
     Ok(())
 }
 
-/// Handler CLSID for a supported container, or `None` when creation is not
-/// implemented yet (TAR family — later task).
+/// Handler CLSID for the single-container formats written in one pass.
 fn clsid_for(format: CreateFormat) -> Option<Guid> {
     match format {
         CreateFormat::Zip => Some(CLSID_FORMAT_ZIP),
         CreateFormat::SevenZ => Some(CLSID_FORMAT_7Z),
-        CreateFormat::Tar
-        | CreateFormat::TarGz
-        | CreateFormat::TarBz2
-        | CreateFormat::TarXz => None,
+        CreateFormat::Tar => Some(CLSID_FORMAT_TAR),
+        CreateFormat::TarGz | CreateFormat::TarBz2 | CreateFormat::TarXz => None,
     }
+}
+
+/// Wrapper handler CLSID for the compressed TAR variants.
+fn wrapper_clsid(format: CreateFormat) -> Option<Guid> {
+    match format {
+        CreateFormat::TarGz => Some(CLSID_FORMAT_GZIP),
+        CreateFormat::TarBz2 => Some(CLSID_FORMAT_BZIP2),
+        CreateFormat::TarXz => Some(CLSID_FORMAT_XZ),
+        _ => None,
+    }
+}
+
+/// Deletes a temporary file when dropped, so cleanup covers both the success
+/// and the error path of a two-pass create.
+struct TempCleanup(PathBuf);
+
+impl Drop for TempCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A unique scratch path for the intermediate `.tar`, placed beside the
+/// destination: that directory is known writable (the destination lives there),
+/// which keeps the write on one volume and lets tests observe cleanup.
+fn temp_tar_path(dest: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out".to_string());
+    dest.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{name}.zipnest-{}-{nanos}-{seq}.tar", std::process::id()))
+}
+
+/// Inner node name for a compressed TAR: the destination filename with the
+/// compression suffix removed (`out.tar.gz` -> `out.tar`). This is the name the
+/// single compressed stream carries, so clients show `out.tar` rather than the
+/// scratch filename.
+fn inner_tar_node(dest: &Path) -> Result<String, ZipnestError> {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().replace('\\', "/"))
+        .ok_or(ZipnestError::Security(
+            archive_security::SecurityViolation::Empty,
+        ))?;
+    let stripped = name
+        .strip_suffix(".gz")
+        .or_else(|| name.strip_suffix(".bz2"))
+        .or_else(|| name.strip_suffix(".xz"))
+        .unwrap_or(&name);
+    Ok(archive_security::sanitize_entry_path(stripped)?)
 }
 
 /// Stat every source and build the item table; also returns the pre-scanned
@@ -193,9 +250,9 @@ unsafe fn apply_properties(raw: *mut c_void, opts: &CreateOptions) {
 /// `progress` (return `false` to cancel).
 ///
 /// `opts` carries the full creation surface; the compression level and method
-/// are honored via `ISetProperties`. Options not yet wired (password, volumes,
-/// SFX, TAR family) return `E_NOTIMPL`.
-#[allow(clippy::arc_with_non_send_sync)] // ProgressCell holds a stack-bound closure cell
+/// are honored via `ISetProperties`. Plain TAR writes in one pass; the
+/// compressed TAR variants write a temporary `.tar` and wrap it. Options not
+/// yet wired (password, volumes, SFX) return `E_NOTIMPL`.
 pub fn create_archive(
     sources: &[CreateSource],
     dest: &Path,
@@ -205,8 +262,58 @@ pub fn create_archive(
     if opts.password.is_some() || opts.volume_bytes.is_some() || opts.sfx.is_some() {
         return Err(ZipnestError::Engine(E_NOTIMPL));
     }
+    if matches!(
+        opts.format,
+        CreateFormat::TarGz | CreateFormat::TarBz2 | CreateFormat::TarXz
+    ) {
+        return create_compressed_tar(sources, dest, opts, progress);
+    }
     let clsid = clsid_for(opts.format).ok_or(ZipnestError::Engine(E_NOTIMPL))?;
+    write_archive(clsid, sources, dest, opts, progress)
+}
 
+/// Two-pass create for `TarGz`/`TarBz2`/`TarXz`: build a temporary `.tar`, then
+/// wrap it with the matching compressor. The temp file is removed on both the
+/// success and the error path via [`TempCleanup`].
+fn create_compressed_tar(
+    sources: &[CreateSource],
+    dest: &Path,
+    opts: &CreateOptions,
+    progress: &mut dyn FnMut(&CreateProgress) -> bool,
+) -> Result<CreateStats, ZipnestError> {
+    let wrapper = wrapper_clsid(opts.format).ok_or(ZipnestError::Engine(E_NOTIMPL))?;
+    let tar_path = temp_tar_path(dest);
+    let _cleanup = TempCleanup(tar_path.clone());
+
+    let inner_stats = write_archive(CLSID_FORMAT_TAR, sources, &tar_path, opts, progress)?;
+
+    let inner = [CreateSource {
+        path: tar_path,
+        node: inner_tar_node(dest)?,
+    }];
+    // The compressors ignore `m`/solid but honor `x`; dropping `m` avoids an
+    // accidental "Copy disables compression" interpretation.
+    let mut wrapper_opts = opts.clone();
+    wrapper_opts.method = CompressionMethod::Auto;
+    let outer_stats = write_archive(wrapper, &inner, dest, &wrapper_opts, progress)?;
+
+    Ok(CreateStats {
+        files: inner_stats.files,
+        bytes_in: inner_stats.bytes_in,
+        bytes_out: outer_stats.bytes_out,
+    })
+}
+
+/// Run one `IOutArchive::UpdateItems` pass for `clsid`, writing all `sources`
+/// into the archive at `dest`.
+#[allow(clippy::arc_with_non_send_sync)] // ProgressCell holds a stack-bound closure cell
+fn write_archive(
+    clsid: Guid,
+    sources: &[CreateSource],
+    dest: &Path,
+    opts: &CreateOptions,
+    progress: &mut dyn FnMut(&CreateProgress) -> bool,
+) -> Result<CreateStats, ZipnestError> {
     let (items, total_bytes) = stat_sources(sources)?;
     let files = items.iter().filter(|i| !i.is_dir).count() as u32;
     let num_items = items.len() as u32;

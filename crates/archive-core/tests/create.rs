@@ -15,6 +15,14 @@ fn opts(fmt: CreateFormat) -> CreateOptions {
         password: None, encrypt_names: false, volume_bytes: None, sfx: None }
 }
 
+/// Names in `dir` that look like the driver's scratch `.tar` files.
+fn leftover_tmp(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir).unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("zipnest"))
+        .collect()
+}
+
 #[test]
 fn creates_zip_with_one_file_roundtrip() {
     let base = tmp("zip"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
@@ -126,6 +134,87 @@ fn skips_symlinked_entries() {
     let sources = collect_sources(&[base.join("src")], &base).unwrap();
     assert!(sources.iter().all(|s| s.node != "src/link.txt"), "file symlink must be skipped");
     assert!(sources.iter().all(|s| s.node != "src/linkdir"), "dir symlink must be skipped");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn creates_plain_tar_roundtrip() {
+    let base = tmp("tar"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "a.txt", b"plain tar body");
+    let dest = base.join("out.tar");
+    let srcs = vec![CreateSource { path: src, node: "a.txt".into() }];
+    create_archive(&srcs, &dest, &opts(CreateFormat::Tar), &mut |_| true).unwrap();
+    let arc = Archive::open(&dest, ArchiveOpenOptions::default()).unwrap();
+    let e = arc.entries().unwrap().into_iter().find(|e| !e.is_dir).expect("file entry");
+    assert_eq!(arc.read_entry(e.index, &ArchiveOpenOptions::default(), None).unwrap(), b"plain tar body");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// NOTE: 7-Zip's GZIP/BZIP2/XZ `IInArchive` exposes the decompressed payload as
+// a single entry; it does *not* cascade into TAR (that is a client-side
+// `CArchiveLink` feature used by 7z.exe/7zFM, verified against 7z 26.03). So a
+// compressed TAR roundtrip is verified in two explicit layers: open the
+// compressed stream, then open the TAR it carries.
+fn assert_compressed_tar_roundtrip(fmt: CreateFormat, dest_name: &str, body: &[u8], tag: &str) {
+    let base = tmp(tag); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    write_src(&base, "src/a.txt", body);
+    let dest = base.join(dest_name);
+    let sources = archive_core::create::collect_sources(&[base.join("src")], &base).unwrap();
+    create_archive(&sources, &dest, &opts(fmt), &mut |_| true).unwrap();
+
+    // The intermediate `.tar` must not survive a successful create.
+    let leftovers = leftover_tmp(&base);
+    assert!(leftovers.is_empty(), "temp tar left behind after success: {leftovers:?}");
+
+    // Layer 1: the compressor holds a single stream carrying the TAR. GZIP stores
+    // the name in its header, so its entry is `out.tar` (the destination minus
+    // `.gz`); BZIP2/XZ store no name and 7-Zip's *client* fills it from the
+    // archive filename, so the raw reader reports an empty path for those.
+    let outer = Archive::open(&dest, ArchiveOpenOptions::default()).unwrap();
+    let outer_entries = outer.entries().unwrap();
+    assert_eq!(outer_entries.len(), 1, "compressor holds exactly one stream");
+    if fmt == CreateFormat::TarGz {
+        assert_eq!(outer_entries[0].path.replace('\\', "/"), "out.tar");
+    }
+    let tar_bytes = outer.read_entry(outer_entries[0].index, &ArchiveOpenOptions::default(), None).unwrap();
+
+    // Layer 2: the decompressed bytes are a valid TAR carrying the source tree.
+    let inner_tar = base.join("out.tar");
+    std::fs::write(&inner_tar, &tar_bytes).unwrap();
+    let inner = Archive::open(&inner_tar, ArchiveOpenOptions::default()).unwrap();
+    let e = inner.entries().unwrap().into_iter().find(|e| !e.is_dir).expect("file entry");
+    assert_eq!(inner.read_entry(e.index, &ArchiveOpenOptions::default(), None).unwrap(), body);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn creates_targz_roundtrip() {
+    assert_compressed_tar_roundtrip(CreateFormat::TarGz, "out.tar.gz", b"tar gz body", "tgz");
+}
+
+#[test]
+fn creates_tarbz2_roundtrip() {
+    assert_compressed_tar_roundtrip(CreateFormat::TarBz2, "out.tar.bz2", b"tar bz2 body", "tbz2");
+}
+
+#[test]
+fn creates_tarxz_roundtrip() {
+    assert_compressed_tar_roundtrip(CreateFormat::TarXz, "out.tar.xz", b"tar xz body", "txz");
+}
+
+#[test]
+fn cleans_up_temp_tar_on_failure() {
+    let base = tmp("tarfail"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    write_src(&base, "src/a.txt", b"x");
+    // Make the destination unwritable as a file so the *second* pass fails after
+    // the intermediate `.tar` has already been written.
+    let dest = base.join("out.tar.gz");
+    std::fs::create_dir_all(&dest).unwrap();
+    let sources = archive_core::create::collect_sources(&[base.join("src")], &base).unwrap();
+    let err = create_archive(&sources, &dest, &opts(CreateFormat::TarGz), &mut |_| true).unwrap_err();
+    assert_eq!(err.kind(), "error.io", "outer pass must surface the io error, got {err:?}");
+    let leftovers = leftover_tmp(&base);
+    assert!(leftovers.is_empty(), "temp tar left behind after failure: {leftovers:?}");
     let _ = std::fs::remove_dir_all(&base);
 }
 
