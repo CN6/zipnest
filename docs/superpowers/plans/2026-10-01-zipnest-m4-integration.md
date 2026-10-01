@@ -44,7 +44,7 @@
 
 - [x] 1 设置持久化（`caeedca`）
 - [x] 2 Shell 集成（HKCU，`reg.exe`；`shell_register` 命令）
-- [ ] 3 托盘 / 单实例
+- [x] 3 托盘 / 单实例 / 外部调起（`open_file_request` + `launch_file`）
 - [ ] 4 设置 UI
 - [ ] 5 i18n 全量
 - [ ] 6 打包

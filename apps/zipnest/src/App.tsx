@@ -6,6 +6,8 @@ import {
 } from "@fluentui/react-components";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
 import { getLocale, setLocale, t, Locale } from "./i18n";
@@ -103,6 +105,34 @@ export default function App() {
       .catch(() => {
         /* running outside tauri (plain vite dev) — drop simply won't work */
       });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Open an archive this process was launched with (associated file / CLI),
+  // and keep handling `open_file_request` from a second instance (tray keeps
+  // the process alive, so launches arrive as events after the first one).
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void invoke<string | null>("launch_file")
+      .then((path) => {
+        if (!cancelled && path) void arch.openByPath(path);
+      })
+      .catch(() => {
+        /* plain vite dev has no command */
+      });
+    listen<{ path: string }>("open_file_request", (e) => {
+      if (e.payload?.path) void arch.openByPath(e.payload.path);
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
       unlisten?.();

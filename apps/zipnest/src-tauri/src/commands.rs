@@ -85,6 +85,12 @@ pub fn settings_set(
     svc.settings_set(patch)
 }
 
+/// Return (once) the archive path this process was launched with.
+#[tauri::command]
+pub fn launch_file(state: tauri::State<'_, crate::LaunchFile>) -> Option<String> {
+    state.0.lock().ok().and_then(|mut g| g.take())
+}
+
 /// Register or unregister this build's per-user Explorer integration and
 /// remember the choice. HKCU only, so it never needs elevation.
 #[tauri::command]
