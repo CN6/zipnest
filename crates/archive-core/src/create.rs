@@ -368,6 +368,42 @@ fn create_compressed_tar(
     })
 }
 
+/// The output stream handed to `UpdateItems`, tagged with its concrete kind.
+///
+/// `FileOutStream` and `VolumeOutStream` are distinct COM objects with different
+/// vtables; releasing one through the other's `release` is type-confusion UB
+/// (`Box::from_raw` on the wrong layout). Carrying the kind here means every
+/// release/finalize site dispatches correctly instead of guessing from the
+/// options.
+enum OutTarget {
+    File(*mut c_void),
+    Volumes(*mut c_void),
+}
+
+impl OutTarget {
+    fn is_volumes(&self) -> bool {
+        matches!(self, OutTarget::Volumes(_))
+    }
+
+    fn as_ptr(&self) -> *mut c_void {
+        match self {
+            OutTarget::File(p) | OutTarget::Volumes(p) => *p,
+        }
+    }
+
+    /// Release exactly the object this variant was created from.
+    ///
+    /// # Safety
+    /// `self` must wrap a live pointer returned by the matching
+    /// `outstream::new` / `outstream::new_volumes`.
+    unsafe fn release(self) {
+        match self {
+            OutTarget::File(p) => outstream::release_void(p),
+            OutTarget::Volumes(p) => outstream::release_void_volumes(p),
+        }
+    }
+}
+
 /// Run one `IOutArchive::UpdateItems` pass for `clsid`, writing all `sources`
 /// into the archive at `dest`.
 #[allow(clippy::arc_with_non_send_sync)] // ProgressCell holds a stack-bound closure cell
@@ -388,14 +424,16 @@ fn write_archive(
     // a single `<dest>`; the handler is unaware and simply writes bytes (7-Zip's
     // own client does exactly this, via its `CMultiOutStream`).
     let out = match opts.volume_bytes {
-        Some(limit) => outstream::new_volumes(dest, limit)?,
-        None => outstream::new(dest)?,
+        Some(limit) => OutTarget::Volumes(outstream::new_volumes(dest, limit)?),
+        None => OutTarget::File(outstream::new(dest)?),
     };
+    let is_volumes = out.is_volumes();
 
     let mut raw: *mut c_void = std::ptr::null_mut();
     let hr = unsafe { dll.create_object(&clsid, &IID_IOUT_ARCHIVE, &mut raw) };
     if hr != S_OK || raw.is_null() {
-        unsafe { outstream::release_void(out) };
+        // Release through the same tag used to create it, not a guessed vtable.
+        unsafe { out.release() };
         return Err(crate::error::map_hresult(hr));
     }
 
@@ -415,7 +453,7 @@ fn write_archive(
 
     let hr = unsafe {
         let vt = &**(raw as *const *const OutArchiveVt);
-        (vt.update_items)(raw, out, num_items, cb)
+        (vt.update_items)(raw, out.as_ptr(), num_items, cb)
     };
 
     let cancelled = state.cancelled.load(Ordering::SeqCst) == 1;
@@ -429,16 +467,17 @@ fn write_archive(
     let mut volume_bytes = 0u64;
     let mut finalize_failed = false;
     unsafe {
-        if opts.volume_bytes.is_some() {
-            if update_ok {
-                match outstream::finalize_volumes(out) {
-                    Some(n) => volume_bytes = n,
-                    None => finalize_failed = true,
+        match out {
+            OutTarget::Volumes(p) => {
+                if update_ok {
+                    match outstream::finalize_volumes(p) {
+                        Some(n) => volume_bytes = n,
+                        None => finalize_failed = true,
+                    }
                 }
+                outstream::release_void_volumes(p);
             }
-            outstream::release_void_volumes(out);
-        } else {
-            outstream::release_void(out);
+            OutTarget::File(p) => outstream::release_void(p),
         }
         outcallback::release_void(cb);
         let vt = &**(raw as *const *const OutArchiveVt);
@@ -471,7 +510,7 @@ fn write_archive(
         return Err(crate::error::map_hresult(hr));
     }
 
-    let bytes_out = if opts.volume_bytes.is_some() {
+    let bytes_out = if is_volumes {
         volume_bytes
     } else {
         std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0)

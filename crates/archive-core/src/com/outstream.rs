@@ -277,6 +277,12 @@ impl VolumeState {
         for i in 0..=last {
             let start = i as u64 * self.limit;
             let desired = std::cmp::min(self.limit, new_size - start);
+            // Extending must materialize every volume in range, including gaps
+            // that were never written: otherwise the logical length would cover
+            // files that do not exist. `set_len` zero-fills an unopened volume.
+            if desired > 0 {
+                self.ensure(i)?;
+            }
             self.truncate(i, desired)?;
         }
         for i in (last + 1)..self.files.len() {
@@ -293,6 +299,11 @@ impl VolumeState {
         } else {
             ((self.length - 1) / self.limit + 1) as usize
         };
+        // Cover every logical volume in the loop so a gap that was never opened
+        // still gets created and sized rather than silently missing.
+        while self.files.len() < total {
+            self.files.push(None);
+        }
         for i in 0..self.files.len() {
             let start = i as u64 * self.limit;
             let desired = if i < total {
@@ -307,6 +318,7 @@ impl VolumeState {
                     let _ = std::fs::remove_file(self.path_for(i));
                 }
             } else {
+                self.ensure(i)?;
                 self.truncate(i, desired)?;
             }
         }
@@ -506,5 +518,48 @@ pub unsafe fn finalize_volumes(p: *mut c_void) -> Option<u64> {
             Some(n)
         }
         Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extending_past_end_creates_and_sizes_gap_volumes() {
+        let dir = std::env::temp_dir().join(format!("zn-volstream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("out.7z");
+
+        let p = new_volumes(&dest, 100).unwrap();
+        unsafe {
+            // 10 bytes into volume 0 -> logical length 10.
+            let d1 = [0xABu8; 10];
+            let mut processed = 0u32;
+            assert_eq!(
+                vol_write(p, d1.as_ptr() as *const c_void, 10, &mut processed),
+                S_OK
+            );
+            // Seek to virtual offset 350 (volume 3, offset 50). Volumes 1 and 2
+            // were never written and must be materialized as zero-filled gaps.
+            assert_eq!(vol_seek(p, 350, 0, std::ptr::null_mut()), S_OK);
+            let d2 = [0xCDu8; 20];
+            assert_eq!(
+                vol_write(p, d2.as_ptr() as *const c_void, 20, &mut processed),
+                S_OK
+            );
+            assert_eq!(finalize_volumes(p), Some(370));
+            release_void_volumes(p);
+        }
+
+        for (index, expected) in [(1usize, 100u64), (2, 100), (3, 100), (4, 70)] {
+            let path = PathBuf::from(format!("{}.{:03}", dest.display(), index));
+            let len = std::fs::metadata(&path)
+                .unwrap_or_else(|_| panic!("gap volume {} must exist", path.display()))
+                .len();
+            assert_eq!(len, expected, "volume {index} size");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
