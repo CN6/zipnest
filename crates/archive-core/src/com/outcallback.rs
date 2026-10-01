@@ -197,10 +197,16 @@ unsafe extern "system" fn get_property(
     }
     let this = this as *mut UpdateCallback;
     let items: &[SourceItem] = &(*this).items;
+    let st = &(*this).state;
     let item = match items.get(index as usize) {
         Some(i) => i,
         None => return E_FAIL,
     };
+    if prop_id == KPID_PATH {
+        if let Ok(mut p) = st.last_path.lock() {
+            p.clone_from(&item.node);
+        }
+    }
     *value = match prop_id {
         KPID_PATH => PropVariant::from_bstr(&item.node),
         KPID_IS_DIR => PropVariant::from_bool(item.is_dir),
@@ -225,10 +231,14 @@ unsafe extern "system" fn get_stream(
     *in_stream = std::ptr::null_mut();
     let this = this as *mut UpdateCallback;
     let items: &[SourceItem] = &(*this).items;
+    let st = &(*this).state;
     let item = match items.get(index as usize) {
         Some(i) => i,
         None => return E_FAIL,
     };
+    if let Ok(mut p) = st.last_path.lock() {
+        p.clone_from(&item.node);
+    }
     if item.is_dir {
         return S_OK;
     }

@@ -71,8 +71,9 @@ pub enum CreateFormat {
     TarXz,
 }
 
-/// Compression effort. `engine_x()` is the value handed to 7-Zip's `x`
-/// property (0..9) once `SetProperties` is wired up.
+/// Compression effort. `engine_x()` is the numeric value handed to 7-Zip's
+/// `x` property (0..9) via `ISetProperties` (a `VT_UI4`, as the engine's
+/// `ParsePropToUInt32` requires — a `VT_BSTR` is rejected with `E_INVALIDARG`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionLevel {
     Store,
@@ -83,13 +84,13 @@ pub enum CompressionLevel {
 }
 
 impl CompressionLevel {
-    pub fn engine_x(&self) -> &'static str {
+    pub fn engine_x(&self) -> u32 {
         match self {
-            CompressionLevel::Store => "0",
-            CompressionLevel::Fastest => "1",
-            CompressionLevel::Normal => "5",
-            CompressionLevel::Maximum => "7",
-            CompressionLevel::Ultra => "9",
+            CompressionLevel::Store => 0,
+            CompressionLevel::Fastest => 1,
+            CompressionLevel::Normal => 5,
+            CompressionLevel::Maximum => 7,
+            CompressionLevel::Ultra => 9,
         }
     }
 }

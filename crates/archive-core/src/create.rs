@@ -1,20 +1,24 @@
 //! Archive creation driver (M3).
 //!
-//! Task 1 implements the `Store` + `Copy` subset (no password, no volumes, no
-//! SFX) for ZIP and 7Z. The guard below rejects the not-yet-wired options so
-//! later tasks can fill them in; the callback/stream plumbing already carries
-//! the fields they need.
+//! Task 1 implemented the `Store` + `Copy` subset (no password, no volumes, no
+//! SFX) for ZIP and 7Z. Task 2 wires `ISetProperties` so the requested
+//! compression level (`x`) and method (`m`) reach the handler. The guard below
+//! still rejects the not-yet-wired options (password/volumes/SFX/TAR) so later
+//! tasks can fill them in; the callback/stream plumbing already carries the
+//! fields they need.
 
 use crate::com::callbacks;
 use crate::com::outcallback::{self, SourceItem, UpdateState};
 use crate::com::outstream;
-use crate::com::vtables::OutArchiveVt;
-use crate::com::{Guid, S_OK, CLSID_FORMAT_7Z, CLSID_FORMAT_ZIP, E_NOTIMPL, IID_IOUT_ARCHIVE};
+use crate::com::propvariant::PropVariant;
+use crate::com::vtables::{OutArchiveVt, SetPropertiesVt};
+use crate::com::{
+    Guid, S_OK, CLSID_FORMAT_7Z, CLSID_FORMAT_ZIP, E_NOTIMPL, IID_IOUT_ARCHIVE,
+    IID_ISET_PROPERTIES,
+};
 use crate::dll;
 use crate::error::ZipnestError;
-use crate::types::{
-    CompressionLevel, CompressionMethod, CreateFormat, CreateOptions, CreateProgress, CreateStats,
-};
+use crate::types::{CreateFormat, CreateOptions, CreateProgress, CreateStats};
 use std::os::raw::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -58,12 +62,63 @@ fn stat_sources(sources: &[CreateSource]) -> Result<(Vec<SourceItem>, u64), Zipn
     Ok((items, total_bytes))
 }
 
+/// Best-effort archive-level properties via `ISetProperties`. Handlers that
+/// don't implement the interface are simply left at their defaults.
+unsafe fn apply_properties(raw: *mut c_void, opts: &CreateOptions) {
+    let mut sp: *mut c_void = std::ptr::null_mut();
+    let oav = &**(raw as *const *const OutArchiveVt);
+    if (oav.query_interface)(raw, &IID_ISET_PROPERTIES, &mut sp) != S_OK || sp.is_null() {
+        return;
+    }
+    // Wide names must outlive the call; keep the backing Vec<u16> alive.
+    let mut names_keep: Vec<Vec<u16>> = Vec::new();
+    let mut names: Vec<*const u16> = Vec::new();
+    let mut values: Vec<PropVariant> = Vec::new();
+
+    fn add(
+        name: &str,
+        pv: PropVariant,
+        keep: &mut Vec<Vec<u16>>,
+        names: &mut Vec<*const u16>,
+        values: &mut Vec<PropVariant>,
+    ) {
+        let w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        keep.push(w);
+        names.push(keep.last().unwrap().as_ptr());
+        values.push(pv);
+    }
+
+    add(
+        "x",
+        PropVariant::from_u32(opts.level.engine_x()),
+        &mut names_keep,
+        &mut names,
+        &mut values,
+    );
+    if let Some(m) = opts.method.engine_name() {
+        add(
+            "m",
+            PropVariant::from_bstr(m),
+            &mut names_keep,
+            &mut names,
+            &mut values,
+        );
+    }
+
+    let sp_vt = &**(sp as *const *const SetPropertiesVt);
+    (sp_vt.set_properties)(sp, names.as_ptr(), values.as_ptr(), names.len() as u32);
+    (sp_vt.release)(sp);
+    for v in values.iter_mut() {
+        v.clear(); // release the BSTR payloads
+    }
+}
+
 /// Create an archive at `dest` from `sources`, reporting progress through
 /// `progress` (return `false` to cancel).
 ///
-/// `opts` carries the full creation surface; Task 1 honors only
-/// `Store`/`Copy` with no password/volumes/SFX and returns `E_NOTIMPL`
-/// otherwise.
+/// `opts` carries the full creation surface; the compression level and method
+/// are honored via `ISetProperties`. Options not yet wired (password, volumes,
+/// SFX, TAR family) return `E_NOTIMPL`.
 #[allow(clippy::arc_with_non_send_sync)] // ProgressCell holds a stack-bound closure cell
 pub fn create_archive(
     sources: &[CreateSource],
@@ -71,12 +126,7 @@ pub fn create_archive(
     opts: &CreateOptions,
     progress: &mut dyn FnMut(&CreateProgress) -> bool,
 ) -> Result<CreateStats, ZipnestError> {
-    if opts.level != CompressionLevel::Store
-        || opts.method != CompressionMethod::Copy
-        || opts.password.is_some()
-        || opts.volume_bytes.is_some()
-        || opts.sfx.is_some()
-    {
+    if opts.password.is_some() || opts.volume_bytes.is_some() || opts.sfx.is_some() {
         return Err(ZipnestError::Engine(E_NOTIMPL));
     }
     let clsid = clsid_for(opts.format).ok_or(ZipnestError::Engine(E_NOTIMPL))?;
@@ -95,6 +145,9 @@ pub fn create_archive(
         unsafe { outstream::release_void(out) };
         return Err(crate::error::map_hresult(hr));
     }
+
+    // Apply archive-level properties (compression level/method) before items.
+    unsafe { apply_properties(raw, opts) };
 
     let state = Arc::new(UpdateState {
         done_bytes: AtomicU64::new(0),

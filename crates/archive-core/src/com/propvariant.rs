@@ -116,6 +116,17 @@ impl PropVariant {
         }
     }
 
+    /// `VT_UI4` payload (7-Zip's numeric handler properties such as `x`).
+    pub fn from_u32(v: u32) -> Self {
+        PropVariant {
+            vt: VT_UI4,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            data: v as u64,
+        }
+    }
+
     /// `VT_UI8` payload (also used for `kpidSize`).
     pub fn from_u64(v: u64) -> Self {
         PropVariant {

@@ -34,6 +34,32 @@ fn creates_zip_with_one_file_roundtrip() {
 }
 
 #[test]
+fn deflate_compresses_repetitive_zip() {
+    let base = tmp("defl"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "big.txt", &vec![b'A'; 200_000]);
+    let store = base.join("store.zip"); let deflate = base.join("deflate.zip");
+    let srcs = vec![CreateSource { path: src.clone(), node: "big.txt".into() }];
+    let mut o = opts(CreateFormat::Zip); o.level = CompressionLevel::Normal; o.method = CompressionMethod::Deflate;
+    create_archive(&srcs, &store, &{ let mut s = o.clone(); s.level = CompressionLevel::Store; s.method = CompressionMethod::Copy; s }, &mut |_| true).unwrap();
+    create_archive(&srcs, &deflate, &o, &mut |_| true).unwrap();
+    assert!(std::fs::metadata(&deflate).unwrap().len() * 4 < std::fs::metadata(&store).unwrap().len(),
+        "deflate must be far smaller than store on repetitive data");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn lzma2_is_default_small_for_7z() {
+    let base = tmp("lz"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "big.txt", &vec![b'B'; 200_000]);
+    let dest = base.join("out.7z");
+    let srcs = vec![CreateSource { path: src, node: "big.txt".into() }];
+    let mut o = opts(CreateFormat::SevenZ); o.level = CompressionLevel::Normal; o.method = CompressionMethod::Lzma2;
+    create_archive(&srcs, &dest, &o, &mut |_| true).unwrap();
+    assert!(std::fs::metadata(&dest).unwrap().len() < 20_000, "LZMA2 must compress repetitive data well");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn creates_7z_with_one_file_roundtrip() {
     let base = tmp("7z"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
     let src = write_src(&base, "a.txt", b"seven zip body");
