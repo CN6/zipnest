@@ -313,6 +313,101 @@ fn rejects_7z_header_encryption_without_password() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Concatenate `<stem>.001`, `.002`, ... into `joined` and return the volume
+/// paths in order. The split is a plain byte partition, so joining the volumes
+/// rebuilds the original single-stream archive.
+fn join_volumes(stem: &std::path::Path, joined: &std::path::Path) -> Vec<PathBuf> {
+    let mut bytes = Vec::new();
+    let mut vols = Vec::new();
+    for i in 1u32.. {
+        let p = PathBuf::from(format!("{}.{:03}", stem.display(), i));
+        if !p.exists() { break; }
+        bytes.extend(std::fs::read(&p).unwrap());
+        vols.push(p);
+    }
+    std::fs::write(joined, &bytes).unwrap();
+    vols
+}
+
+/// Create a 2.5 MB stored source split into 1 MB volumes and assert the volume
+/// files partition the archive losslessly and open as a normal archive.
+fn assert_split_roundtrip(fmt: CreateFormat, tag: &str, joined_name: &str) {
+    let base = tmp(tag); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "big.bin", &vec![0x5Au8; 2_500_000]);
+    let dest = base.join(if fmt == CreateFormat::SevenZ { "vol.7z" } else { "vol.zip" });
+    let srcs = vec![CreateSource { path: src, node: "big.bin".into() }];
+    let mut o = opts(fmt); o.volume_bytes = Some(1_000_000);
+    let stats = create_archive(&srcs, &dest, &o, &mut |_| true).unwrap();
+
+    assert!(!dest.exists(), "the unsplit base path must not be created");
+    let v1 = PathBuf::from(format!("{}.001", dest.display()));
+    let v2 = PathBuf::from(format!("{}.002", dest.display()));
+    assert!(v1.exists(), "first volume must exist");
+    assert!(v2.exists(), "second volume must exist");
+
+    let joined = base.join(joined_name);
+    let vols = join_volumes(&dest, &joined);
+    assert!(vols.len() >= 3, "2.5 MB in 1 MB volumes must yield >=3 volumes");
+    for (i, v) in vols.iter().enumerate() {
+        let len = std::fs::metadata(v).unwrap().len();
+        if i + 1 < vols.len() {
+            assert_eq!(len, 1_000_000, "volume {i} must be exactly full");
+        } else {
+            assert!(len > 0 && len <= 1_000_000, "last volume size {len} out of range");
+        }
+    }
+    assert_eq!(stats.bytes_out, std::fs::metadata(&joined).unwrap().len(),
+        "stats.bytes_out must equal the total split size");
+
+    let arc = Archive::open(&joined, ArchiveOpenOptions::default()).unwrap();
+    let e = arc.entries().unwrap().into_iter()
+        .find(|e| e.path.ends_with("big.bin")).expect("big.bin present");
+    assert_eq!(
+        arc.read_entry(e.index, &ArchiveOpenOptions::default(), None).unwrap().len(),
+        2_500_000
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn splits_7z_into_volumes() {
+    assert_split_roundtrip(CreateFormat::SevenZ, "vol7z", "vol.joined.7z");
+}
+
+#[test]
+fn splits_zip_into_volumes() {
+    assert_split_roundtrip(CreateFormat::Zip, "volzip", "vol.joined.zip");
+}
+
+#[test]
+fn deletes_partial_volumes_on_cancel() {
+    let base = tmp("volcancel"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "big.bin", &vec![0x5Au8; 2_500_000]);
+    let dest = base.join("vol.7z");
+    let srcs = vec![CreateSource { path: src, node: "big.bin".into() }];
+    let mut o = opts(CreateFormat::SevenZ); o.volume_bytes = Some(1_000_000);
+    let err = create_archive(&srcs, &dest, &o, &mut |_| false)
+        .expect_err("cancelled create must fail");
+    assert_eq!(err.kind(), "error.cancelled", "got {err:?}");
+    for i in 1..=4 {
+        let p = base.join(format!("vol.7z.{i:03}"));
+        assert!(!p.exists(), "partial volume {} must be deleted on cancel", p.display());
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn rejects_volumes_for_tar_formats() {
+    let base = tmp("voltar"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "a.txt", b"x");
+    let srcs = vec![CreateSource { path: src, node: "a.txt".into() }];
+    let mut o = opts(CreateFormat::Tar); o.volume_bytes = Some(1_000_000);
+    let err = create_archive(&srcs, &base.join("out.tar"), &o, &mut |_| true)
+        .expect_err("volumes on TAR must be rejected");
+    assert_eq!(err.kind(), "error.engine", "got {err:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn rejects_password_for_tar_formats() {
     // TAR/compressed-TAR handlers have no encryption; a password request must

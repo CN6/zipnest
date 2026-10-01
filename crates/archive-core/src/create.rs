@@ -8,8 +8,10 @@
 //! the GZIP/BZIP2/XZ handler. Task 5 adds AES-256 password creation: the
 //! password is handed to the engine through `ICryptoGetTextPassword2` on the
 //! update callback, and ZIP additionally forces AES-256 via the `em` property.
-//! The guard below still rejects the not-yet-wired options (volumes/SFX); the
-//! callback/stream plumbing already carries the fields they need.
+//! Task 7 adds split volumes: for ZIP/7z the output is written to
+//! `<dest>.001`, `.002`, ... through the multi-volume stream in `outstream`,
+//! because the handler only ever sees a single stream (7-Zip's own client
+//! splits the same way). SFX remains the only rejected option.
 
 use crate::com::callbacks;
 use crate::com::outcallback::{self, SourceItem, UpdateState};
@@ -18,7 +20,8 @@ use crate::com::propvariant::PropVariant;
 use crate::com::vtables::{OutArchiveVt, SetPropertiesVt};
 use crate::com::{
     Guid, S_OK, CLSID_FORMAT_7Z, CLSID_FORMAT_BZIP2, CLSID_FORMAT_GZIP, CLSID_FORMAT_TAR,
-    CLSID_FORMAT_XZ, CLSID_FORMAT_ZIP, E_NOTIMPL, IID_IOUT_ARCHIVE, IID_ISET_PROPERTIES,
+    CLSID_FORMAT_XZ, CLSID_FORMAT_ZIP, E_FAIL, E_INVALIDARG, E_NOTIMPL, IID_IOUT_ARCHIVE,
+    IID_ISET_PROPERTIES,
 };
 use crate::dll;
 use crate::error::ZipnestError;
@@ -283,16 +286,28 @@ unsafe fn apply_properties(raw: *mut c_void, opts: &CreateOptions) {
 /// AES-256 (`em=AES256` plus the `ICryptoGetTextPassword2` callback), 7Z via
 /// its default AES-256. Plain TAR writes in one pass; the compressed TAR
 /// variants write a temporary `.tar` and wrap it. A password on the TAR family
-/// is rejected with [`ZipnestError::PasswordUnsupported`]; options not yet
-/// wired (volumes, SFX) return `E_NOTIMPL`.
+/// is rejected with [`ZipnestError::PasswordUnsupported`]. With
+/// `opts.volume_bytes`, ZIP/7z are split into `<dest>.001`, `.002`, ... (the
+/// TAR family and SFX reject volumes with `E_NOTIMPL`); SFX is not wired.
 pub fn create_archive(
     sources: &[CreateSource],
     dest: &Path,
     opts: &CreateOptions,
     progress: &mut dyn FnMut(&CreateProgress) -> bool,
 ) -> Result<CreateStats, ZipnestError> {
-    if opts.volume_bytes.is_some() || opts.sfx.is_some() {
+    if opts.sfx.is_some() {
         return Err(ZipnestError::Engine(E_NOTIMPL));
+    }
+    if let Some(limit) = opts.volume_bytes {
+        // Only the single-container formats can be split; the TAR family and
+        // SFX are out of scope. A zero volume size would divide the virtual
+        // stream by zero, so it is rejected rather than silently ignored.
+        if !matches!(opts.format, CreateFormat::Zip | CreateFormat::SevenZ) {
+            return Err(ZipnestError::Engine(E_NOTIMPL));
+        }
+        if limit == 0 {
+            return Err(ZipnestError::Engine(E_INVALIDARG));
+        }
     }
     // The TAR family has no encryption; reject a password up front rather than
     // hand back an unencrypted archive the caller believes is protected.
@@ -369,7 +384,13 @@ fn write_archive(
 
     let dll = dll::load()?;
     // Open the output stream first: if this fails, no handler ref exists yet.
-    let out = outstream::new(dest)?;
+    // With a volume size, the stream spans `<dest>.001`, `.002`, ... instead of
+    // a single `<dest>`; the handler is unaware and simply writes bytes (7-Zip's
+    // own client does exactly this, via its `CMultiOutStream`).
+    let out = match opts.volume_bytes {
+        Some(limit) => outstream::new_volumes(dest, limit)?,
+        None => outstream::new(dest)?,
+    };
 
     let mut raw: *mut c_void = std::ptr::null_mut();
     let hr = unsafe { dll.create_object(&clsid, &IID_IOUT_ARCHIVE, &mut raw) };
@@ -397,10 +418,29 @@ fn write_archive(
         (vt.update_items)(raw, out, num_items, cb)
     };
 
+    let cancelled = state.cancelled.load(Ordering::SeqCst) == 1;
+    let io_error = state.io_error.lock().ok().and_then(|mut s| s.take());
+    let update_ok = hr == S_OK && !cancelled && io_error.is_none();
+
     // Drop our references: the callback, the output stream, and the handler.
+    // A multi-volume stream is finalized only on success (truncate each volume
+    // to its logical size and keep the files); on any failure a plain release
+    // makes its destructor delete the partial volumes.
+    let mut volume_bytes = 0u64;
+    let mut finalize_failed = false;
     unsafe {
+        if opts.volume_bytes.is_some() {
+            if update_ok {
+                match outstream::finalize_volumes(out) {
+                    Some(n) => volume_bytes = n,
+                    None => finalize_failed = true,
+                }
+            }
+            outstream::release_void_volumes(out);
+        } else {
+            outstream::release_void(out);
+        }
         outcallback::release_void(cb);
-        outstream::release_void(out);
         let vt = &**(raw as *const *const OutArchiveVt);
         (vt.release)(raw);
         // Free the boxed closure cell; no callbacks can fire after UpdateItems.
@@ -418,17 +458,24 @@ fn write_archive(
 
     // Post-check order: local flags win over the handler's HRESULT (a cancel
     // we raised must report its real cause).
-    if state.cancelled.load(Ordering::SeqCst) == 1 {
+    if cancelled {
         return Err(ZipnestError::Cancelled);
     }
-    if let Some(e) = state.io_error.lock().ok().and_then(|mut s| s.take()) {
+    if let Some(e) = io_error {
         return Err(ZipnestError::Io(e));
+    }
+    if finalize_failed {
+        return Err(ZipnestError::Engine(E_FAIL));
     }
     if hr != S_OK {
         return Err(crate::error::map_hresult(hr));
     }
 
-    let bytes_out = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+    let bytes_out = if opts.volume_bytes.is_some() {
+        volume_bytes
+    } else {
+        std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0)
+    };
 
     Ok(CreateStats {
         files,
