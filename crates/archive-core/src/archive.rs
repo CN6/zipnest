@@ -1,12 +1,13 @@
 ﻿//! `Archive`: open/list entries through the 7z.dll `IInArchive` COM object.
 
 use crate::com::callbacks::OpenCallbackOwner;
-use crate::com::instream::FileStreamOwner;
+use crate::com::instream::{self, FileStreamOwner};
 use crate::com::propvariant::PropVariant;
-use crate::com::vtables::InArchiveVt;
+use crate::com::vtables::{InArchiveGetStreamVt, InArchiveVt, InStreamVt};
 use crate::com::{
     CLSID_FORMAT_7Z, CLSID_FORMAT_BZIP2, CLSID_FORMAT_GZIP, CLSID_FORMAT_ISO, CLSID_FORMAT_RAR,
-    CLSID_FORMAT_RAR5, CLSID_FORMAT_TAR, CLSID_FORMAT_XZ, CLSID_FORMAT_ZIP, Guid, S_OK,
+    CLSID_FORMAT_RAR5, CLSID_FORMAT_SPLIT, CLSID_FORMAT_TAR, CLSID_FORMAT_XZ, CLSID_FORMAT_ZIP,
+    Guid, IID_IIN_ARCHIVE_GET_STREAM, S_OK,
 };
 use crate::dll;
 use crate::error::ZipnestError;
@@ -20,11 +21,38 @@ pub struct Archive {
     _not_send: *mut (),  // keep !Send/!Sync: IInArchive is not thread-safe
 }
 
-/// Candidate handler CLSIDs for a file path (first success wins).
+/// Strip a numeric multi-volume suffix (`.001`, `.0001`, ...). 7-Zip's
+/// `Split` handler needs at least two digits, so we require the same.
+fn strip_volume_suffix(name: &str) -> Option<String> {
+    let dot = name.rfind('.')?;
+    let suffix = &name[dot + 1..];
+    if suffix.len() >= 2 && suffix.bytes().all(|b| b.is_ascii_digit()) {
+        Some(name[..dot].to_string())
+    } else {
+        None
+    }
+}
+
+/// Path of the first volume's logical archive: `<base>.7z.001` → `<base>.7z`.
+/// `None` when `path` is not a numbered volume.
+fn volume_base(path: &Path) -> Option<std::path::PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let stem = strip_volume_suffix(name)?;
+    if stem.is_empty() || !stem.contains('.') {
+        return None;
+    }
+    Some(path.with_file_name(stem))
+}
+
+/// Candidate handler CLSIDs for a file path (first success wins). A trailing
+/// volume suffix is ignored so `<base>.7z.001` selects the 7z handler.
 fn clsid_candidates(path: &Path) -> Vec<Guid> {
     let name = path
         .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
+        .map(|n| {
+            let lower = n.to_string_lossy().to_lowercase();
+            strip_volume_suffix(&lower).unwrap_or(lower)
+        })
         .unwrap_or_default();
     if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".gz") {
         return vec![CLSID_FORMAT_GZIP];
@@ -58,12 +86,23 @@ impl Archive {
     /// Open an archive (decode headers; may prompt for a password via
     /// `opts.password`).
     pub fn open(path: &Path, opts: ArchiveOpenOptions) -> Result<Archive, ZipnestError> {
+        // A numbered volume (`<base>.7z.001`) must first be assembled by the
+        // `Split` handler, then re-opened with the real format handler.
+        if volume_base(path).is_some() && !clsid_candidates(path).is_empty() {
+            return Self::open_volumes(path, opts);
+        }
+
         let dll = dll::load()?;
         let candidates = clsid_candidates(path);
         if candidates.is_empty() {
             return Err(ZipnestError::NotAnArchive);
         }
         let file = std::fs::File::open(path)?;
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
 
         let mut last_err = ZipnestError::NotAnArchive;
         for clsid in &candidates {
@@ -82,7 +121,12 @@ impl Archive {
                 continue;
             }
 
-            let cb = OpenCallbackOwner::new(opts.password.clone());
+            let cb = OpenCallbackOwner::new(
+                opts.password.clone(),
+                dir.clone(),
+                file_name.clone(),
+                true,
+            );
             let state = std::sync::Arc::clone(cb.state());
             let hr = unsafe {
                 let vt = &**(raw as *const *const InArchiveVt);
@@ -106,6 +150,119 @@ impl Archive {
             }
             last_err = map_open_error(hr, &state);
         }
+        Err(last_err)
+    }
+
+    /// Open `<base>.7z.001` / `<base>.zip.001`: let the engine's `Split`
+    /// handler read every volume through our `IArchiveOpenVolumeCallback`,
+    /// take the concatenated stream it exposes via `IInArchiveGetStream`, and
+    /// decode that stream with the real handler chosen from `<base>`.
+    fn open_volumes(path: &Path, opts: ArchiveOpenOptions) -> Result<Archive, ZipnestError> {
+        let dll = dll::load()?;
+        let candidates = clsid_candidates(path);
+        if candidates.is_empty() {
+            return Err(ZipnestError::NotAnArchive);
+        }
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        // --- Stage 1: assemble the volumes with the `Split` handler. ---
+        let file = std::fs::File::open(path)?;
+        let stream = FileStreamOwner::new(file)?;
+        let mut split_raw: *mut c_void = std::ptr::null_mut();
+        let hr = unsafe {
+            dll.create_object(&CLSID_FORMAT_SPLIT, &crate::com::IID_IIN_ARCHIVE, &mut split_raw)
+        };
+        if hr != S_OK || split_raw.is_null() {
+            unsafe { stream.release_own() };
+            return Err(crate::error::map_hresult(hr));
+        }
+        let cb = OpenCallbackOwner::new(opts.password.clone(), dir.clone(), file_name.clone(), true);
+        let hr = unsafe {
+            let vt = &**(split_raw as *const *const InArchiveVt);
+            (vt.open)(split_raw, stream.as_void(), std::ptr::null(), cb.as_void())
+        };
+        unsafe {
+            cb.release_own();
+            stream.release_own();
+        }
+        let close_split = |raw: *mut c_void| unsafe {
+            let vt = &**(raw as *const *const InArchiveVt);
+            (vt.close)(raw);
+            (vt.release)(raw);
+        };
+        if hr != S_OK {
+            close_split(split_raw);
+            return Err(ZipnestError::NotAnArchive);
+        }
+
+        // --- Stage 2: fetch the combined, seekable stream. ---
+        let mut combined: *mut c_void = std::ptr::null_mut();
+        let hr = unsafe {
+            let qi_vt = &**(split_raw as *const *const InArchiveVt);
+            let mut gs_iface: *mut c_void = std::ptr::null_mut();
+            let qhr =
+                (qi_vt.query_interface)(split_raw, &IID_IIN_ARCHIVE_GET_STREAM, &mut gs_iface);
+            if qhr != S_OK || gs_iface.is_null() {
+                (qi_vt.close)(split_raw);
+                (qi_vt.release)(split_raw);
+                return Err(ZipnestError::NotAnArchive);
+            }
+            let gs_vt = &**(gs_iface as *const *const InArchiveGetStreamVt);
+            let ghr = (gs_vt.get_stream)(gs_iface, 0, &mut combined);
+            (gs_vt.release)(gs_iface);
+            (qi_vt.close)(split_raw);
+            (qi_vt.release)(split_raw);
+            ghr
+        };
+        if hr != S_OK || combined.is_null() {
+            return Err(ZipnestError::NotAnArchive);
+        }
+
+        // --- Stage 3: decode the combined stream with the real handler. ---
+        let mut last_err = ZipnestError::NotAnArchive;
+        for clsid in &candidates {
+            // A failed attempt may have moved the shared stream; rewind.
+            unsafe {
+                let vt = &**(combined as *const *const InStreamVt);
+                (vt.seek)(combined, 0, 0, std::ptr::null_mut());
+            }
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            let hr = unsafe { dll.create_object(clsid, &crate::com::IID_IIN_ARCHIVE, &mut raw) };
+            if hr != S_OK || raw.is_null() {
+                last_err = crate::error::map_hresult(hr);
+                continue;
+            }
+            let cb = OpenCallbackOwner::new(
+                opts.password.clone(),
+                dir.clone(),
+                file_name.clone(),
+                false,
+            );
+            let state = std::sync::Arc::clone(cb.state());
+            let hr = unsafe {
+                let vt = &**(raw as *const *const InArchiveVt);
+                (vt.open)(raw, combined, std::ptr::null(), cb.as_void())
+            };
+            unsafe { cb.release_own() };
+            if hr == S_OK {
+                return Ok(Archive {
+                    raw,
+                    stream: combined,
+                    _not_send: std::ptr::null_mut(),
+                });
+            }
+            unsafe {
+                let vt = &**(raw as *const *const InArchiveVt);
+                (vt.close)(raw);
+                (vt.release)(raw);
+            }
+            last_err = map_open_error(hr, &state);
+        }
+        unsafe { instream::release_raw(combined) };
         Err(last_err)
     }
 
@@ -240,8 +397,10 @@ impl Drop for Archive {
             let vt = &**(self.raw as *const *const InArchiveVt);
             (vt.close)(self.raw);
             (vt.release)(self.raw);
-            // Release the retained input stream last.
-            crate::com::instream::release_void(self.stream);
+            // Release the retained input stream last. Dispatch through the
+            // object's own vtable: it may be ours (single file) or the engine's
+            // `CMultiStream` (assembled volumes).
+            instream::release_raw(self.stream);
         }
     }
 }

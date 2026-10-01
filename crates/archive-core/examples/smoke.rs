@@ -38,7 +38,12 @@ fn main() {
     eprintln!("[4] ok stream={:p}", stream.as_void());
 
     eprintln!("[5] building open callback...");
-    let cb = archive_core::com::callbacks::OpenCallbackOwner::new(None);
+    let cb = archive_core::com::callbacks::OpenCallbackOwner::new(
+        None,
+        std::path::PathBuf::new(),
+        String::new(),
+        false,
+    );
     eprintln!("[5] ok cb={:p}", cb.as_void());
 
     eprintln!("[6] IInArchive::Open...");

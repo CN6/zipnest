@@ -5,22 +5,34 @@
 //! the two interfaces have different vtables (slot 3 conflicts:
 //! `SetTotal` vs `CryptoGetTextPassword`).
 
-use super::propvariant::alloc_bstr;
-use super::vtables::{ArchiveOpenCallbackVt, CryptoGetTextPassword2Vt, CryptoGetTextPasswordVt};
+use super::instream::FileStreamOwner;
+use super::propvariant::{alloc_bstr, PropVariant, VT_EMPTY, KPID_NAME};
+use super::vtables::{
+    ArchiveOpenCallbackVt, CryptoGetTextPassword2Vt, CryptoGetTextPasswordVt,
+    OpenVolumeCallbackVt,
+};
 use super::{as_void, Guid, Hresult, ComObject, E_FAIL, E_NOINTERFACE,
-    IID_ICRYPTO_GET_TEXT_PASSWORD, IID_ICRYPTO_GET_TEXT_PASSWORD2, IID_IARCHIVE_OPEN_CALLBACK,
-    IID_IUNKNOWN, S_OK};
+    IID_ICRYPTO_GET_TEXT_PASSWORD, IID_ICRYPTO_GET_TEXT_PASSWORD2,
+    IID_IARCHIVE_OPEN_CALLBACK, IID_IARCHIVE_OPEN_VOLUME_CALLBACK,
+    IID_IUNKNOWN, S_FALSE, S_OK};
 use std::os::raw::c_void;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-/// Password material for one open operation — memory only, never logged.
+/// Password material + multi-volume lookup for one open operation — memory
+/// only, never logged.
 pub struct OpenState {
     pub password: Option<String>,
     /// Set when the engine actually asked for a password (via
     /// `ICryptoGetTextPassword`). Lets `Archive::open` distinguish
     /// "password required/incorrect" from "not an archive".
     pub asked: std::sync::atomic::AtomicU8,
+    /// Directory of the file being opened; volume names are resolved here.
+    pub volume_dir: PathBuf,
+    /// File name of the first volume (e.g. `vol.7z.001`), reported through
+    /// `IArchiveOpenVolumeCallback::GetProperty(kpidName)`.
+    pub volume_name: String,
 }
 
 #[repr(C)]
@@ -29,11 +41,23 @@ pub struct OpenCallback {
     refs: AtomicU32,
     state: Arc<OpenState>,
     crypto: *mut CryptoCallback,
+    volume: *mut VolumeCallback,
 }
 
 #[repr(C)]
 pub struct CryptoCallback {
     obj: ComObject<CryptoGetTextPasswordVt>,
+    refs: AtomicU32,
+    state: Arc<OpenState>,
+}
+
+/// Third interface of the open pair: `IArchiveOpenVolumeCallback`. It gets its
+/// own object (and thus its own vtable) because its post-IUnknown slots
+/// (`GetProperty`/`GetStream`) differ from `IArchiveOpenCallback`'s
+/// (`SetTotal`/`SetCompleted`); one object cannot serve both.
+#[repr(C)]
+pub struct VolumeCallback {
+    obj: ComObject<OpenVolumeCallbackVt>,
     refs: AtomicU32,
     state: Arc<OpenState>,
 }
@@ -51,6 +75,14 @@ static CRYPTO_VT: CryptoGetTextPasswordVt = CryptoGetTextPasswordVt {
     add_ref: crypto_add_ref,
     release: crypto_release,
     get_text_password,
+};
+
+static VOLUME_VT: OpenVolumeCallbackVt = OpenVolumeCallbackVt {
+    query_interface: volume_qi,
+    add_ref: volume_add_ref,
+    release: volume_release,
+    get_property: volume_get_property,
+    get_stream: volume_get_stream,
 };
 
 // ---- IArchiveOpenCallback object ----
@@ -74,6 +106,17 @@ unsafe extern "system" fn open_qi(
         let crypto = (*this).crypto;
         *ppv = crypto as *mut c_void;
         crypto_add_ref(crypto as *mut c_void);
+        S_OK
+    } else if *iid == IID_IARCHIVE_OPEN_VOLUME_CALLBACK {
+        // Multi-volume companion; may be absent when the caller chose not to
+        // expose volume lookup (the re-open stage of a `.NNN` file).
+        let volume = (*this).volume;
+        if volume.is_null() {
+            *ppv = std::ptr::null_mut();
+            return E_NOINTERFACE;
+        }
+        *ppv = volume as *mut c_void;
+        volume_add_ref(volume as *mut c_void);
         S_OK
     } else {
         *ppv = std::ptr::null_mut();
@@ -172,6 +215,100 @@ unsafe extern "system" fn get_text_password(
         None => {
             *password = std::ptr::null_mut();
             E_FAIL
+        }
+    }
+}
+
+// ---- IArchiveOpenVolumeCallback object ----
+
+unsafe extern "system" fn volume_qi(
+    this: *mut c_void,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> Hresult {
+    if riid.is_null() || ppv.is_null() {
+        return E_FAIL;
+    }
+    let iid = &*riid;
+    if *iid == IID_IUNKNOWN || *iid == IID_IARCHIVE_OPEN_VOLUME_CALLBACK {
+        *ppv = this;
+        volume_add_ref(this);
+        S_OK
+    } else {
+        *ppv = std::ptr::null_mut();
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn volume_add_ref(this: *mut c_void) -> u32 {
+    let this = this as *mut VolumeCallback;
+    (*this).refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn volume_release(this: *mut c_void) -> u32 {
+    let this = this as *mut VolumeCallback;
+    let left = (*this).refs.fetch_sub(1, Ordering::Release) - 1;
+    if left == 0 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        drop(Box::from_raw(this));
+    }
+    left
+}
+
+/// `kpidName` → the first volume's file name (e.g. `vol.7z.001`), which the
+/// `Split` handler parses to derive the rest of the sequence. Anything else is
+/// reported as `VT_EMPTY`.
+unsafe extern "system" fn volume_get_property(
+    this: *mut c_void,
+    prop_id: u32,
+    value: *mut PropVariant,
+) -> Hresult {
+    if value.is_null() {
+        return E_FAIL;
+    }
+    if prop_id == KPID_NAME {
+        let obj: &VolumeCallback = &*(this as *mut VolumeCallback);
+        *value = PropVariant::from_bstr(&obj.state.volume_name);
+        S_OK
+    } else {
+        (*value).vt = VT_EMPTY;
+        S_OK
+    }
+}
+
+/// Open a sibling volume by name in the first volume's directory. A missing
+/// file yields `S_FALSE`, which tells the `Split` handler the sequence ended.
+unsafe extern "system" fn volume_get_stream(
+    this: *mut c_void,
+    name: *const u16,
+    in_stream: *mut *mut c_void,
+) -> Hresult {
+    if name.is_null() || in_stream.is_null() {
+        return E_FAIL;
+    }
+    let obj: &VolumeCallback = &*(this as *mut VolumeCallback);
+    let mut len = 0usize;
+    while *name.add(len) != 0 {
+        len += 1;
+    }
+    let file_name = String::from_utf16_lossy(std::slice::from_raw_parts(name, len));
+    let path = obj.state.volume_dir.join(file_name);
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => {
+            *in_stream = std::ptr::null_mut();
+            return S_FALSE;
+        }
+    };
+    match FileStreamOwner::new(file) {
+        Ok(owner) => {
+            // Hand our single reference to the engine; it will Release it.
+            *in_stream = owner.into_raw();
+            S_OK
+        }
+        Err(_) => {
+            *in_stream = std::ptr::null_mut();
+            S_FALSE
         }
     }
 }
@@ -280,6 +417,8 @@ pub(crate) fn crypto_new(password: Option<String>) -> *mut CryptoPair {
     let state = Arc::new(OpenState {
         password,
         asked: std::sync::atomic::AtomicU8::new(0),
+        volume_dir: PathBuf::new(),
+        volume_name: String::new(),
     });
     let v1 = Box::into_raw(Box::new(CryptoCallback {
         obj: ComObject { vt: &CRYPTO_VT },
@@ -341,17 +480,29 @@ pub(crate) unsafe fn qi_hand_out_crypto(
     }
 }
 
-/// Owns the callback pair for one `Open` call.
+/// Owns the callback objects for one `Open` call.
 pub struct OpenCallbackOwner {
     open: *mut OpenCallback,
     crypto: *mut CryptoCallback,
+    volume: *mut VolumeCallback,
 }
 
 impl OpenCallbackOwner {
-    pub fn new(password: Option<String>) -> Self {
+    /// `volume_dir`/`volume_name` describe the file being opened so the volume
+    /// callback can resolve sibling `.NNN` volumes. Pass `with_volume = false`
+    /// for a re-open stage that must not perform its own volume discovery
+    /// (the combined stream already carries every volume).
+    pub fn new(
+        password: Option<String>,
+        volume_dir: PathBuf,
+        volume_name: String,
+        with_volume: bool,
+    ) -> Self {
         let state = Arc::new(OpenState {
             password,
             asked: std::sync::atomic::AtomicU8::new(0),
+            volume_dir,
+            volume_name,
         });
         let crypto = Box::new(CryptoCallback {
             obj: ComObject { vt: &CRYPTO_VT },
@@ -359,15 +510,27 @@ impl OpenCallbackOwner {
             state: Arc::clone(&state),
         });
         let crypto = Box::into_raw(crypto);
+        let volume = if with_volume {
+            let v = Box::new(VolumeCallback {
+                obj: ComObject { vt: &VOLUME_VT },
+                refs: AtomicU32::new(1),
+                state: Arc::clone(&state),
+            });
+            Box::into_raw(v)
+        } else {
+            std::ptr::null_mut()
+        };
         let open = Box::new(OpenCallback {
             obj: ComObject { vt: &OPEN_VT },
             refs: AtomicU32::new(1),
             state,
             crypto,
+            volume,
         });
         OpenCallbackOwner {
             open: Box::into_raw(open),
             crypto,
+            volume,
         }
     }
 
@@ -388,9 +551,13 @@ impl OpenCallbackOwner {
     pub unsafe fn release_own(self) {
         let open = self.open;
         let crypto = self.crypto;
+        let volume = self.volume;
         std::mem::forget(self);
         (OPEN_VT.release)(open as *mut c_void);
         (CRYPTO_VT.release)(crypto as *mut c_void);
+        if !volume.is_null() {
+            (VOLUME_VT.release)(volume as *mut c_void);
+        }
     }
 }
 
@@ -399,6 +566,9 @@ impl Drop for OpenCallbackOwner {
         unsafe {
             (OPEN_VT.release)(self.open as *mut c_void);
             (CRYPTO_VT.release)(self.crypto as *mut c_void);
+            if !self.volume.is_null() {
+                (VOLUME_VT.release)(self.volume as *mut c_void);
+            }
         }
     }
 }

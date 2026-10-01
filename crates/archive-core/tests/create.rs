@@ -380,6 +380,36 @@ fn splits_zip_into_volumes() {
 }
 
 #[test]
+fn opens_split_7z_from_first_volume() {
+    let base = tmp("rvol7z"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "big.bin", &vec![0x33u8; 2_500_000]);
+    let dest = base.join("vol.7z");
+    let srcs = vec![CreateSource { path: src, node: "big.bin".into() }];
+    let mut o = opts(CreateFormat::SevenZ); o.volume_bytes = Some(1_000_000);
+    create_archive(&srcs, &dest, &o, &mut |_| true).unwrap();
+    assert!(base.join("vol.7z.002").exists());
+    let arc = Archive::open(&base.join("vol.7z.001"), ArchiveOpenOptions::default()).unwrap();
+    let e = arc.entries().unwrap().into_iter().find(|e| e.path.ends_with("big.bin")).expect("entry");
+    assert_eq!(arc.read_entry(e.index, &ArchiveOpenOptions::default(), None).unwrap().len(), 2_500_000);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn opens_split_zip_from_first_volume() {
+    let base = tmp("rvolzip"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "big.bin", &vec![0x44u8; 2_500_000]);
+    let dest = base.join("vol.zip");
+    let srcs = vec![CreateSource { path: src, node: "big.bin".into() }];
+    let mut o = opts(CreateFormat::Zip); o.volume_bytes = Some(1_000_000);
+    create_archive(&srcs, &dest, &o, &mut |_| true).unwrap();
+    assert!(base.join("vol.zip.002").exists());
+    let arc = Archive::open(&base.join("vol.zip.001"), ArchiveOpenOptions::default()).unwrap();
+    let e = arc.entries().unwrap().into_iter().find(|e| e.path.ends_with("big.bin")).expect("entry");
+    assert_eq!(arc.read_entry(e.index, &ArchiveOpenOptions::default(), None).unwrap().len(), 2_500_000);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn deletes_partial_volumes_on_cancel() {
     let base = tmp("volcancel"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
     let src = write_src(&base, "big.bin", &vec![0x5Au8; 2_500_000]);

@@ -66,6 +66,8 @@ pub const IID_ICRYPTO_GET_TEXT_PASSWORD: Guid = guid7(5, 0x10);
 pub const IID_ICRYPTO_GET_TEXT_PASSWORD2: Guid = guid7(5, 0x11);
 pub const IID_IARCHIVE_OPEN_CALLBACK: Guid = guid7(6, 0x10);
 pub const IID_IARCHIVE_EXTRACT_CALLBACK: Guid = guid7(6, 0x20);
+pub const IID_IARCHIVE_OPEN_VOLUME_CALLBACK: Guid = guid7(6, 0x30);
+pub const IID_IIN_ARCHIVE_GET_STREAM: Guid = guid7(6, 0x40);
 pub const IID_IIN_ARCHIVE: Guid = guid7(6, 0x60);
 pub const IID_IOUT_STREAM: Guid = guid7(3, 0x04);
 pub const IID_IOUT_ARCHIVE: Guid = guid7(6, 0xA0);
@@ -80,6 +82,7 @@ pub const CLSID_FORMAT_XZ: Guid = handler_guid(0x0C);
 pub const CLSID_FORMAT_7Z: Guid = handler_guid(0x07);
 pub const CLSID_FORMAT_RAR5: Guid = handler_guid(0xCC);
 pub const CLSID_FORMAT_ISO: Guid = handler_guid(0xE7);
+pub const CLSID_FORMAT_SPLIT: Guid = handler_guid(0xEA);
 pub const CLSID_FORMAT_TAR: Guid = handler_guid(0xEE);
 pub const CLSID_FORMAT_GZIP: Guid = handler_guid(0xEF);
 

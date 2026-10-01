@@ -180,11 +180,14 @@ impl Drop for FileStreamOwner {
     }
 }
 
-/// Release a raw stream pointer previously handed out by
-/// [`FileStreamOwner::into_raw`] (used by `Archive::drop`).
-pub unsafe fn release_void(p: *mut c_void) {
+/// Release a stream through *its own* vtable. Needed because `Archive` may
+/// hold either one of our `FileStreamOwner`s or a foreign `IInStream` returned
+/// by `IInArchiveGetStream` (the engine's `CMultiStream`); both share the
+/// IUnknown+Read+Seek layout, so dispatch must go through the object.
+pub unsafe fn release_raw(p: *mut c_void) {
     if !p.is_null() {
-        (IN_STREAM_VT.release)(p);
+        let vt = &**(p as *const *const InStreamVt);
+        (vt.release)(p);
     }
 }
 

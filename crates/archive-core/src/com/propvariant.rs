@@ -14,6 +14,10 @@ pub const VT_FILETIME: u16 = 64;
 
 /// PROPID values (vendor notes §6; PropID.h enum counted).
 pub const KPID_PATH: u32 = 3;
+/// `kpidName` (PropID.h, enum counted from `kpidNoProperty = 0`): the 7-Zip
+/// `Split` handler asks the volume callback for this to learn the first
+/// volume's file name (e.g. `vol.7z.001`).
+pub const KPID_NAME: u32 = 4;
 pub const KPID_IS_DIR: u32 = 6;
 pub const KPID_SIZE: u32 = 7;
 pub const KPID_MTIME: u32 = 12;

@@ -116,6 +116,39 @@ pub struct ArchiveOpenCallbackVt {
     ) -> Hresult,
 }
 
+/// `IArchiveOpenVolumeCallback` = IUnknown + GetProperty + GetStream
+/// (IArchive.h `Z7_IFACEM_IArchiveOpenVolumeCallback`, guid 6:0x30).
+/// The `Split` handler queries this to discover and open the remaining
+/// `.NNN` volumes.
+#[repr(C)]
+pub struct OpenVolumeCallbackVt {
+    pub query_interface: QueryInterfaceFn,
+    pub add_ref: AddRefFn,
+    pub release: ReleaseFn,
+    pub get_property: unsafe extern "system" fn(
+        this: *mut c_void,
+        prop_id: u32,
+        value: *mut PropVariant,
+    ) -> Hresult,
+    pub get_stream: unsafe extern "system" fn(
+        this: *mut c_void,
+        name: *const u16,
+        in_stream: *mut *mut c_void,
+    ) -> Hresult,
+}
+
+/// `IInArchiveGetStream` = IUnknown + GetStream (guid 6:0x40). Exposes an
+/// exposed handler entry as a raw stream (the `Split` handler uses it to hand
+/// back the concatenated volume stream).
+#[repr(C)]
+pub struct InArchiveGetStreamVt {
+    pub query_interface: QueryInterfaceFn,
+    pub add_ref: AddRefFn,
+    pub release: ReleaseFn,
+    pub get_stream:
+        unsafe extern "system" fn(this: *mut c_void, index: u32, stream: *mut *mut c_void) -> Hresult,
+}
+
 /// `ICryptoGetTextPassword` (IPassword.h) — single method after IUnknown.
 #[repr(C)]
 pub struct CryptoGetTextPasswordVt {
