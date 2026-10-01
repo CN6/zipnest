@@ -655,7 +655,7 @@ fn create_archive_emits_finished_ok() {
 - Produces: 工具栏“新建压缩包”入口 → `CreateWizard`（源列表、目标、格式、等级、方法、密码、加密文件名、分卷、SFX）→ 调用 command → 进度复用 `job_progress`/`job_finished`。
 
 - [ ] **Step 1: 命令**（照既有命令风格）`#[tauri::command] pub fn create_archive(state: State<IpcService>, sources: Vec<String>, dest: String, options: serde_json::Value) -> Result<u64, IpcError>`；在 `lib.rs` handler 列表注册。
-- [ ] **Step 2: 向导组件 + i18n**：新增 `create.*` keys（两语齐全）；`CreateWizard.tsx` 用 Fluent `Dialog`/`Dropdown`/`Input`；SFX 勾选时强制 7z 且加密文件名在 zip 下置灰。
+- [ ] **Step 2: 向导组件 + i18n**：新增 `create.*` keys（两语齐全）；**并补齐 Task 5 引入的 `error.password_unsupported`**（加入 `apps/zipnest/src/i18n/index.test.ts` 的 `RUST_ERROR_KEYS` 列表 + `zh-CN.json`/`en-US.json` 文案，满足"每个 key 两语齐全"不变式）；`CreateWizard.tsx` 用 Fluent `Dialog`/`Dropdown`/`Input`；SFX 勾选时强制 7z；密码字段在 TAR 家族下禁用（引擎侧已返回 `error.password_unsupported` 兜底），加密文件名在 zip 下置灰。
 - [ ] **Step 3: 接线**：`useArchive.ts` 加 `startCreate()`；App 工具栏按钮。
 - [ ] **Step 4: 验证 + Commit** `pnpm build` + `pnpm test` 绿；`git commit -am "feat(web): create wizard"`
 
