@@ -38,6 +38,11 @@ pub struct PropVariant {
     pub reserved2: u16,
     pub reserved3: u16,
     pub data: u64,
+    /// The Windows `PROPVARIANT` union is 16 bytes on x64 (it contains
+    /// `DECIMAL`), so `sizeof(PROPVARIANT)` is 24. Arrays handed to the engine
+    /// (e.g. `ISetProperties`) are indexed with that stride; this tail keeps
+    /// our array stride correct and gives the engine room to write.
+    pub reserved4: u64,
 }
 
 impl PropVariant {
@@ -49,6 +54,7 @@ impl PropVariant {
             reserved1: 0,
             reserved2: 0,
             reserved3: 0,
+            reserved4: 0,
             data: 0,
         }
     }
@@ -112,6 +118,7 @@ impl PropVariant {
             reserved1: 0,
             reserved2: 0,
             reserved3: 0,
+            reserved4: 0,
             data: alloc_bstr(s) as u64,
         }
     }
@@ -123,6 +130,7 @@ impl PropVariant {
             reserved1: 0,
             reserved2: 0,
             reserved3: 0,
+            reserved4: 0,
             data: v as u64,
         }
     }
@@ -134,6 +142,7 @@ impl PropVariant {
             reserved1: 0,
             reserved2: 0,
             reserved3: 0,
+            reserved4: 0,
             data: v,
         }
     }
@@ -145,6 +154,7 @@ impl PropVariant {
             reserved1: 0,
             reserved2: 0,
             reserved3: 0,
+            reserved4: 0,
             data: (if v { -1i32 } else { 0 }) as u32 as u64,
         }
     }
@@ -160,6 +170,7 @@ impl PropVariant {
             reserved1: 0,
             reserved2: 0,
             reserved3: 0,
+            reserved4: 0,
             data: ticks,
         }
     }

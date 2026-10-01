@@ -146,8 +146,16 @@ offset 2:  wReserved1: u16    // 7-Zip: time precision level for VT_FILETIME
 offset 4:  wReserved2: u16
 offset 6:  wReserved3: u16
 offset 8:  data: 8 bytes      // union payload (pointer-sized)
-total 16 bytes
+offset 16: tail padding: 8 bytes
+total 24 bytes on x64
 ```
+
+On x64 the `PROPVARIANT` union contains `DECIMAL` (16 bytes), so
+`sizeof(PROPVARIANT) == 24`, NOT 16 (16 is the x86 size). This matters for
+**arrays** of variants (e.g. `ISetProperties`): the engine indexes with a
+24-byte stride, so a 16-byte Rust struct misreads every element after the
+first. The Rust `PropVariant` in `crates/archive-core/src/com/propvariant.rs`
+therefore carries an 8-byte tail.
 
 - Init to `vt = VT_EMPTY (0)` before every call: the callee may
   `VariantClear()` the input value (IArchive.h lines 30-41).
