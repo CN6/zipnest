@@ -2,3 +2,6 @@
 *.log
 
 /.superpowers/
+
+/dist-portable/
+/ZipNest_*.zip

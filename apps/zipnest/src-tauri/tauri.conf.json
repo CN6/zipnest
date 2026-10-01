@@ -23,7 +23,19 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
+    "category": "Utility",
+    "resources": {
+      "resources/engines/7z.dll": "engines/7z.dll",
+      "resources/engines/sfx/7z.sfx": "engines/sfx/7z.sfx",
+      "resources/engines/sfx/7zCon.sfx": "engines/sfx/7zCon.sfx",
+      "resources/licenses/7zip.txt": "licenses/7zip.txt"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
