@@ -248,30 +248,59 @@ impl IpcService {
         self.settings.lock().map_err(|_| IpcError::new("error.engine"))
     }
 
-    /// Register or unregister the per-user Explorer integration for `exe`, then
-    /// remember the choice. The registry side is injected through `applier` so
+    /// Register or unregister the per-user Explorer integration for `exe`,
+    /// then remember the choice. Each component (file associations, and the
+    /// three context-menu targets) is applied independently: a hardened OS
+    /// can deny one injection point while the rest still succeed, so the
+    /// outcome carries a warning key per denied component instead of failing
+    /// the whole save. The registry side is injected through `applier` so
     /// tests never touch the real registry.
     pub fn shell_register(
         &self,
         exe: &std::path::Path,
         opts: crate::shell::ShellOptions,
         applier: &dyn crate::shell::ShellApplier,
-    ) -> Result<Settings, IpcError> {
+    ) -> Result<crate::shell::ShellRegisterResult, IpcError> {
         use crate::shell;
-        let assoc = if opts.associate { shell::assoc_ops(exe) } else { shell::assoc_removals() };
-        let menu = if opts.context_menu {
-            shell::context_menu_ops(exe)
+        let mut warnings = Vec::new();
+
+        let associate_ok = if opts.associate {
+            let ok = applier.run(&shell::assoc_ops(exe)).is_ok();
+            if !ok {
+                warnings.push("error.shell.associate".into());
+            }
+            ok
         } else {
-            shell::context_menu_removals()
+            let _ = applier.run(&shell::assoc_removals());
+            false
         };
-        applier
-            .run(&assoc)
-            .and_then(|()| applier.run(&menu))
-            .map_err(|_| IpcError::new("error.io"))?;
-        self.lock_settings()?.set(SettingsPatch {
-            associate: Some(opts.associate),
-            context_menu: Some(opts.context_menu),
+
+        let mut menu_ok = false;
+        if opts.context_menu {
+            for (key, ops) in [
+                ("error.shell.file_menu", shell::file_menu_ops(exe)),
+                ("error.shell.directory_menu", shell::directory_menu_ops(exe)),
+                ("error.shell.background_menu", shell::background_menu_ops(exe)),
+            ] {
+                if applier.run(&ops).is_ok() {
+                    menu_ok = true;
+                } else {
+                    warnings.push(key.into());
+                }
+            }
+        } else {
+            let _ = applier.run(&shell::context_menu_removals());
+        }
+
+        let settings = self.lock_settings()?.set(SettingsPatch {
+            associate: Some(opts.associate && associate_ok),
+            context_menu: Some(opts.context_menu && menu_ok),
             ..Default::default()
+        })?;
+        Ok(crate::shell::ShellRegisterResult {
+            associate: settings.associate,
+            context_menu: settings.context_menu,
+            warnings,
         })
     }
 
@@ -509,6 +538,25 @@ mod tests {
         }
     }
 
+    /// Fails exactly the all-files context-menu target, like a hardened OS.
+    struct PartialFail;
+
+    impl ShellApplier for PartialFail {
+        fn run(&self, ops: &[RegOp]) -> std::io::Result<()> {
+            let blocked = ops.iter().any(|o| match o {
+                RegOp::SetValue { key, .. } | RegOp::DeleteKey { key } => {
+                    key.contains(r"\*\shell")
+                }
+                RegOp::DeleteValue { .. } => false,
+            });
+            if blocked {
+                Err(std::io::Error::other("access denied"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     fn service_with_settings(name: &str) -> IpcService {
         let root = std::env::temp_dir().join(format!("zipnest-svc-{}-{name}", std::process::id()));
         IpcService::with_settings_path(
@@ -545,5 +593,23 @@ mod tests {
             .unwrap()
             .iter()
             .all(|o| matches!(o, RegOp::DeleteKey { .. } | RegOp::DeleteValue { .. })));
+    }
+
+    #[test]
+    fn shell_register_survives_partial_denial() {
+        let svc = service_with_settings("partial");
+        let exe = std::path::Path::new(r"C:\Apps\ZipNest.exe");
+        let out = svc
+            .shell_register(
+                exe,
+                ShellOptions { associate: true, context_menu: true },
+                &PartialFail,
+            )
+            .unwrap();
+        // Associations and the two allowed menu targets applied; the
+        // all-files entry was denied and surfaced as a warning.
+        assert!(out.associate);
+        assert!(out.context_menu);
+        assert_eq!(out.warnings, vec!["error.shell.file_menu".to_string()]);
     }
 }

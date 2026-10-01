@@ -17,6 +17,10 @@ const RUST_ERROR_KEYS = [
   "error.quota_exceeded",
   "error.io",
   "error.settings.invalid",
+  "error.shell.associate",
+  "error.shell.file_menu",
+  "error.shell.directory_menu",
+  "error.shell.background_menu",
 ];
 
 describe("i18n", () => {

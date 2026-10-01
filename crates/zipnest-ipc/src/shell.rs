@@ -6,7 +6,7 @@
 //! actual writes go through [`ShellApplier`], which the app wires to `reg.exe`
 //! and tests wire to a recorder.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Archive extensions ZipNest can open, in the order the UI lists them.
 pub const SUPPORTED_EXTENSIONS: [&str; 9] =
@@ -115,33 +115,69 @@ pub fn assoc_removals() -> Vec<RegOp> {
     ops
 }
 
-/// Context-menu ops: right-click a file/folder/background → open in ZipNest.
-pub fn context_menu_ops(exe: &std::path::Path) -> Vec<RegOp> {
-    let icon = format!("{},0", quoted(exe));
-    let mut ops = Vec::new();
-    for (base, arg) in [
-        (r"*\shell\ZipNest", "\"%1\""),
-        (r"Directory\shell\ZipNest", "\"%1\""),
-        (r"Directory\Background\shell\ZipNest", "\"%V\""),
-    ] {
-        let key = format!(r"{CLASSES}\{base}");
-        ops.push(RegOp::set(key.clone(), Some("MUIVerb"), "ZipNest"));
-        ops.push(RegOp::set(key.clone(), Some("Icon"), icon.clone()));
-        ops.push(RegOp::set(
-            format!(r"{key}\command"),
-            None,
-            format!("{} {arg}", quoted(exe)),
-        ));
-    }
-    ops
+/// One Explorer context target. Kept separate because a hardened machine can
+/// deny `*\shell` (all files) or `Directory\Background\shell` while still
+/// allowing the others, so the UI reports them independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuTarget {
+    File,
+    Directory,
+    Background,
 }
 
-/// Undo [`context_menu_ops`].
+fn menu_key(target: MenuTarget) -> String {
+    let base = match target {
+        MenuTarget::File => r"*\shell\ZipNest",
+        MenuTarget::Directory => r"Directory\shell\ZipNest",
+        MenuTarget::Background => r"Directory\Background\shell\ZipNest",
+    };
+    format!(r"{CLASSES}\{base}")
+}
+
+/// Context-menu ops for one target. Files and folders get `%1`; the desktop /
+/// folder background gets `%V` (the folder itself).
+pub fn menu_ops(target: MenuTarget, exe: &std::path::Path) -> Vec<RegOp> {
+    let (base, arg) = match target {
+        MenuTarget::File => (r"*\shell\ZipNest", "\"%1\""),
+        MenuTarget::Directory => (r"Directory\shell\ZipNest", "\"%1\""),
+        MenuTarget::Background => (r"Directory\Background\shell\ZipNest", "\"%V\""),
+    };
+    let key = format!(r"{CLASSES}\{base}");
+    vec![
+        RegOp::set(key.clone(), Some("MUIVerb"), "ZipNest"),
+        RegOp::set(key.clone(), Some("Icon"), format!("{},0", quoted(exe))),
+        RegOp::set(format!(r"{key}\command"), None, format!("{} {arg}", quoted(exe))),
+    ]
+}
+
+pub fn file_menu_ops(exe: &std::path::Path) -> Vec<RegOp> {
+    menu_ops(MenuTarget::File, exe)
+}
+
+pub fn directory_menu_ops(exe: &std::path::Path) -> Vec<RegOp> {
+    menu_ops(MenuTarget::Directory, exe)
+}
+
+pub fn background_menu_ops(exe: &std::path::Path) -> Vec<RegOp> {
+    menu_ops(MenuTarget::Background, exe)
+}
+
+/// Undo every context-menu entry.
 pub fn context_menu_removals() -> Vec<RegOp> {
-    [r"*\shell\ZipNest", r"Directory\shell\ZipNest", r"Directory\Background\shell\ZipNest"]
+    [MenuTarget::File, MenuTarget::Directory, MenuTarget::Background]
         .iter()
-        .map(|base| RegOp::DeleteKey { key: format!(r"{CLASSES}\{base}") })
+        .map(|t| RegOp::DeleteKey { key: menu_key(*t) })
         .collect()
+}
+
+/// Outcome of a (possibly partial) integration update. `warnings` holds one
+/// i18n key per component the OS denied, so a hardened machine blocks only
+/// that piece instead of the whole save.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShellRegisterResult {
+    pub associate: bool,
+    pub context_menu: bool,
+    pub warnings: Vec<String>,
 }
 
 /// Applies generated ops. Implemented for real by [`WindowsRegistry`] and by
@@ -257,18 +293,28 @@ mod tests {
 
     #[test]
     fn context_menu_uses_percent_one_and_percent_v() {
-        let ops = context_menu_ops(exe());
-        let file = find_set(&ops, r"HKCU\Software\Classes\*\shell\ZipNest\command", None);
+        let file_ops = file_menu_ops(exe());
+        let bg_ops = background_menu_ops(exe());
+        let file = find_set(&file_ops, r"HKCU\Software\Classes\*\shell\ZipNest\command", None);
         let bg = find_set(
-            &ops,
+            &bg_ops,
             r"HKCU\Software\Classes\Directory\Background\shell\ZipNest\command",
             None,
         );
         assert_eq!(file, Some(r#""C:\Program Files\ZipNest\ZipNest.exe" "%1""#));
         assert_eq!(bg, Some(r#""C:\Program Files\ZipNest\ZipNest.exe" "%V""#));
         assert_eq!(
-            find_set(&ops, r"HKCU\Software\Classes\*\shell\ZipNest", Some("MUIVerb")),
+            find_set(&file_ops, r"HKCU\Software\Classes\*\shell\ZipNest", Some("MUIVerb")),
             Some("ZipNest")
+        );
+    }
+
+    #[test]
+    fn directory_menu_uses_percent_one() {
+        let ops = directory_menu_ops(exe());
+        assert_eq!(
+            find_set(&ops, r"HKCU\Software\Classes\Directory\shell\ZipNest\command", None),
+            Some(r#""C:\Program Files\ZipNest\ZipNest.exe" "%1""#)
         );
     }
 

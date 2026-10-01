@@ -8,6 +8,7 @@ interface Props {
   onOpen: () => void;
   onNew: () => void;
   onExtract: () => void;
+  onSettings: () => void;
   archivePath: string;
   selectedCount: number;
   extractEnabled: boolean;
@@ -21,6 +22,7 @@ export default function Toolbar({
   onOpen,
   onNew,
   onExtract,
+  onSettings,
   archivePath,
   selectedCount,
   extractEnabled,
@@ -44,6 +46,9 @@ export default function Toolbar({
       {selectedCount > 0 && (
         <span className="toolbar-sel">{t("browser.selected_count", { count: selectedCount })}</span>
       )}
+      <Button appearance="subtle" size="small" onClick={onSettings}>
+        {t("settings.title")}
+      </Button>
       <Button appearance="subtle" size="small" onClick={onToggleLocale}>
         {locale === "zh-CN" ? "EN" : "中文"}
       </Button>

@@ -45,7 +45,22 @@
 - [x] 1 设置持久化（`caeedca`）
 - [x] 2 Shell 集成（HKCU，`reg.exe`；`shell_register` 命令）
 - [x] 3 托盘 / 单实例 / 外部调起（`open_file_request` + `launch_file`）
-- [ ] 4 设置 UI
+- [x] 3 托盘 / 单实例 / 外部调起（`open_file_request` + `launch_file`）
+- [x] 4 设置 UI（语言/目录/覆盖/限额/关联开关）
 - [ ] 5 i18n 全量
 - [ ] 6 打包
 - [ ] 7 验收
+
+## 实机发现（2026-10-01）
+
+本机对 Explorer 注入点有 ACL 封锁（spec §10 风险的更强版本）：
+
+| 目标 | 结果 |
+|---|---|
+| `HKCU\Software\Classes\ZipNest.<ext>` + `.ext\OpenWithProgids`（关联） | ✅ 可写 |
+| `Directory\shell\ZipNest`（文件夹右键） | ✅ 可写 |
+| `*\shell\ZipNest`（所有文件右键） | ❌ Access denied |
+| `Directory\Background\shell\ZipNest`（空白处右键） | ❌ Access denied |
+
+因此 `shell_register` 改为**按组件独立应用 + 逐项 warning**（`ShellRegisterResult`），
+单个注入点被拒不再让整次保存失败；设置页会回滚被拒的开关并显示原因。

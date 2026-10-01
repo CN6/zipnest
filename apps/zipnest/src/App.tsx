@@ -12,12 +12,13 @@ import "./App.css";
 
 import { getLocale, setLocale, t, Locale } from "./i18n";
 import { ArchiveApi, useArchive } from "./hooks/useArchive";
-import { CreateOptions, EntryDto, openEntry, revealInExplorer } from "./ipc";
+import { CreateOptions, EntryDto, openEntry, revealInExplorer, settingsGet } from "./ipc";
 import Toolbar from "./components/Toolbar";
 import Breadcrumbs from "./components/Breadcrumbs";
 import EntryTable from "./components/EntryTable";
 import ExtractDialog from "./components/ExtractDialog";
 import CreateWizard from "./components/CreateWizard";
+import SettingsDialog from "./components/SettingsDialog";
 import PasswordDialog from "./components/PasswordDialog";
 import ProgressBarStrip from "./components/ProgressBar";
 import PreviewPanel from "./components/PreviewPanel";
@@ -48,6 +49,7 @@ export default function App() {
   const [locale, setLocaleState] = useState<Locale>(getLocale());
   const [extractOpen, setExtractOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   // Context menu: the entry it targets plus viewport position.
   const [ctxMenu, setCtxMenu] = useState<{
     entry: { path: string; is_dir: boolean };
@@ -71,6 +73,28 @@ export default function App() {
     setLocale(next);
     setLocaleState(next);
   };
+
+  // "system" resolves from the OS at startup; explicit choices win.
+  const applyLanguage = (language: string) => {
+    const resolved: Locale =
+      language === "en-US"
+        ? "en-US"
+        : language === "zh-CN"
+          ? "zh-CN"
+          : typeof navigator !== "undefined" && navigator.language.startsWith("zh")
+            ? "zh-CN"
+            : "en-US";
+    setLocale(resolved);
+    setLocaleState(resolved);
+  };
+
+  // Start in the persisted language setting (the launcher may not have set it).
+  useEffect(() => {
+    void settingsGet()
+      .then((s) => applyLanguage(s.language))
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const pickArchive = async () => {
     const path = await open({ multiple: false, filters: ARCHIVE_FILTERS });
@@ -205,6 +229,7 @@ export default function App() {
           archivePath={arch.archivePath}
           selectedCount={arch.selected.size}
           extractEnabled={arch.status === "open" && arch.selected.size > 0}
+          onSettings={() => setSettingsOpen(true)}
           disabled={busy}
         />
         {arch.status !== "closed" && (
@@ -296,6 +321,11 @@ export default function App() {
           open={createOpen}
           onClose={() => setCreateOpen(false)}
           onStart={startCreate}
+        />
+        <SettingsDialog
+          open={settingsOpen}
+          onClose={() => setSettingsOpen(false)}
+          onLanguageChange={applyLanguage}
         />
         <PasswordDialog
           open={arch.passwordDialogOpen}

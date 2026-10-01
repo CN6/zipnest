@@ -8,13 +8,23 @@ const packs: Record<Locale, Record<string, string>> = {
   "en-US": enUS,
 };
 
-let current: Locale =
-  typeof navigator !== "undefined" && navigator.language.startsWith("zh")
+let current: Locale = (() => {
+  if (typeof localStorage !== "undefined") {
+    const saved = localStorage.getItem("zipnest.locale");
+    if (saved === "zh-CN" || saved === "en-US") return saved;
+  }
+  return typeof navigator !== "undefined" && navigator.language.startsWith("zh")
     ? "zh-CN"
     : "en-US";
+})();
 
 export function setLocale(locale: Locale): void {
   current = locale;
+  try {
+    localStorage.setItem("zipnest.locale", locale);
+  } catch {
+    /* private mode / storage disabled: keep the in-memory locale */
+  }
 }
 
 export function getLocale(): Locale {

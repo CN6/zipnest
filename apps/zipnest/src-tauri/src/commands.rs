@@ -7,6 +7,7 @@ use zipnest_ipc::{
     CreateRequest, EntryDto, IpcError, IpcService, OpenArchiveResult, Settings, SettingsPatch,
     ShellOptions,
 };
+use zipnest_ipc::shell::ShellRegisterResult;
 
 #[tauri::command]
 pub fn open_archive(
@@ -98,7 +99,7 @@ pub fn shell_register(
     svc: State<'_, IpcService>,
     associate: bool,
     context_menu: bool,
-) -> Result<Settings, IpcError> {
+) -> Result<ShellRegisterResult, IpcError> {
     let exe = std::env::current_exe().map_err(|_| IpcError::new("error.io"))?;
     svc.shell_register(
         &exe,

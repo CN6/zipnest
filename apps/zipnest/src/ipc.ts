@@ -90,3 +90,42 @@ export const revealInExplorer = (path: string) =>
 
 export const openEntry = (id: number, path: string) =>
   invoke<void>("open_entry", { id, path });
+
+/** Wire shape of `zipnest-ipc::Settings` (snake_case, no rename). */
+export interface Settings {
+  language: string;
+  default_extract_dir: string;
+  overwrite_policy: string;
+  associate: boolean;
+  context_menu: boolean;
+  preview_max_bytes: number;
+}
+
+/** Partial update; omitted fields are left untouched. */
+export interface SettingsPatch {
+  language?: string;
+  default_extract_dir?: string;
+  overwrite_policy?: string;
+  preview_max_bytes?: number;
+}
+
+export const settingsGet = () => invoke<Settings>("settings_get");
+
+export const settingsSet = (patch: SettingsPatch) =>
+  invoke<Settings>("settings_set", { patch });
+
+/**
+ * Register/unregister the per-user Explorer integration. The Rust side only
+ * persists these two flags, so the patch above deliberately omits them.
+ * Note the top-level command args are camelCase (Tauri converts them).
+ */
+/** Outcome of `shell_register`: what actually applied plus one warning key
+ * per Explorer integration point the OS denied (e.g. a hardened `*\shell`). */
+export interface ShellRegisterResult {
+  associate: boolean;
+  context_menu: boolean;
+  warnings: string[];
+}
+
+export const shellRegister = (associate: boolean, contextMenu: boolean) =>
+  invoke<ShellRegisterResult>("shell_register", { associate, contextMenu });
