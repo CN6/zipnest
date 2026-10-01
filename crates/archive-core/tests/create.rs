@@ -249,6 +249,10 @@ fn creates_encrypted_zip_needs_password() {
     // The correct password reads the plaintext back.
     let arc = Archive::open(&dest, ArchiveOpenOptions { password: Some("pw123".into()) }).unwrap();
     assert_eq!(arc.read_entry(0, &ArchiveOpenOptions { password: Some("pw123".into()) }, None).unwrap(), b"secret body");
+    // A wrong password must not yield plaintext: the ciphertext is key-gated.
+    let err = arc.read_entry(0, &ArchiveOpenOptions { password: Some("WRONG".into()) }, None).unwrap_err();
+    assert!(matches!(err.kind(), "error.password_incorrect" | "error.engine"),
+        "wrong password must fail, got {err:?}");
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -264,5 +268,27 @@ fn creates_encrypted_7z_needs_password() {
     assert!(arc.entries().unwrap().iter().any(|e| e.encrypted), "entry must be marked encrypted");
     let arc = Archive::open(&dest, ArchiveOpenOptions { password: Some("pw7z".into()) }).unwrap();
     assert_eq!(arc.read_entry(0, &ArchiveOpenOptions { password: Some("pw7z".into()) }, None).unwrap(), b"seven secret");
+    // A wrong password must not yield plaintext: the ciphertext is key-gated.
+    let err = arc.read_entry(0, &ArchiveOpenOptions { password: Some("WRONG".into()) }, None).unwrap_err();
+    assert!(matches!(err.kind(), "error.password_incorrect" | "error.engine"),
+        "wrong password must fail, got {err:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn rejects_password_for_tar_formats() {
+    // TAR/compressed-TAR handlers have no encryption; a password request must
+    // be rejected outright rather than silently ignored.
+    let base = tmp("pw-tar"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "a.txt", b"plain");
+    let srcs = vec![CreateSource { path: src, node: "a.txt".into() }];
+    for fmt in [CreateFormat::Tar, CreateFormat::TarGz, CreateFormat::TarBz2, CreateFormat::TarXz] {
+        let dest = base.join("out.bin");
+        let mut o = opts(fmt); o.password = Some("pw".into());
+        let err = create_archive(&srcs, &dest, &o, &mut |_| true)
+            .expect_err("password on a TAR format must be rejected");
+        assert_eq!(err.kind(), "error.password_unsupported", "format {fmt:?} gave {err:?}");
+        assert!(!dest.exists(), "no archive may be written when the password is unsupported");
+    }
     let _ = std::fs::remove_dir_all(&base);
 }

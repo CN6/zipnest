@@ -268,8 +268,9 @@ unsafe fn apply_properties(raw: *mut c_void, opts: &CreateOptions) {
 /// are honored via `ISetProperties`. A password encrypts the payload: ZIP via
 /// AES-256 (`em=AES256` plus the `ICryptoGetTextPassword2` callback), 7Z via
 /// its default AES-256. Plain TAR writes in one pass; the compressed TAR
-/// variants write a temporary `.tar` and wrap it. Options not yet wired
-/// (volumes, SFX) return `E_NOTIMPL`.
+/// variants write a temporary `.tar` and wrap it. A password on the TAR family
+/// is rejected with [`ZipnestError::PasswordUnsupported`]; options not yet
+/// wired (volumes, SFX) return `E_NOTIMPL`.
 pub fn create_archive(
     sources: &[CreateSource],
     dest: &Path,
@@ -278,6 +279,16 @@ pub fn create_archive(
 ) -> Result<CreateStats, ZipnestError> {
     if opts.volume_bytes.is_some() || opts.sfx.is_some() {
         return Err(ZipnestError::Engine(E_NOTIMPL));
+    }
+    // The TAR family has no encryption; reject a password up front rather than
+    // hand back an unencrypted archive the caller believes is protected.
+    if opts.password.is_some()
+        && matches!(
+            opts.format,
+            CreateFormat::Tar | CreateFormat::TarGz | CreateFormat::TarBz2 | CreateFormat::TarXz
+        )
+    {
+        return Err(ZipnestError::PasswordUnsupported);
     }
     if matches!(
         opts.format,

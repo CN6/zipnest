@@ -18,6 +18,8 @@ pub enum ZipnestError {
     PasswordRequired,
     /// Password supplied but rejected.
     PasswordIncorrect,
+    /// A password was requested for a format that cannot encrypt (TAR family).
+    PasswordUnsupported,
     /// User cancelled a progress-reporting operation.
     Cancelled,
     /// Raw engine HRESULT (see `map_hresult`).
@@ -38,6 +40,7 @@ impl ZipnestError {
             ZipnestError::NotAnArchive => "error.not_an_archive",
             ZipnestError::PasswordRequired => "error.password_required",
             ZipnestError::PasswordIncorrect => "error.password_incorrect",
+            ZipnestError::PasswordUnsupported => "error.password_unsupported",
             ZipnestError::Cancelled => "error.cancelled",
             ZipnestError::Engine(_) => "error.engine",
             ZipnestError::Security(_) => "error.security_blocked",
@@ -59,6 +62,9 @@ impl fmt::Display for ZipnestError {
         match self {
             ZipnestError::DllMissing(p) => write!(f, "7z.dll not found (tried: {p})"),
             ZipnestError::Engine(hr) => write!(f, "engine error HRESULT=0x{:08X}", *hr as u32),
+            ZipnestError::PasswordUnsupported => {
+                write!(f, "this archive format does not support a password")
+            }
             other => write!(f, "{}", other.error_key()),
         }
     }
