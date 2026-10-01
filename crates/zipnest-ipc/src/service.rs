@@ -3,6 +3,7 @@
 
 use crate::error::IpcError;
 use crate::registry::{ArchiveRegistry, SharedArchive};
+use crate::settings::{Settings, SettingsPatch, SettingsStore};
 use archive_core::types::{
     CompressionLevel, CompressionMethod, CreateFormat, CreateOptions, SfxKind,
 };
@@ -174,13 +175,18 @@ pub struct IpcService {
     pub registry: ArchiveRegistry,
     jobs: archive_jobs::JobManager,
     emit: Emit,
+    settings: std::sync::Mutex<SettingsStore>,
 }
 
 impl IpcService {
     /// `emit` is called from job worker threads — the callback must be
     /// thread-safe. `throttle` controls progress event spacing (200ms in
     /// production, 0ms in tests).
-    pub fn new(emit: Emit, throttle: Duration) -> Self {
+    pub fn with_settings_path(
+        emit: Emit,
+        throttle: Duration,
+        settings_path: std::path::PathBuf,
+    ) -> Self {
         let emit2 = Arc::clone(&emit);
         let sink = Box::new(move |ev: archive_jobs::JobEvent| {
             use archive_jobs::JobEvent;
@@ -219,7 +225,27 @@ impl IpcService {
             registry: ArchiveRegistry::default(),
             jobs: archive_jobs::JobManager::with_throttle(sink, throttle),
             emit,
+            settings: std::sync::Mutex::new(SettingsStore::new(settings_path)),
         }
+    }
+
+    /// Production constructor: settings live in the per-user config dir.
+    pub fn new(emit: Emit, throttle: Duration) -> Self {
+        Self::with_settings_path(emit, throttle, crate::settings::default_path())
+    }
+
+    /// Current settings (never fails: defaults when the file is absent).
+    pub fn settings_get(&self) -> Result<Settings, IpcError> {
+        Ok(self.lock_settings()?.get().clone())
+    }
+
+    /// Validate + persist a settings patch, returning the resulting settings.
+    pub fn settings_set(&self, patch: SettingsPatch) -> Result<Settings, IpcError> {
+        self.lock_settings()?.set(patch)
+    }
+
+    fn lock_settings(&self) -> Result<std::sync::MutexGuard<'_, SettingsStore>, IpcError> {
+        self.settings.lock().map_err(|_| IpcError::new("error.engine"))
     }
 
     pub fn open_archive(&self, path: String, password: Option<String>) -> Result<OpenArchiveResult, IpcError> {

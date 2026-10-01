@@ -88,5 +88,6 @@
   "error.engine": "引擎内部错误",
   "error.security_blocked": "已阻止不安全的路径（路径穿越）",
   "error.quota_exceeded": "解压内容超出大小限制",
-  "error.io": "文件读写失败"
+  "error.io": "文件读写失败",
+  "error.settings.invalid": "设置项取值无效"
 }

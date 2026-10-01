@@ -88,5 +88,6 @@
   "error.engine": "Internal engine error",
   "error.security_blocked": "Unsafe path blocked (path traversal)",
   "error.quota_exceeded": "Extraction exceeds the size limit",
-  "error.io": "File I/O failed"
+  "error.io": "File I/O failed",
+  "error.settings.invalid": "Invalid settings value"
 }

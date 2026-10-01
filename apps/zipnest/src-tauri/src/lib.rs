@@ -31,6 +31,8 @@ pub fn run() {
             commands::extract,
             commands::create_archive,
             commands::job_cancel,
+            commands::settings_get,
+            commands::settings_set,
             commands::reveal_in_explorer,
             commands::open_entry,
         ])

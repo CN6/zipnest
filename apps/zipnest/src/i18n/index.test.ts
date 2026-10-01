@@ -16,6 +16,7 @@ const RUST_ERROR_KEYS = [
   "error.security_blocked",
   "error.quota_exceeded",
   "error.io",
+  "error.settings.invalid",
 ];
 
 describe("i18n", () => {

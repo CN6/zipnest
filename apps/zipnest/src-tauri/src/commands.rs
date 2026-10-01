@@ -3,7 +3,9 @@
 //! the frontend maps through i18n. Command names are the JS contract.
 
 use tauri::State;
-use zipnest_ipc::{CreateRequest, EntryDto, IpcError, IpcService, OpenArchiveResult};
+use zipnest_ipc::{
+    CreateRequest, EntryDto, IpcError, IpcService, OpenArchiveResult, Settings, SettingsPatch,
+};
 
 #[tauri::command]
 pub fn open_archive(
@@ -63,6 +65,23 @@ pub fn create_archive(
 #[tauri::command]
 pub fn job_cancel(svc: State<'_, IpcService>, job_id: u64) -> bool {
     svc.cancel(job_id)
+}
+
+/// Read persisted user settings (defaults when no file exists yet).
+#[tauri::command]
+pub fn settings_get(svc: State<'_, IpcService>) -> Result<Settings, IpcError> {
+    svc.settings_get()
+}
+
+/// Apply a partial settings update; unknown values are rejected with a key.
+#[tauri::command]
+pub fn settings_set(
+    svc: State<'_, IpcService>,
+    patch: serde_json::Value,
+) -> Result<Settings, IpcError> {
+    let patch: SettingsPatch = serde_json::from_value(patch)
+        .map_err(|_| IpcError::new("error.settings.invalid"))?;
+    svc.settings_set(patch)
 }
 
 /// Reveal an on-disk path in Explorer (used for extraction destinations).
