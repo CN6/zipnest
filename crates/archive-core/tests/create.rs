@@ -60,6 +60,19 @@ fn lzma2_is_default_small_for_7z() {
 }
 
 #[test]
+fn copy_method_disables_7z_compression() {
+    let base = tmp("7zcopy"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "big.txt", &vec![b'C'; 200_000]);
+    let dest = base.join("out.7z");
+    let srcs = vec![CreateSource { path: src, node: "big.txt".into() }];
+    let mut o = opts(CreateFormat::SevenZ); o.level = CompressionLevel::Store; o.method = CompressionMethod::Copy;
+    create_archive(&srcs, &dest, &o, &mut |_| true).unwrap();
+    assert!(std::fs::metadata(&dest).unwrap().len() > 100_000,
+        "Copy method must leave repetitive data essentially uncompressed; the LZMA2 default would be tiny");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn creates_7z_with_one_file_roundtrip() {
     let base = tmp("7z"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
     let src = write_src(&base, "a.txt", b"seven zip body");
