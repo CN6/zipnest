@@ -404,6 +404,9 @@ fn collects_directory_tree_preserving_structure() {
 - Produces: 这些格式的 `create_archive` 分支。
 
 - [ ] **Step 1: 失败测试**
+
+> **现实约束（T4 实测）：** 7-Zip 的原始 GZIP/BZIP2/XZ handler **不级联**到内层 TAR——`Archive::open("out.tar.gz")` 只得到 **1 个条目**（承载的 `.tar`），不进入其内容（级联是客户端 `CArchiveLink` 的行为）。故往返测试用**两层**：先取压缩流里的单一条目 → 写出 → 以 TAR 再打开 → 断言载荷。
+
 ```rust
 #[test]
 fn creates_targz_roundtrip() {
@@ -412,9 +415,17 @@ fn creates_targz_roundtrip() {
     let dest = base.join("out.tar.gz");
     let sources = archive_core::create::collect_sources(&[base.join("src")], &base).unwrap();
     create_archive(&sources, &dest, &opts(CreateFormat::TarGz), &mut |_| true).unwrap();
-    let arc = Archive::open(&dest, ArchiveOpenOptions::default()).unwrap();
-    let e = arc.entries().unwrap().into_iter().find(|e| !e.is_dir).expect("file entry");
-    assert!(arc.read_entry(e.index, &ArchiveOpenOptions::default(), None).unwrap().starts_with(b"tar gz body"));
+    // layer 1: the compressed stream holds exactly one entry (the inner tar)
+    let outer = Archive::open(&dest, ArchiveOpenOptions::default()).unwrap();
+    let outer_entries = outer.entries().unwrap();
+    assert_eq!(outer_entries.len(), 1, "raw gz handler yields only the carried tar");
+    let tar_bytes = outer.read_entry(outer_entries[0].index, &ArchiveOpenOptions::default(), None).unwrap();
+    // layer 2: that carried tar opens as a real tar with our payload
+    let inner_path = base.join("inner.tar");
+    std::fs::write(&inner_path, &tar_bytes).unwrap();
+    let inner = Archive::open(&inner_path, ArchiveOpenOptions::default()).unwrap();
+    let e = inner.entries().unwrap().into_iter().find(|e| !e.is_dir).expect("file entry");
+    assert!(inner.read_entry(e.index, &ArchiveOpenOptions::default(), None).unwrap().ends_with(b"tar gz body"));
     let _ = std::fs::remove_dir_all(&base);
 }
 ```
