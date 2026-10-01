@@ -5,6 +5,8 @@
 
 pub mod callbacks;
 pub mod instream;
+pub mod outcallback;
+pub mod outstream;
 pub mod propvariant;
 pub mod vtables;
 
@@ -64,6 +66,11 @@ pub const IID_ICRYPTO_GET_TEXT_PASSWORD: Guid = guid7(5, 0x10);
 pub const IID_IARCHIVE_OPEN_CALLBACK: Guid = guid7(6, 0x10);
 pub const IID_IARCHIVE_EXTRACT_CALLBACK: Guid = guid7(6, 0x20);
 pub const IID_IIN_ARCHIVE: Guid = guid7(6, 0x60);
+pub const IID_IOUT_STREAM: Guid = guid7(3, 0x04);
+pub const IID_IOUT_ARCHIVE: Guid = guid7(6, 0xA0);
+pub const IID_ISET_PROPERTIES: Guid = guid7(6, 0x03);
+pub const IID_IARCHIVE_UPDATE_CALLBACK: Guid = guid7(6, 0x80);
+pub const IID_IARCHIVE_UPDATE_CALLBACK2: Guid = guid7(6, 0x82);
 
 pub const CLSID_FORMAT_ZIP: Guid = handler_guid(0x01);
 pub const CLSID_FORMAT_BZIP2: Guid = handler_guid(0x02);

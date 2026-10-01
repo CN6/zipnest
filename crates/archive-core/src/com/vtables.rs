@@ -174,3 +174,85 @@ pub struct SeqOutStreamVt {
         processed: *mut u32,
     ) -> Hresult,
 }
+
+/// `IOutStream` = IUnknown + Write + Seek + SetSize (vendor `IStream.h`:
+/// `IOutStream` derives `ISequentialOutStream`).
+#[repr(C)]
+pub struct OutStreamVt {
+    pub query_interface: QueryInterfaceFn,
+    pub add_ref: AddRefFn,
+    pub release: ReleaseFn,
+    pub write: unsafe extern "system" fn(
+        this: *mut c_void,
+        data: *const c_void,
+        size: u32,
+        processed: *mut u32,
+    ) -> Hresult,
+    pub seek: unsafe extern "system" fn(
+        this: *mut c_void,
+        offset: i64,
+        origin: u32,
+        new_position: *mut u64,
+    ) -> Hresult,
+    pub set_size: unsafe extern "system" fn(this: *mut c_void, new_size: u64) -> Hresult,
+}
+
+/// `IOutArchive` = IUnknown + UpdateItems + GetFileTimeType (IArchive.h 0xA0).
+#[repr(C)]
+pub struct OutArchiveVt {
+    pub query_interface: QueryInterfaceFn,
+    pub add_ref: AddRefFn,
+    pub release: ReleaseFn,
+    pub update_items: unsafe extern "system" fn(
+        this: *mut c_void,
+        out_stream: *mut c_void,
+        num_items: u32,
+        update_callback: *mut c_void,
+    ) -> Hresult,
+    pub get_file_time_type: unsafe extern "system" fn(this: *mut c_void, t: *mut u32) -> Hresult,
+}
+
+/// `ISetProperties` = IUnknown + SetProperties (IArchive.h 0x03).
+#[repr(C)]
+pub struct SetPropertiesVt {
+    pub query_interface: QueryInterfaceFn,
+    pub add_ref: AddRefFn,
+    pub release: ReleaseFn,
+    pub set_properties: unsafe extern "system" fn(
+        this: *mut c_void,
+        names: *const *const u16,
+        values: *const PropVariant,
+        num_props: u32,
+    ) -> Hresult,
+}
+
+/// `IArchiveUpdateCallback` = IProgress (SetTotal/SetCompleted) +
+/// GetUpdateItemInfo + GetProperty + GetStream + SetOperationResult
+/// (IArchive.h 0x80, base vtable first).
+#[repr(C)]
+pub struct UpdateCallbackVt {
+    pub query_interface: QueryInterfaceFn,
+    pub add_ref: AddRefFn,
+    pub release: ReleaseFn,
+    pub set_total: unsafe extern "system" fn(this: *mut c_void, total: u64) -> Hresult,
+    pub set_completed: unsafe extern "system" fn(this: *mut c_void, complete: *const u64) -> Hresult,
+    pub get_update_item_info: unsafe extern "system" fn(
+        this: *mut c_void,
+        index: u32,
+        new_data: *mut i32,
+        new_props: *mut i32,
+        index_in_archive: *mut u32,
+    ) -> Hresult,
+    pub get_property: unsafe extern "system" fn(
+        this: *mut c_void,
+        index: u32,
+        prop_id: u32,
+        value: *mut PropVariant,
+    ) -> Hresult,
+    pub get_stream: unsafe extern "system" fn(
+        this: *mut c_void,
+        index: u32,
+        in_stream: *mut *mut c_void,
+    ) -> Hresult,
+    pub set_operation_result: unsafe extern "system" fn(this: *mut c_void, op_res: i32) -> Hresult,
+}

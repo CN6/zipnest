@@ -55,3 +55,124 @@ pub struct ExtractStats {
     pub files: u32,
     pub bytes: u64,
 }
+
+// ---------------------------------------------------------------------------
+// Archive creation (Task 1 / M3).
+// ---------------------------------------------------------------------------
+
+/// Output container format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateFormat {
+    Zip,
+    SevenZ,
+    Tar,
+    TarGz,
+    TarBz2,
+    TarXz,
+}
+
+/// Compression effort. `engine_x()` is the value handed to 7-Zip's `x`
+/// property (0..9) once `SetProperties` is wired up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionLevel {
+    Store,
+    Fastest,
+    Normal,
+    Maximum,
+    Ultra,
+}
+
+impl CompressionLevel {
+    pub fn engine_x(&self) -> &'static str {
+        match self {
+            CompressionLevel::Store => "0",
+            CompressionLevel::Fastest => "1",
+            CompressionLevel::Normal => "5",
+            CompressionLevel::Maximum => "7",
+            CompressionLevel::Ultra => "9",
+        }
+    }
+}
+
+/// Per-format compression method. `Auto` leaves the choice to the handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionMethod {
+    Auto,
+    Copy,
+    Deflate,
+    Lzma2,
+    Bzip2,
+}
+
+impl CompressionMethod {
+    /// 7-Zip method name (`m` property), or `None` for `Auto`.
+    pub fn engine_name(&self) -> Option<&'static str> {
+        match self {
+            CompressionMethod::Auto => None,
+            CompressionMethod::Copy => Some("Copy"),
+            CompressionMethod::Deflate => Some("Deflate"),
+            CompressionMethod::Lzma2 => Some("LZMA2"),
+            CompressionMethod::Bzip2 => Some("BZip2"),
+        }
+    }
+}
+
+/// Self-extracting archive stub flavor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SfxKind {
+    Gui,
+    Console,
+}
+
+/// Options for [`crate::create::create_archive`].
+///
+/// The password (if any) is held only in memory; `Debug` redacts it and it is
+/// never logged.
+#[derive(Clone)]
+pub struct CreateOptions {
+    pub format: CreateFormat,
+    pub level: CompressionLevel,
+    pub method: CompressionMethod,
+    pub password: Option<String>,
+    pub encrypt_names: bool,
+    pub volume_bytes: Option<u64>,
+    pub sfx: Option<SfxKind>,
+}
+
+impl fmt::Debug for CreateOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateOptions")
+            .field("format", &self.format)
+            .field("level", &self.level)
+            .field("method", &self.method)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("encrypt_names", &self.encrypt_names)
+            .field("volume_bytes", &self.volume_bytes)
+            .field("sfx", &self.sfx)
+            .finish()
+    }
+}
+
+/// One input to a create operation: an on-disk path plus the node name it
+/// should carry inside the archive.
+#[derive(Debug, Clone)]
+pub struct CreateSource {
+    pub path: PathBuf,
+    pub node: String,
+}
+
+/// Progress snapshot handed to the create callback.
+#[derive(Debug, Clone)]
+pub struct CreateProgress {
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+    pub current_path: String,
+}
+
+/// Summary of a completed archive creation.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CreateStats {
+    pub files: u32,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}

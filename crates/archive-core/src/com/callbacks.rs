@@ -202,6 +202,27 @@ pub(crate) unsafe fn crypto_release_void(p: *mut c_void) -> u32 {
     crypto_release(p)
 }
 
+/// QI helper shared by the extract/update callbacks: when `riid` is
+/// `ICryptoGetTextPassword`, hand out the companion object (AddRef'd) and
+/// return `Some(S_OK)`; anything else returns `None` so the caller can
+/// continue matching its own IIDs.
+///
+/// # Safety
+/// `crypto` must be a live object from [`crypto_new`], and `ppv` writable.
+pub(crate) unsafe fn qi_hand_out_crypto(
+    crypto: *mut c_void,
+    riid: &Guid,
+    ppv: *mut *mut c_void,
+) -> Option<Hresult> {
+    if *riid == IID_ICRYPTO_GET_TEXT_PASSWORD {
+        crypto_addref_void(crypto);
+        *ppv = crypto;
+        Some(S_OK)
+    } else {
+        None
+    }
+}
+
 /// Owns the callback pair for one `Open` call.
 pub struct OpenCallbackOwner {
     open: *mut OpenCallback,

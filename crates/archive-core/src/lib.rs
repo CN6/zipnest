@@ -6,6 +6,7 @@
 //! - [`ZipnestError`] with stable `error_key()` values for the UI layer.
 
 pub mod archive;
+pub mod create;
 pub mod dll;
 pub mod error;
 pub mod extract;
@@ -16,7 +17,10 @@ pub mod types;
 pub mod com;
 
 pub use archive::Archive;
+pub use create::create_archive;
 pub use error::{map_hresult, ZipnestError};
 pub use types::{
-    ArchiveEntry, ArchiveOpenOptions, ExtractOptions, ExtractProgress, ExtractStats,
+    ArchiveEntry, ArchiveOpenOptions, CompressionLevel, CompressionMethod, CreateFormat,
+    CreateOptions, CreateProgress, CreateSource, CreateStats, ExtractOptions, ExtractProgress,
+    ExtractStats, SfxKind,
 };

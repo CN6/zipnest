@@ -15,8 +15,7 @@ use crate::com::propvariant::PropVariant;
 use crate::com::vtables::{ArchiveExtractCallbackVt, InArchiveVt, SeqOutStreamVt};
 use crate::com::{
     qi_matches, Guid, Hresult, E_ABORT, E_FAIL, E_NOINTERFACE, E_NOTIMPL, S_OK,
-    IID_IARCHIVE_EXTRACT_CALLBACK, IID_ICRYPTO_GET_TEXT_PASSWORD, IID_IPROGRESS,
-    IID_ISEQ_OUT_STREAM, IID_IUNKNOWN,
+    IID_IARCHIVE_EXTRACT_CALLBACK, IID_IPROGRESS, IID_ISEQ_OUT_STREAM, IID_IUNKNOWN,
 };
 use crate::error::ZipnestError;
 use crate::types::{ArchiveEntry, ExtractOptions, ExtractProgress, ExtractStats};
@@ -127,25 +126,8 @@ unsafe extern "system" fn sink_write(
 // Shared: one crypto companion object per Extract call (password support)
 // ===========================================================================
 
-/// QI helper used by both extract callbacks: returns `true` when `riid` is
-/// `ICryptoGetTextPassword` and hands the companion object out.
-/// Returns `false` for anything else.
-///
-/// # Safety
-/// `crypto` must be a live object from [`callbacks::crypto_new`].
-unsafe fn qi_hand_out_crypto(
-    crypto: *mut c_void,
-    riid: &Guid,
-    ppv: *mut *mut c_void,
-) -> Option<Hresult> {
-    if *riid == IID_ICRYPTO_GET_TEXT_PASSWORD {
-        callbacks::crypto_addref_void(crypto);
-        *ppv = crypto;
-        Some(S_OK)
-    } else {
-        None
-    }
-}
+// The QI helper (`callbacks::qi_hand_out_crypto`) is shared by both extract
+// callbacks below and by the update callback in `outcallback.rs`.
 
 // ===========================================================================
 // read_entry: extract one index into a memory sink
@@ -181,7 +163,7 @@ unsafe extern "system" fn cb_qi(
         return E_FAIL;
     }
     let this = this as *mut MemExtractCallback;
-    if let Some(hr) = qi_hand_out_crypto((*this).crypto, &*riid, ppv) {
+    if let Some(hr) = callbacks::qi_hand_out_crypto((*this).crypto, &*riid, ppv) {
         return hr;
     }
     if qi_matches(&*riid, &[IID_IUNKNOWN, IID_IPROGRESS, IID_IARCHIVE_EXTRACT_CALLBACK]) {
@@ -533,7 +515,7 @@ unsafe extern "system" fn disk_qi(
         return E_FAIL;
     }
     let this = this as *mut DiskExtractCallback;
-    if let Some(hr) = qi_hand_out_crypto((*this).crypto, &*riid, ppv) {
+    if let Some(hr) = callbacks::qi_hand_out_crypto((*this).crypto, &*riid, ppv) {
         return hr;
     }
     if qi_matches(&*riid, &[IID_IUNKNOWN, IID_IPROGRESS, IID_IARCHIVE_EXTRACT_CALLBACK]) {

@@ -103,6 +103,55 @@ impl PropVariant {
             self.data = 0;
         }
     }
+
+    /// BSTR-valued property (e.g. `kpidPath`): the BSTR is owned by the
+    /// PropVariant and released by [`PropVariant::clear`].
+    pub fn from_bstr(s: &str) -> Self {
+        PropVariant {
+            vt: VT_BSTR,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            data: alloc_bstr(s) as u64,
+        }
+    }
+
+    /// `VT_UI8` payload (also used for `kpidSize`).
+    pub fn from_u64(v: u64) -> Self {
+        PropVariant {
+            vt: VT_UI8,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            data: v,
+        }
+    }
+
+    /// `VT_BOOL` (VARIANT_TRUE is `-1i32`).
+    pub fn from_bool(v: bool) -> Self {
+        PropVariant {
+            vt: VT_BOOL,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            data: (if v { -1i32 } else { 0 }) as u32 as u64,
+        }
+    }
+
+    /// `VT_FILETIME` from a `SystemTime` (100ns ticks since 1601-01-01).
+    pub fn from_filetime(t: std::time::SystemTime) -> Self {
+        let ticks = t
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64 / 100 + FILETIME_UNIX_EPOCH_DELTA)
+            .unwrap_or(FILETIME_UNIX_EPOCH_DELTA);
+        PropVariant {
+            vt: VT_FILETIME,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            data: ticks,
+        }
+    }
 }
 
 #[link(name = "ole32")]
