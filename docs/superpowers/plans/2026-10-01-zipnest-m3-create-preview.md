@@ -64,7 +64,7 @@ README.md                                        # 修改：M3 状态
 **Interfaces:**
 - Consumes: 既有 `dll::load()` / `SevenZip::create_object`、`com::{Guid,Hresult,S_OK,E_FAIL,ComObject,qi_matches,as_void}`、`com::instream::FileStreamOwner`、`com::callbacks::crypto_new`、`error::ZipnestError`。
 - Produces:
-  - `types.rs`: `CreateFormat { Zip, SevenZ, Tar, TarGz, TarBz2, TarXz }`；`CompressionLevel { Store, Fastest, Normal, Maximum, Ultra }`（`fn engine_x(&self) -> &'static str`）；`CompressionMethod { Auto, Copy, Deflate, Lzma2, Bzip2 }`（`fn engine_name(&self) -> Option<&'static str>`）；`SfxKind { Gui, Console }`；`CreateOptions { format, level, method, password: Option<String>, encrypt_names: bool, volume_bytes: Option<u64>, sfx: Option<SfxKind> }`（手写 `Debug`）；`CreateSource { path: PathBuf, node: String }`；`CreateProgress { done_bytes, total_bytes, current_path }`；`CreateStats { files: u32, bytes_in: u64, bytes_out: u64 }`（`Default`+`Clone`+`Copy`）。
+  - `types.rs`: `CreateFormat { Zip, SevenZ, Tar, TarGz, TarBz2, TarXz }`；`CompressionLevel { Store, Fastest, Normal, Maximum, Ultra }`（`fn engine_x(&self) -> &'static str`）；`CompressionMethod { Auto, Copy, Deflate, Lzma2, Bzip2 }`（`fn engine_name(&self) -> Option<&'static str>`）；`SfxKind { Gui, Console }`；`CreateOptions { format, level, method, password: Option<String>, encrypt_names: bool, volume_bytes: Option<u64>, sfx: Option<SfxKind> }`（**派生 `Clone`**，手写 `Debug` 脱敏）；`CreateSource { path: PathBuf, node: String }`；`CreateProgress { done_bytes, total_bytes, current_path }`；`CreateStats { files: u32, bytes_in: u64, bytes_out: u64 }`（`Default`+`Clone`+`Copy`）。所有枚举派生 `Debug`+`Clone`+`Copy`+`PartialEq`+`Eq`。
   - `create.rs`: `pub fn create_archive(sources: &[CreateSource], dest: &Path, opts: &CreateOptions, progress: &mut dyn FnMut(&CreateProgress) -> bool) -> Result<CreateStats, ZipnestError>`（Task 1 只实现 `level=Store`+`method=Copy`、`password=None`、`volume_bytes=None`、`sfx=None` 的分支）。
   - `com/mod.rs`: `IID_IOUT_ARCHIVE`, `IID_ISET_PROPERTIES`, `IID_IOUT_STREAM`, `IID_IARCHIVE_UPDATE_CALLBACK`, `IID_IARCHIVE_UPDATE_CALLBACK2`。
 
@@ -207,7 +207,7 @@ pub struct UpdateCallbackVt {
 
 - [ ] **Step 5: 实现 `create_archive` 驱动（Task 1 子集）**
 
-`create.rs`：定位 CLSID（`CreateFormat::Zip→CLSID_FORMAT_ZIP`，`SevenZ→CLSID_FORMAT_7Z`），`dll.create_object(clsid, IID_IOUT_ARCHIVE, &mut raw)`；`ArchiveWriter::create` 流程：建 `FileOutStream`（`dest`）→ 建 `UpdateCallback`（items）→（Task 1 先跳过 SetProperties）→ `OutArchiveVt.update_items(out_stream, n, cb)` → 收尾 release。落盘后 `CreateStats { files, bytes_in, bytes_out: dest 文件大小 }`。错误经 `map_hresult`；`io_error`/`cancelled` 先行判定（照 `extract_to_disk` 的顺序）。
+`create.rs`：定位 CLSID（`CreateFormat::Zip→CLSID_FORMAT_ZIP`，`SevenZ→CLSID_FORMAT_7Z`），`dll.create_object(clsid, IID_IOUT_ARCHIVE, &mut raw)`；`ArchiveWriter::create` 流程：建 `FileOutStream`（`dest`）→ 建 `UpdateCallback`（items）→（Task 1 先跳过 SetProperties）→ `OutArchiveVt.update_items(out_stream, n, cb)` → 收尾 release。落盘后 `CreateStats { files, bytes_in, bytes_out: dest 文件大小 }`。错误经 `map_hresult`；`io_error`/`cancelled` 先行判定（照 `extract_to_disk` 的顺序）。**本步同时**：在 `types.rs` 加入上述创建类型（枚举派生 `Debug+Clone+Copy+PartialEq+Eq`；`CreateOptions` 派生 `Clone`、手写 `Debug` 脱敏 `password`）；在 `lib.rs` 加 `pub mod create;` 并导出 `create::{create_archive, collect_sources}`（`collect_sources` 在 Task 3 加，Task 1 可先 `pub use create::create_archive;`）及新类型。
 
 - [ ] **Step 6: 失败测试 → 实现 → 通过**
 
