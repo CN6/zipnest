@@ -241,14 +241,27 @@ fn cleans_up_temp_tar_on_failure() {
 }
 
 #[test]
-fn create_progress_is_monotonic_and_cancel_stops() {
+fn create_reports_progress_and_cancel_stops() {
     let base = tmp("prog"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
     let src = write_src(&base, "big.bin", &vec![7u8; 3_000_000]);
     let dest = base.join("out.7z");
     let srcs = vec![CreateSource { path: src, node: "big.bin".into() }];
-    let mut seen = 0u64;
+    // Collect every sample; the closure runs on an engine thread and calling
+    // panic!/assert! from it could abort the process, so all checks run after.
+    let mut samples: Vec<(u64, u64)> = Vec::new();
     let mut o = opts(CreateFormat::SevenZ); o.level = CompressionLevel::Normal;
-    create_archive(&srcs, &dest, &o, &mut |p| { seen += 1; assert!(p.done_bytes <= p.total_bytes.max(p.done_bytes)); true }).unwrap();
+    create_archive(&srcs, &dest, &o, &mut |p| { samples.push((p.done_bytes, p.total_bytes)); true }).unwrap();
+
+    assert!(!samples.is_empty(), "progress callback was never invoked");
+    for &(done, total) in &samples {
+        assert!(done <= total, "done_bytes {done} exceeded total_bytes {total}");
+    }
+    for w in samples.windows(2) {
+        assert!(w[0].0 <= w[1].0, "done_bytes must be non-decreasing, got {:?}", &samples);
+    }
+    assert!(samples.last().unwrap().0 > 0, "no bytes reported as completed");
+    assert_eq!(samples.last().unwrap().1, 3_000_000, "total_bytes must be the pre-scanned source size");
+
     // Keep the source and its directory alive for the cancel pass: deleting the
     // whole base here would make the second create fail with an io error before
     // the handler can ever consult the progress callback.
