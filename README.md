@@ -20,7 +20,7 @@ plus ZIP/7Z/TAR creation planned for M2+.
 ## Build & test
 
 ```powershell
-cargo test --workspace          # 36 tests, must be green
+cargo test --workspace          # 40 tests, must be green
 cargo test -- --ignored         # one-off 5000-entry performance probe
 cd apps\zipnest
 pnpm test                       # vitest: i18n key parity + progress helpers
