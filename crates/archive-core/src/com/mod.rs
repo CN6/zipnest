@@ -63,6 +63,7 @@ pub const IID_ISEQ_IN_STREAM: Guid = guid7(3, 0x01);
 pub const IID_ISEQ_OUT_STREAM: Guid = guid7(3, 0x02);
 pub const IID_IPROGRESS: Guid = guid7(0, 5);
 pub const IID_ICRYPTO_GET_TEXT_PASSWORD: Guid = guid7(5, 0x10);
+pub const IID_ICRYPTO_GET_TEXT_PASSWORD2: Guid = guid7(5, 0x11);
 pub const IID_IARCHIVE_OPEN_CALLBACK: Guid = guid7(6, 0x10);
 pub const IID_IARCHIVE_EXTRACT_CALLBACK: Guid = guid7(6, 0x20);
 pub const IID_IIN_ARCHIVE: Guid = guid7(6, 0x60);

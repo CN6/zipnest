@@ -126,6 +126,23 @@ pub struct CryptoGetTextPasswordVt {
         unsafe extern "system" fn(this: *mut c_void, password: *mut *mut u16) -> Hresult,
 }
 
+/// `ICryptoGetTextPassword2` (IPassword.h) — single method after IUnknown.
+///
+/// The handlers obtain the create-time password through this interface
+/// (`ZipHandlerOut.cpp`, `7zHandlerOut.cpp`), *not* through the
+/// `ICryptoGetTextPassword` used by the open path.
+#[repr(C)]
+pub struct CryptoGetTextPassword2Vt {
+    pub query_interface: QueryInterfaceFn,
+    pub add_ref: AddRefFn,
+    pub release: ReleaseFn,
+    pub get_text_password2: unsafe extern "system" fn(
+        this: *mut c_void,
+        password_is_defined: *mut i32,
+        password: *mut *mut u16,
+    ) -> Hresult,
+}
+
 /// `IProgress` = IUnknown + SetTotal(u64) + SetCompleted(*const u64).
 #[repr(C)]
 pub struct ProgressVt {

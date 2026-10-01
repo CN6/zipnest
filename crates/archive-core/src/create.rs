@@ -5,9 +5,11 @@
 //! compression level (`x`) and method (`m`) reach the handler. Task 4 adds the
 //! TAR family: plain TAR writes directly through `CLSID_FORMAT_TAR`, while
 //! `TarGz`/`TarBz2`/`TarXz` first write a temporary `.tar` and then wrap it with
-//! the GZIP/BZIP2/XZ handler. The guard below still rejects the not-yet-wired
-//! options (password/volumes/SFX); the callback/stream plumbing already carries
-//! the fields they need.
+//! the GZIP/BZIP2/XZ handler. Task 5 adds AES-256 password creation: the
+//! password is handed to the engine through `ICryptoGetTextPassword2` on the
+//! update callback, and ZIP additionally forces AES-256 via the `em` property.
+//! The guard below still rejects the not-yet-wired options (volumes/SFX); the
+//! callback/stream plumbing already carries the fields they need.
 
 use crate::com::callbacks;
 use crate::com::outcallback::{self, SourceItem, UpdateState};
@@ -237,6 +239,19 @@ unsafe fn apply_properties(raw: *mut c_void, opts: &CreateOptions) {
             &mut values,
         );
     }
+    if opts.password.is_some() && opts.format == CreateFormat::Zip {
+        // ZipHandlerOut picks AES only when the `em` property says so; with a
+        // password but no `em` the default is legacy ZipCrypto. "AES256" maps
+        // to AES-256 key mode 3. (7z selects AES-256 automatically once the
+        // password callback reports a password.)
+        add(
+            "em",
+            PropVariant::from_bstr("AES256"),
+            &mut names_keep,
+            &mut names,
+            &mut values,
+        );
+    }
 
     let sp_vt = &**(sp as *const *const SetPropertiesVt);
     (sp_vt.set_properties)(sp, names.as_ptr(), values.as_ptr(), names.len() as u32);
@@ -250,16 +265,18 @@ unsafe fn apply_properties(raw: *mut c_void, opts: &CreateOptions) {
 /// `progress` (return `false` to cancel).
 ///
 /// `opts` carries the full creation surface; the compression level and method
-/// are honored via `ISetProperties`. Plain TAR writes in one pass; the
-/// compressed TAR variants write a temporary `.tar` and wrap it. Options not
-/// yet wired (password, volumes, SFX) return `E_NOTIMPL`.
+/// are honored via `ISetProperties`. A password encrypts the payload: ZIP via
+/// AES-256 (`em=AES256` plus the `ICryptoGetTextPassword2` callback), 7Z via
+/// its default AES-256. Plain TAR writes in one pass; the compressed TAR
+/// variants write a temporary `.tar` and wrap it. Options not yet wired
+/// (volumes, SFX) return `E_NOTIMPL`.
 pub fn create_archive(
     sources: &[CreateSource],
     dest: &Path,
     opts: &CreateOptions,
     progress: &mut dyn FnMut(&CreateProgress) -> bool,
 ) -> Result<CreateStats, ZipnestError> {
-    if opts.password.is_some() || opts.volume_bytes.is_some() || opts.sfx.is_some() {
+    if opts.volume_bytes.is_some() || opts.sfx.is_some() {
         return Err(ZipnestError::Engine(E_NOTIMPL));
     }
     if matches!(

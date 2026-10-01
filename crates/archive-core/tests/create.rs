@@ -229,3 +229,40 @@ fn creates_7z_with_one_file_roundtrip() {
     assert_eq!(arc.read_entry(0, &ArchiveOpenOptions::default(), None).unwrap(), b"seven zip body");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn creates_encrypted_zip_needs_password() {
+    let base = tmp("encz"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "a.txt", b"secret body");
+    let dest = base.join("enc.zip");
+    let srcs = vec![CreateSource { path: src, node: "a.txt".into() }];
+    let mut o = opts(CreateFormat::Zip); o.password = Some("pw123".into());
+    create_archive(&srcs, &dest, &o, &mut |_| true).unwrap();
+    // Without a password the archive still opens (ZIP encrypts data, not the
+    // central directory) but every file entry must be flagged encrypted.
+    let arc = Archive::open(&dest, ArchiveOpenOptions::default()).unwrap();
+    assert!(arc.entries().unwrap().iter().any(|e| e.encrypted), "entry must be marked encrypted");
+    // WinZip AES marks local headers with extra field id 0x9901 ("AE"); this
+    // proves AES-256 was used, not legacy ZipCrypto.
+    let raw = std::fs::read(&dest).unwrap();
+    assert!(raw.windows(2).any(|w| w == [0x01, 0x99]), "ZIP must carry the WinZip AES extra field");
+    // The correct password reads the plaintext back.
+    let arc = Archive::open(&dest, ArchiveOpenOptions { password: Some("pw123".into()) }).unwrap();
+    assert_eq!(arc.read_entry(0, &ArchiveOpenOptions { password: Some("pw123".into()) }, None).unwrap(), b"secret body");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn creates_encrypted_7z_needs_password() {
+    let base = tmp("enc7z"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "a.txt", b"seven secret");
+    let dest = base.join("enc.7z");
+    let srcs = vec![CreateSource { path: src, node: "a.txt".into() }];
+    let mut o = opts(CreateFormat::SevenZ); o.password = Some("pw7z".into());
+    create_archive(&srcs, &dest, &o, &mut |_| true).unwrap();
+    let arc = Archive::open(&dest, ArchiveOpenOptions::default()).unwrap();
+    assert!(arc.entries().unwrap().iter().any(|e| e.encrypted), "entry must be marked encrypted");
+    let arc = Archive::open(&dest, ArchiveOpenOptions { password: Some("pw7z".into()) }).unwrap();
+    assert_eq!(arc.read_entry(0, &ArchiveOpenOptions { password: Some("pw7z".into()) }, None).unwrap(), b"seven secret");
+    let _ = std::fs::remove_dir_all(&base);
+}

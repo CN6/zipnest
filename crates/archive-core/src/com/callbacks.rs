@@ -6,9 +6,10 @@
 //! `SetTotal` vs `CryptoGetTextPassword`).
 
 use super::propvariant::alloc_bstr;
-use super::vtables::{ArchiveOpenCallbackVt, CryptoGetTextPasswordVt};
+use super::vtables::{ArchiveOpenCallbackVt, CryptoGetTextPassword2Vt, CryptoGetTextPasswordVt};
 use super::{as_void, Guid, Hresult, ComObject, E_FAIL, E_NOINTERFACE,
-    IID_ICRYPTO_GET_TEXT_PASSWORD, IID_IARCHIVE_OPEN_CALLBACK, IID_IUNKNOWN, S_OK};
+    IID_ICRYPTO_GET_TEXT_PASSWORD, IID_ICRYPTO_GET_TEXT_PASSWORD2, IID_IARCHIVE_OPEN_CALLBACK,
+    IID_IUNKNOWN, S_OK};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -176,47 +177,164 @@ unsafe extern "system" fn get_text_password(
 }
 
 // ---------------------------------------------------------------------------
-// Standalone crypto objects for the extract/read callbacks (Task 8/9).
-// The extract callback QIs `IID_ICRYPTO_GET_TEXT_PASSWORD` on itself and
-// hands out this companion object, exactly like the open path above.
+// Standalone crypto companions for the extract/read and create callbacks.
+//
+// Two interfaces with the same slot layout but different method signatures are
+// needed:
+//   * `ICryptoGetTextPassword`  (v1) — queried by the open and extract paths.
+//   * `ICryptoGetTextPassword2` (v2) — queried by the create handlers
+//     (`ZipHandlerOut.cpp`, `7zHandlerOut.cpp`) to obtain the password plus an
+//     explicit "is defined" flag.
+// Because a single COM object can only carry one vtable pointer, the pair is a
+// tiny holder that hands out whichever companion was asked for.
 // ---------------------------------------------------------------------------
 
-/// Create a standalone `ICryptoGetTextPassword` with refcount 1 (ours).
-pub(crate) fn crypto_new(password: Option<String>) -> *mut CryptoCallback {
+#[repr(C)]
+pub struct CryptoCallback2 {
+    obj: ComObject<CryptoGetTextPassword2Vt>,
+    refs: AtomicU32,
+    state: Arc<OpenState>,
+}
+
+static CRYPTO2_VT: CryptoGetTextPassword2Vt = CryptoGetTextPassword2Vt {
+    query_interface: crypto2_qi,
+    add_ref: crypto2_add_ref,
+    release: crypto2_release,
+    get_text_password2,
+};
+
+/// Owns one v1 and one v2 companion sharing a password state.
+#[repr(C)]
+pub struct CryptoPair {
+    v1: *mut CryptoCallback,
+    v2: *mut CryptoCallback2,
+}
+
+unsafe extern "system" fn crypto2_qi(
+    this: *mut c_void,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> Hresult {
+    if riid.is_null() || ppv.is_null() {
+        return E_FAIL;
+    }
+    let iid = &*riid;
+    if *iid == IID_IUNKNOWN || *iid == IID_ICRYPTO_GET_TEXT_PASSWORD2 {
+        *ppv = this;
+        crypto2_add_ref(this);
+        S_OK
+    } else {
+        *ppv = std::ptr::null_mut();
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn crypto2_add_ref(this: *mut c_void) -> u32 {
+    let this = this as *mut CryptoCallback2;
+    (*this).refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn crypto2_release(this: *mut c_void) -> u32 {
+    let this = this as *mut CryptoCallback2;
+    let left = (*this).refs.fetch_sub(1, Ordering::Release) - 1;
+    if left == 0 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        drop(Box::from_raw(this));
+    }
+    left
+}
+
+unsafe extern "system" fn get_text_password2(
+    this: *mut c_void,
+    password_is_defined: *mut i32,
+    password: *mut *mut u16,
+) -> Hresult {
+    if password_is_defined.is_null() || password.is_null() {
+        return E_FAIL;
+    }
+    let this = this as *mut CryptoCallback2;
+    let obj: &CryptoCallback2 = &*this;
+    obj.state
+        .asked
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    match &obj.state.password {
+        Some(p) => {
+            *password_is_defined = 1;
+            *password = alloc_bstr(p);
+            if (*password).is_null() {
+                return E_FAIL;
+            }
+            S_OK
+        }
+        // v2 can report "no password" without failing; unlike v1's E_FAIL.
+        None => {
+            *password_is_defined = 0;
+            *password = std::ptr::null_mut();
+            S_OK
+        }
+    }
+}
+
+/// Create the standalone v1+v2 crypto companions, each with refcount 1 (ours).
+pub(crate) fn crypto_new(password: Option<String>) -> *mut CryptoPair {
     let state = Arc::new(OpenState {
         password,
         asked: std::sync::atomic::AtomicU8::new(0),
     });
-    Box::into_raw(Box::new(CryptoCallback {
+    let v1 = Box::into_raw(Box::new(CryptoCallback {
         obj: ComObject { vt: &CRYPTO_VT },
         refs: AtomicU32::new(1),
+        state: Arc::clone(&state),
+    }));
+    let v2 = Box::into_raw(Box::new(CryptoCallback2 {
+        obj: ComObject { vt: &CRYPTO2_VT },
+        refs: AtomicU32::new(1),
         state,
-    }))
+    }));
+    Box::into_raw(Box::new(CryptoPair { v1, v2 }))
 }
 
 pub(crate) unsafe fn crypto_addref_void(p: *mut c_void) -> u32 {
     crypto_add_ref(p)
 }
 
-pub(crate) unsafe fn crypto_release_void(p: *mut c_void) -> u32 {
-    crypto_release(p)
+/// Release the pair's own references and free the holder. Any references the
+/// engine still holds on a companion keep that companion alive on its own.
+pub(crate) unsafe fn crypto_release_void(p: *mut c_void) {
+    if p.is_null() {
+        return;
+    }
+    let pair = p as *mut CryptoPair;
+    crypto_release((*pair).v1 as *mut c_void);
+    crypto2_release((*pair).v2 as *mut c_void);
+    drop(Box::from_raw(pair));
 }
 
-/// QI helper shared by the extract/update callbacks: when `riid` is
-/// `ICryptoGetTextPassword`, hand out the companion object (AddRef'd) and
-/// return `Some(S_OK)`; anything else returns `None` so the caller can
-/// continue matching its own IIDs.
+/// QI helper shared by the extract/update callbacks: when `riid` names either
+/// crypto interface, hand out the matching companion (AddRef'd) and return
+/// `Some(S_OK)`; anything else returns `None` so the caller can continue
+/// matching its own IIDs.
 ///
 /// # Safety
-/// `crypto` must be a live object from [`crypto_new`], and `ppv` writable.
+/// `crypto` must be a live pair from [`crypto_new`], and `ppv` writable.
 pub(crate) unsafe fn qi_hand_out_crypto(
     crypto: *mut c_void,
     riid: &Guid,
     ppv: *mut *mut c_void,
 ) -> Option<Hresult> {
+    if crypto.is_null() {
+        return None;
+    }
+    let pair = crypto as *mut CryptoPair;
     if *riid == IID_ICRYPTO_GET_TEXT_PASSWORD {
-        crypto_addref_void(crypto);
-        *ppv = crypto;
+        let v1 = (*pair).v1 as *mut c_void;
+        crypto_addref_void(v1);
+        *ppv = v1;
+        Some(S_OK)
+    } else if *riid == IID_ICRYPTO_GET_TEXT_PASSWORD2 {
+        let v2 = (*pair).v2 as *mut c_void;
+        crypto2_add_ref(v2);
+        *ppv = v2;
         Some(S_OK)
     } else {
         None
