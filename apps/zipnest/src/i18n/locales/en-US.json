@@ -107,8 +107,13 @@
   "settings.overwrite.rename": "Rename",
   "settings.preview_limit": "Preview size limit (MB)",
   "settings.shell": "Explorer integration",
-  "settings.shell.associate": "File associations",
+  "settings.shell.associate": "Open archives with ZipNest by default",
   "settings.shell.context_menu": "Context menu",
+  "settings.donate": "Support us",
+  "settings.donate.title": "Support ZipNest",
+  "settings.donate.body": "ZipNest is free and open source. If it helps you, a small tip keeps the coffee flowing. Thank you!",
+  "settings.donate.wechat": "WeChat Pay",
+  "settings.donate.alipay": "Alipay",
   "settings.save": "Save",
   "settings.saved": "Settings saved"
 }

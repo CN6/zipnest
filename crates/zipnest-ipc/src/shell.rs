@@ -73,8 +73,9 @@ fn open_command(exe: &std::path::Path) -> String {
     format!("{} \"%1\"", quoted(exe))
 }
 
-/// File-association ops: a ProgID per extension plus an `OpenWithProgids`
-/// entry. We *add an option* rather than hijack the default handler.
+/// File-association ops: a ProgID per extension that becomes the **default**
+/// handler (writing the extension's default value), plus an `OpenWithProgids`
+/// entry so the user can still switch back without losing us.
 pub fn assoc_ops(exe: &std::path::Path) -> Vec<RegOp> {
     let icon = format!("{},0", quoted(exe));
     let mut ops = Vec::new();
@@ -91,7 +92,13 @@ pub fn assoc_ops(exe: &std::path::Path) -> Vec<RegOp> {
             None,
             open_command(exe),
         ));
-        // Empty REG_SZ under OpenWithProgids = "offer ZipNest, don't take over".
+        // Make ZipNest the default opener for this extension.
+        ops.push(RegOp::set(
+            format!(r"{CLASSES}\.{ext}"),
+            None,
+            pid.clone(),
+        ));
+        // Keep an OpenWithProgids entry as a graceful fallback.
         ops.push(RegOp::set(
             format!(r"{CLASSES}\.{ext}\OpenWithProgids"),
             Some(&pid),
@@ -102,6 +109,8 @@ pub fn assoc_ops(exe: &std::path::Path) -> Vec<RegOp> {
 }
 
 /// Undo [`assoc_ops`]: drop each ProgID tree and its OpenWithProgids entry.
+/// The extension's default value is left untouched (restoring the previous
+/// opener is the user's call — Windows keeps the old handler in UserChoice).
 pub fn assoc_removals() -> Vec<RegOp> {
     let mut ops = Vec::new();
     for ext in SUPPORTED_EXTENSIONS {
@@ -260,15 +269,20 @@ mod tests {
     }
 
     #[test]
-    fn assoc_offers_progid_without_hijacking_default() {
+    fn assoc_makes_zipnest_the_default_handler() {
         let ops = assoc_ops(exe());
-        // We write an OpenWithProgids entry...
-        assert_eq!(
-            find_set(&ops, r"HKCU\Software\Classes\.zip\OpenWithProgids", Some("ZipNest.zip")),
-            Some("")
-        );
-        // ...and never the extension's default value.
-        assert!(find_set(&ops, r"HKCU\Software\Classes\.zip", None).is_none());
+        for ext in SUPPORTED_EXTENSIONS {
+            let pid = prog_id(ext);
+            // The extension's default value points at our ProgID, and the
+            // ProgID's open command is quoted.
+            assert_eq!(
+                find_set(&ops, &format!(r"HKCU\Software\Classes\.{ext}"), None),
+                Some(pid.as_str()),
+                "default handler missing for .{ext}"
+            );
+            let cmd_key = format!(r"HKCU\Software\Classes\{pid}\shell\open\command");
+            assert!(find_set(&ops, &cmd_key, None).is_some(), "open cmd missing for {ext}");
+        }
     }
 
     #[test]

@@ -21,11 +21,12 @@ interface Props {
   open: boolean;
   onClose: () => void;
   onLanguageChange: (language: string) => void;
+  onDonate: () => void;
 }
 
 /** Settings: language, default extract dir, overwrite policy, preview cap,
  * and the HKCU Explorer integration toggles backed by `shell_register`. */
-export default function SettingsDialog({ open, onClose, onLanguageChange }: Props) {
+export default function SettingsDialog({ open, onClose, onLanguageChange, onDonate }: Props) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -178,6 +179,19 @@ export default function SettingsDialog({ open, onClose, onLanguageChange }: Prop
                 {t(error)}
               </div>
             )}
+
+            <div
+              style={{
+                marginTop: 16,
+                borderTop: "1px solid #eee",
+                paddingTop: 8,
+                textAlign: "right",
+              }}
+            >
+              <Button appearance="subtle" size="small" onClick={onDonate}>
+                {t("settings.donate")}
+              </Button>
+            </div>
           </DialogContent>
           <DialogActions>
             <Button appearance="secondary" onClick={onClose} disabled={saving}>

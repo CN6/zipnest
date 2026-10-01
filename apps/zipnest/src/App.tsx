@@ -19,6 +19,7 @@ import EntryTable from "./components/EntryTable";
 import ExtractDialog from "./components/ExtractDialog";
 import CreateWizard from "./components/CreateWizard";
 import SettingsDialog from "./components/SettingsDialog";
+import DonateDialog from "./components/DonateDialog";
 import PasswordDialog from "./components/PasswordDialog";
 import ProgressBarStrip from "./components/ProgressBar";
 import PreviewPanel from "./components/PreviewPanel";
@@ -50,6 +51,7 @@ export default function App() {
   const [extractOpen, setExtractOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [donateOpen, setDonateOpen] = useState(false);
   // Context menu: the entry it targets plus viewport position.
   const [ctxMenu, setCtxMenu] = useState<{
     entry: { path: string; is_dir: boolean };
@@ -326,7 +328,9 @@ export default function App() {
           open={settingsOpen}
           onClose={() => setSettingsOpen(false)}
           onLanguageChange={applyLanguage}
+          onDonate={() => setDonateOpen(true)}
         />
+        <DonateDialog open={donateOpen} onClose={() => setDonateOpen(false)} />
         <PasswordDialog
           open={arch.passwordDialogOpen}
           wrong={arch.passwordWrong}
