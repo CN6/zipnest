@@ -410,6 +410,38 @@ fn opens_split_zip_from_first_volume() {
 }
 
 #[test]
+fn opens_single_volume_7z_from_first_volume() {
+    let base = tmp("svol7z"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "small.bin", b"tiny seven zip body");
+    let dest = base.join("vol.7z");
+    let srcs = vec![CreateSource { path: src, node: "small.bin".into() }];
+    let mut o = opts(CreateFormat::SevenZ); o.volume_bytes = Some(1_000_000);
+    create_archive(&srcs, &dest, &o, &mut |_| true).unwrap();
+    assert!(base.join("vol.7z.001").exists(), "first volume must exist");
+    assert!(!base.join("vol.7z.002").exists(), "single-volume content must not spill");
+    let arc = Archive::open(&base.join("vol.7z.001"), ArchiveOpenOptions::default()).unwrap();
+    let e = arc.entries().unwrap().into_iter().find(|e| e.path.ends_with("small.bin")).expect("entry");
+    assert_eq!(arc.read_entry(e.index, &ArchiveOpenOptions::default(), None).unwrap(), b"tiny seven zip body");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn opens_single_volume_zip_from_first_volume() {
+    let base = tmp("svolzip"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "small.bin", b"tiny zip body");
+    let dest = base.join("vol.zip");
+    let srcs = vec![CreateSource { path: src, node: "small.bin".into() }];
+    let mut o = opts(CreateFormat::Zip); o.volume_bytes = Some(1_000_000);
+    create_archive(&srcs, &dest, &o, &mut |_| true).unwrap();
+    assert!(base.join("vol.zip.001").exists(), "first volume must exist");
+    assert!(!base.join("vol.zip.002").exists(), "single-volume content must not spill");
+    let arc = Archive::open(&base.join("vol.zip.001"), ArchiveOpenOptions::default()).unwrap();
+    let e = arc.entries().unwrap().into_iter().find(|e| e.path.ends_with("small.bin")).expect("entry");
+    assert_eq!(arc.read_entry(e.index, &ArchiveOpenOptions::default(), None).unwrap(), b"tiny zip body");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn deletes_partial_volumes_on_cancel() {
     let base = tmp("volcancel"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
     let src = write_src(&base, "big.bin", &vec![0x5Au8; 2_500_000]);
