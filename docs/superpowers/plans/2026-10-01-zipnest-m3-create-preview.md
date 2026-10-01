@@ -64,7 +64,7 @@ README.md                                        # 修改：M3 状态
 **Interfaces:**
 - Consumes: 既有 `dll::load()` / `SevenZip::create_object`、`com::{Guid,Hresult,S_OK,E_FAIL,ComObject,qi_matches,as_void}`、`com::instream::FileStreamOwner`、`com::callbacks::crypto_new`、`error::ZipnestError`。
 - Produces:
-  - `types.rs`: `CreateFormat { Zip, SevenZ, Tar, TarGz, TarBz2, TarXz }`；`CompressionLevel { Store, Fastest, Normal, Maximum, Ultra }`（`fn engine_x(&self) -> &'static str`）；`CompressionMethod { Auto, Copy, Deflate, Lzma2, Bzip2 }`（`fn engine_name(&self) -> Option<&'static str>`）；`SfxKind { Gui, Console }`；`CreateOptions { format, level, method, password: Option<String>, encrypt_names: bool, volume_bytes: Option<u64>, sfx: Option<SfxKind> }`（**派生 `Clone`**，手写 `Debug` 脱敏）；`CreateSource { path: PathBuf, node: String }`；`CreateProgress { done_bytes, total_bytes, current_path }`；`CreateStats { files: u32, bytes_in: u64, bytes_out: u64 }`（`Default`+`Clone`+`Copy`）。所有枚举派生 `Debug`+`Clone`+`Copy`+`PartialEq`+`Eq`。
+  - `types.rs`: `CreateFormat { Zip, SevenZ, Tar, TarGz, TarBz2, TarXz }`；`CompressionLevel { Store, Fastest, Normal, Maximum, Ultra }`（`fn engine_x(&self) -> u32` — 传给 `SetProperties` 的 `x` 必须是数值 `VT_UI4`，非 BSTR）；`CompressionMethod { Auto, Copy, Deflate, Lzma2, Bzip2 }`（`fn engine_name(&self) -> Option<&'static str>`）；`SfxKind { Gui, Console }`；`CreateOptions { format, level, method, password: Option<String>, encrypt_names: bool, volume_bytes: Option<u64>, sfx: Option<SfxKind> }`（**派生 `Clone`**，手写 `Debug` 脱敏）；`CreateSource { path: PathBuf, node: String }`；`CreateProgress { done_bytes, total_bytes, current_path }`；`CreateStats { files: u32, bytes_in: u64, bytes_out: u64 }`（`Default`+`Clone`+`Copy`）。所有枚举派生 `Debug`+`Clone`+`Copy`+`PartialEq`+`Eq`。
   - `create.rs`: `pub fn create_archive(sources: &[CreateSource], dest: &Path, opts: &CreateOptions, progress: &mut dyn FnMut(&CreateProgress) -> bool) -> Result<CreateStats, ZipnestError>`（Task 1 只实现 `level=Store`+`method=Copy`、`password=None`、`volume_bytes=None`、`sfx=None` 的分支）。
   - `com/mod.rs`: `IID_IOUT_ARCHIVE`, `IID_ISET_PROPERTIES`, `IID_IOUT_STREAM`, `IID_IARCHIVE_UPDATE_CALLBACK`, `IID_IARCHIVE_UPDATE_CALLBACK2`。
 
@@ -164,6 +164,8 @@ impl PropVariant {
 ```
 
 （`empty()` 已存在，勿重复定义。）
+
+**关键布局事实：** 在 x64/ARM64（LLP64）上 `PROPVARIANT` 的大小是 **24 字节**——`DECIMAL` 成员（16 字节）使联合体为 8+16。若 `#[repr(C)]` 结构体只有 16 字节，`SetProperties` 的数组步长错位会返回 `E_INVALIDARG`（并静默丢弃后续属性）；单值 `GetProperty` 的读路径也会被引擎越界写 8 字节。执行时确认结构体带 8 字节尾字段（`reserved4: u64`）。
 
 - [ ] **Step 4: 实现 `IOutStream` 与 `IArchiveUpdateCallback`**
 
