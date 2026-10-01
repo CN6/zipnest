@@ -3,8 +3,11 @@
 
 use crate::error::IpcError;
 use crate::registry::{ArchiveRegistry, SharedArchive};
+use archive_core::types::{
+    CompressionLevel, CompressionMethod, CreateFormat, CreateOptions, SfxKind,
+};
 use archive_core::{Archive, ArchiveEntry, ArchiveOpenOptions};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +30,96 @@ pub struct OpenArchiveResult {
     pub encrypted: bool,
     pub format: String,
     pub entries: Vec<EntryDto>,
+}
+
+/// Create wizard options, as sent by the frontend. Enum-like fields are
+/// stable lowercase strings (never the Rust enum names) so the DTO can evolve
+/// without breaking the UI:
+///
+/// - `format`: `"zip" | "7z" | "tar" | "tar.gz" | "tar.bz2" | "tar.xz"`
+///   (aliases `"7zip"`, `"tgz"`, `"tbz2"`, `"txz"` accepted)
+/// - `level`: `"store" | "fastest" | "normal" | "maximum" | "ultra"`
+/// - `method`: `"auto" | "copy" | "deflate" | "lzma2" | "bzip2"`
+/// - `sfx`: `"gui" | "console"` (7z-only; omitted when not building an SFX)
+///
+/// The password is memory-only; `Debug` redacts it and it is never logged.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct CreateRequest {
+    pub format: String,
+    pub level: String,
+    pub method: String,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub encrypt_names: Option<bool>,
+    #[serde(default)]
+    pub volume_bytes: Option<u64>,
+    #[serde(default)]
+    pub sfx: Option<String>,
+}
+
+impl std::fmt::Debug for CreateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateRequest")
+            .field("format", &self.format)
+            .field("level", &self.level)
+            .field("method", &self.method)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("encrypt_names", &self.encrypt_names)
+            .field("volume_bytes", &self.volume_bytes)
+            .field("sfx", &self.sfx)
+            .finish()
+    }
+}
+
+impl CreateRequest {
+    /// Map the wire DTO onto the engine's typed [`CreateOptions`]. Unknown
+    /// strings are rejected here (the untrusted frontend boundary) with a
+    /// stable key instead of reaching the engine.
+    fn into_engine_options(self) -> Result<CreateOptions, IpcError> {
+        let format = match self.format.to_ascii_lowercase().as_str() {
+            "zip" => CreateFormat::Zip,
+            "7z" | "7zip" => CreateFormat::SevenZ,
+            "tar" => CreateFormat::Tar,
+            "tar.gz" | "tgz" | "targz" => CreateFormat::TarGz,
+            "tar.bz2" | "tbz2" | "tarbz2" => CreateFormat::TarBz2,
+            "tar.xz" | "txz" | "tarxz" => CreateFormat::TarXz,
+            _ => return Err(IpcError::new("error.engine")),
+        };
+        let level = match self.level.to_ascii_lowercase().as_str() {
+            "store" => CompressionLevel::Store,
+            "fastest" => CompressionLevel::Fastest,
+            "normal" => CompressionLevel::Normal,
+            "maximum" => CompressionLevel::Maximum,
+            "ultra" => CompressionLevel::Ultra,
+            _ => return Err(IpcError::new("error.engine")),
+        };
+        let method = match self.method.to_ascii_lowercase().as_str() {
+            "auto" => CompressionMethod::Auto,
+            "copy" => CompressionMethod::Copy,
+            "deflate" => CompressionMethod::Deflate,
+            "lzma2" => CompressionMethod::Lzma2,
+            "bzip2" => CompressionMethod::Bzip2,
+            _ => return Err(IpcError::new("error.engine")),
+        };
+        let sfx = match self.sfx.as_deref() {
+            None | Some("") => None,
+            Some(s) => match s.to_ascii_lowercase().as_str() {
+                "gui" => Some(SfxKind::Gui),
+                "console" => Some(SfxKind::Console),
+                _ => return Err(IpcError::new("error.engine")),
+            },
+        };
+        Ok(CreateOptions {
+            format,
+            level,
+            method,
+            password: self.password,
+            encrypt_names: self.encrypt_names.unwrap_or(false),
+            volume_bytes: self.volume_bytes,
+            sfx,
+        })
+    }
 }
 
 fn to_dto(e: &ArchiveEntry) -> EntryDto {
@@ -280,6 +373,66 @@ impl IpcService {
                 }
                 key
             })?;
+            Ok(())
+        }));
+        Ok(job_id)
+    }
+
+    /// Queue a create job and return its id.
+    ///
+    /// `sources` are on-disk paths (files or directories); each keeps its own
+    /// basename inside the archive, and directories recurse (empty ones are
+    /// preserved). The DTO is validated and mapped to [`CreateOptions`] before
+    /// the job is queued, so a malformed request fails synchronously with an
+    /// `IpcError` instead of producing a queued-but-doomed job. Progress is
+    /// reported from the engine callback (return `false` on cancel), and the
+    /// destination's parent must be writable — enforced by the engine.
+    pub fn create_archive(
+        &self,
+        sources: Vec<String>,
+        dest: String,
+        options: CreateRequest,
+    ) -> Result<u64, IpcError> {
+        if sources.is_empty() || dest.trim().is_empty() {
+            return Err(IpcError::new("error.io"));
+        }
+        let opts = options.into_engine_options()?;
+        let inputs: Vec<std::path::PathBuf> =
+            sources.into_iter().map(std::path::PathBuf::from).collect();
+
+        let job_id = self.jobs.submit("create", Box::new(move |ctx| {
+            // Each input is expanded relative to its own parent so the archive
+            // node is the item's basename (a directory keeps its tree).
+            let mut engine_sources = Vec::new();
+            for input in &inputs {
+                let base = input
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let mut part =
+                    archive_core::collect_sources(std::slice::from_ref(input), &base)
+                        .map_err(|e| e.error_key().to_string())?;
+                engine_sources.append(&mut part);
+            }
+            if engine_sources.is_empty() {
+                return Err("error.io".into());
+            }
+
+            let total_items = engine_sources.len() as u64;
+            let dest_path = std::path::PathBuf::from(&dest);
+            // `CreateProgress` has no item counter; count distinct paths
+            // observed as an approximation of entries written.
+            let mut seen = std::collections::HashSet::new();
+            archive_core::create_archive(&engine_sources, &dest_path, &opts, &mut |p| {
+                if ctx.cancelled() {
+                    return false;
+                }
+                seen.insert(p.current_path.clone());
+                ctx.report(seen.len() as u64, total_items, p.done_bytes, p.total_bytes);
+                true
+            })
+            .map_err(|e| e.error_key().to_string())?;
             Ok(())
         }));
         Ok(job_id)

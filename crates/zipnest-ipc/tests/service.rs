@@ -220,6 +220,75 @@ fn open_with_password_then_extract_without_it_reuses_open_password() {
     std::fs::remove_dir_all(&dest).ok();
 }
 
+#[test]
+fn create_archive_emits_finished_ok() {
+    let (svc, events) = service();
+    let tmp = std::env::temp_dir().join(format!("zn-ipc-create-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let src = tmp.join("a.txt"); std::fs::write(&src, b"ipc create").unwrap();
+    let dest = tmp.join("out.zip");
+    let job = svc.create_archive(vec![src.to_string_lossy().into()], dest.to_string_lossy().into(),
+        serde_json::from_value(serde_json::json!({"format":"zip","level":"normal","method":"auto"})).unwrap()).unwrap();
+    wait_events(&events, 5000, |v| v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job));
+    let v = events.lock().unwrap();
+    let fin = v.iter().find(|(n, _)| n == "job_finished").unwrap();
+    assert_eq!(fin.1["ok"], true, "{:?}", fin.1);
+    drop(v);
+    assert!(dest.exists());
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// Unknown DTO enum strings are rejected synchronously with a stable key,
+// before any job is queued (the DTO is the untrusted frontend boundary).
+#[test]
+fn create_archive_invalid_format_is_rejected() {
+    let (svc, _) = service();
+    let tmp = std::env::temp_dir().join(format!("zn-ipc-create-bad-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let src = tmp.join("a.txt");
+    std::fs::write(&src, b"x").unwrap();
+    let dest = tmp.join("out.rar");
+    let err = svc
+        .create_archive(
+            vec![src.to_string_lossy().into()],
+            dest.to_string_lossy().into(),
+            serde_json::from_value(serde_json::json!({"format":"rar","level":"normal","method":"auto"})).unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(err.key, "error.engine");
+    assert!(!dest.exists());
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// A missing source fails the job (not a panic, not a hang) with the engine's
+// I/O key surfaced through `job_finished`.
+#[test]
+fn create_archive_missing_source_finishes_failed() {
+    let (svc, events) = service();
+    let tmp = std::env::temp_dir().join(format!("zn-ipc-create-miss-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let dest = tmp.join("out.zip");
+    let missing = tmp.join("nope.txt");
+    let job = svc
+        .create_archive(
+            vec![missing.to_string_lossy().into()],
+            dest.to_string_lossy().into(),
+            serde_json::from_value(serde_json::json!({"format":"zip","level":"normal","method":"auto"})).unwrap(),
+        )
+        .unwrap();
+    wait_events(&events, 5000, |v| v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job));
+    let v = events.lock().unwrap();
+    let fin = v.iter().find(|(n, _)| n == "job_finished").unwrap();
+    assert_eq!(fin.1["ok"], false);
+    assert_eq!(fin.1["error_key"].as_str(), Some("error.io"));
+    drop(v);
+    assert!(!dest.exists());
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 // Encrypted entries with no password from either source must fail with a
 // re-promptable key, not an opaque engine error.
 #[test]

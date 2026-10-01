@@ -9,4 +9,4 @@ pub mod registry;
 pub mod service;
 
 pub use error::IpcError;
-pub use service::{EntryDto, IpcService, OpenArchiveResult};
+pub use service::{CreateRequest, EntryDto, IpcService, OpenArchiveResult};
