@@ -1,4 +1,12 @@
-import { Dialog, DialogBody, DialogContent, DialogSurface, DialogTitle } from "@fluentui/react-components";
+import {
+  Button,
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogContent,
+  DialogSurface,
+  DialogTitle,
+} from "@fluentui/react-components";
 import { t } from "../i18n";
 import alipayImg from "../assets/donate/alipay.jpg";
 import wechatImg from "../assets/donate/wechat.jpg";
@@ -29,6 +37,11 @@ export default function DonateDialog({ open, onClose }: Props) {
               </div>
             </div>
           </DialogContent>
+          <DialogActions>
+            <Button appearance="secondary" onClick={onClose}>
+              {t("extract.cancel")}
+            </Button>
+          </DialogActions>
         </DialogBody>
       </DialogSurface>
     </Dialog>

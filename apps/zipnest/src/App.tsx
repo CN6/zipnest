@@ -313,11 +313,16 @@ export default function App() {
               ✕
             </Button>
           )}
+          <span className="toolbar-spacer" />
+          <Button appearance="subtle" size="small" onClick={() => setDonateOpen(true)}>
+            {t("settings.donate")}
+          </Button>
         </footer>
         <ExtractDialog
           open={extractOpen}
           onClose={() => setExtractOpen(false)}
           onStart={startExtract}
+          defaultDest={arch.archivePath ? arch.archivePath.replace(/[\\/][^\\/]*$/, "") : ""}
         />
         <CreateWizard
           open={createOpen}

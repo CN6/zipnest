@@ -18,21 +18,25 @@ interface Props {
   open: boolean;
   onClose: () => void;
   onStart: (dest: string, overwrite: boolean) => void;
+  /** Prefilled destination = the opened archive's own folder. */
+  defaultDest?: string;
 }
 
 /** Destination picker + overwrite flag for an extraction. */
-export default function ExtractDialog({ open, onClose, onStart }: Props) {
+export default function ExtractDialog({ open, onClose, onStart, defaultDest }: Props) {
   const [dest, setDest] = useState("");
   const [overwrite, setOverwrite] = useState(true);
   const [touched, setTouched] = useState(false);
 
   useEffect(() => {
     if (open) {
-      setDest("");
+      // Extract to where the archive lives by default; the user can still
+      // pick anywhere else.
+      setDest(defaultDest ?? "");
       setOverwrite(true);
       setTouched(false);
     }
-  }, [open]);
+  }, [open, defaultDest]);
 
   const browse = async () => {
     const dir = await openDialog({ directory: true, multiple: false });
