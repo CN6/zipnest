@@ -12,7 +12,9 @@ import {
   jobCancel,
   listChildren,
   openArchive,
+  readEntryBytes,
 } from "../ipc";
+import { PreviewInfo, classifyEntry } from "../lib/previewCodec";
 
 export type SortKey = "name" | "size" | "mtime";
 export interface SortState {
@@ -32,6 +34,22 @@ export interface JobState {
   /** No progress event yet → still queued behind another job. */
   started: boolean;
 }
+
+/** Bytes + classification shown by the preview panel for one selection. */
+export interface PreviewData {
+  entry: EntryDto;
+  info: PreviewInfo;
+  bytes: Uint8Array;
+}
+
+/** Preview read caps — keep a huge entry from ever landing in the webview. */
+const PREVIEW_SNIFF_BYTES = 64 * 1024;
+const PREVIEW_TEXT_BYTES = 256 * 1024;
+const PREVIEW_IMAGE_BYTES = 8 * 1024 * 1024;
+const PREVIEW_HEX_BYTES = 4 * 1024;
+
+/** `read_entry_bytes` returns a JSON number array; wrap it for the codec. */
+const toBytes = (raw: number[]) => new Uint8Array(raw);
 
 /** What the password dialog is retrying. */
 export type PendingPassword =
@@ -76,6 +94,11 @@ export function useArchive() {
   const [passwordWrong, setPasswordWrong] = useState(false);
   const [extractDest, setExtractDest] = useState("");
   const [createDest, setCreateDest] = useState("");
+  const [preview, setPreview] = useState<PreviewData | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  /** Monotonic token: a stale fetch resolving late must not overwrite state. */
+  const previewSeqRef = useRef(0);
   const anchorRef = useRef<string | null>(null);
   const jobRef = useRef<number | null>(null);
   /** Which lifecycle started the in-flight job (drives finish handling). */
@@ -87,6 +110,59 @@ export function useArchive() {
 
   const clearError = useCallback(() => setErrorKey(null), []);
   const clearNotice = useCallback(() => setNotice(null), []);
+
+  const clearPreview = useCallback(() => {
+    previewSeqRef.current += 1;
+    setPreview(null);
+    setPreviewError(null);
+    setPreviewLoading(false);
+  }, []);
+
+  // Preview is a bounded read through IPC: sniff a small window to classify,
+  // then fetch only as many bytes as that kind can usefully render.
+  const previewEntry = useCallback(
+    async (entry: EntryDto) => {
+      if (!archive || entry.is_dir) {
+        clearPreview();
+        return;
+      }
+      const seq = ++previewSeqRef.current;
+      setPreviewLoading(true);
+      setPreviewError(null);
+      const stale = () => seq !== previewSeqRef.current;
+      try {
+        const sniff = toBytes(await readEntryBytes(archive.id, entry.path, PREVIEW_SNIFF_BYTES));
+        if (stale()) return;
+        const info = classifyEntry(entry.name || entry.path, sniff);
+        let bytes = sniff;
+        if (info.kind === "image") {
+          const cap = Math.max(sniff.length, Math.min(entry.size, PREVIEW_IMAGE_BYTES));
+          if (cap > sniff.length) {
+            bytes = toBytes(await readEntryBytes(archive.id, entry.path, cap));
+          }
+        } else if (info.kind === "text") {
+          const cap = Math.max(
+            sniff.length,
+            Math.min(entry.size || sniff.length, PREVIEW_TEXT_BYTES),
+          );
+          if (cap > sniff.length) {
+            bytes = toBytes(await readEntryBytes(archive.id, entry.path, cap));
+          }
+        } else if (info.kind === "hex") {
+          bytes = sniff.subarray(0, PREVIEW_HEX_BYTES);
+        }
+        if (stale()) return;
+        setPreview({ entry, info, bytes });
+      } catch (e) {
+        if (stale()) return;
+        setPreviewError(errKey(e));
+        setPreview(null);
+      } finally {
+        if (!stale()) setPreviewLoading(false);
+      }
+    },
+    [archive, clearPreview],
+  );
 
   const openByPath = useCallback(async (path: string, password?: string) => {
     setStatus("opening");
@@ -410,6 +486,9 @@ export function useArchive() {
     passwordWrong,
     extractDest,
     createDest,
+    preview,
+    previewLoading,
+    previewError,
     parentOf,
     openByPath,
     navigate,
@@ -423,6 +502,8 @@ export function useArchive() {
     setErrorKey,
     startExtract,
     startCreate,
+    previewEntry,
+    clearPreview,
     cancelJob,
     submitPassword,
     dismissPassword,

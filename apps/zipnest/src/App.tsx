@@ -10,7 +10,7 @@ import "./App.css";
 
 import { getLocale, setLocale, t, Locale } from "./i18n";
 import { ArchiveApi, useArchive } from "./hooks/useArchive";
-import { CreateOptions, openEntry, revealInExplorer } from "./ipc";
+import { CreateOptions, EntryDto, openEntry, revealInExplorer } from "./ipc";
 import Toolbar from "./components/Toolbar";
 import Breadcrumbs from "./components/Breadcrumbs";
 import EntryTable from "./components/EntryTable";
@@ -18,6 +18,7 @@ import ExtractDialog from "./components/ExtractDialog";
 import CreateWizard from "./components/CreateWizard";
 import PasswordDialog from "./components/PasswordDialog";
 import ProgressBarStrip from "./components/ProgressBar";
+import PreviewPanel from "./components/PreviewPanel";
 
 const ARCHIVE_FILTERS = [
   {
@@ -126,6 +127,32 @@ export default function App() {
     document.title = t("app.title");
   }, [locale]);
 
+  // Preview target: exactly one selected row that is not a directory.
+  const selectedOne =
+    arch.selectedEntries.length === 1 && !arch.selectedEntries[0].is_dir
+      ? arch.selectedEntries[0]
+      : null;
+  const selectedOnePath = selectedOne?.path ?? null;
+  const archiveId = arch.archive?.id ?? null;
+
+  useEffect(() => {
+    if (!selectedOnePath) {
+      arch.clearPreview();
+      return;
+    }
+    const entry = arch.rows.find((r) => r.path === selectedOnePath);
+    if (entry) void arch.previewEntry(entry);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedOnePath, archiveId]);
+
+  const openExternal = (entry: EntryDto) => {
+    if (arch.archive) {
+      openEntry(arch.archive.id, entry.path).catch((e) =>
+        arch.setErrorKey(typeof e === "string" ? e : "error.engine"),
+      );
+    }
+  };
+
   const showEmpty = arch.status === "closed" || arch.rows.length === 0;
   const noticeText = arch.notice ? t(arch.notice) : "";
   const busy = arch.status === "opening" || arch.status === "extracting" || arch.status === "creating";
@@ -157,18 +184,29 @@ export default function App() {
           />
         )}
         {arch.status !== "closed" && arch.rows.length > 0 && (
-          <EntryTable
-            rows={arch.rows}
-            selected={arch.selected}
-            sort={arch.sort}
-            onSort={arch.toggleSort}
-            onActivate={(entry) => activate(arch, entry.path, entry.is_dir)}
-            onClickRow={(entry, index, e) => arch.clickSelect(entry, index, e)}
-            onContextMenu={(entry, x, y) => {
-              if (busy) return;
-              setCtxMenu({ entry: { path: entry.path, is_dir: entry.is_dir }, x, y });
-            }}
-          />
+          <div className="browser-body">
+            <EntryTable
+              rows={arch.rows}
+              selected={arch.selected}
+              sort={arch.sort}
+              onSort={arch.toggleSort}
+              onActivate={(entry) => activate(arch, entry.path, entry.is_dir)}
+              onClickRow={(entry, index, e) => arch.clickSelect(entry, index, e)}
+              onContextMenu={(entry, x, y) => {
+                if (busy) return;
+                setCtxMenu({ entry: { path: entry.path, is_dir: entry.is_dir }, x, y });
+              }}
+            />
+            {selectedOne && (
+              <PreviewPanel
+                entry={selectedOne}
+                preview={arch.preview}
+                loading={arch.previewLoading}
+                errorKey={arch.previewError}
+                onOpenExternal={() => openExternal(selectedOne)}
+              />
+            )}
+          </div>
         )}
         {showEmpty && (
           <div className="empty">
