@@ -4,7 +4,7 @@ Full-featured archive manager for Windows (x64 + ARM64), built on the
 official 7-Zip engine (`7z.dll`, dynamically loaded). Free for everyone —
 donations optional, **no feature is ever gated**.
 
-## Status: M2 (main UI) — done
+## Status: M3 (create & preview) — done
 
 The engine layer lives in two crates:
 
@@ -13,14 +13,16 @@ The engine layer lives in two crates:
 | `archive-core` | `7z.dll` COM wrapper: open / list / read / extract, passwords, progress, cancellation |
 | `archive-security` | Path sanitization (zip-slip, traversal, reserved names) + extraction quota (zip-bomb guard) |
 
-Supported in M1: **ZIP, 7z, RAR, TAR, GZ, BZ2, XZ, ISO** extraction
-(RAR decompression only — creating RAR is intentionally unsupported),
-plus ZIP/7Z/TAR creation planned for M2+.
+Extraction: **ZIP, 7z, RAR, TAR, GZ, BZ2, XZ, ISO** (RAR decompression
+only — creating RAR is intentionally unsupported).
+Creation (M3): **ZIP, 7Z, TAR** plus the **.tar.gz / .tar.bz2 / .tar.xz**
+wrappers — compression level/method, AES-256 passwords, 7z header
+encryption, split volumes (7z / ZIP), and 7z SFX stubs.
 
 ## Build & test
 
 ```powershell
-cargo test --workspace          # 40 tests, must be green
+cargo test --workspace          # 77 tests, must be green
 cargo test -- --ignored         # one-off 5000-entry performance probe
 cd apps\zipnest
 pnpm test                       # vitest: i18n key parity + progress helpers
@@ -68,13 +70,28 @@ Done:
   service + registry) → Tauri commands → frontend. Errors cross layers as
   `IpcError { key }` only; every key has a locale string in both languages.
 
-Not yet (M3/M4): archive creation, AES-256 write, split volumes, SFX,
-preview panel, task center, settings, file associations, tray, shell
-context menu.
+## M3 — create & preview
+
+Done:
+
+- Creation wizard: ZIP/7Z/TAR plus the .tar.gz/.tar.bz2/.tar.xz wrappers;
+  compression level/method; AES-256 password; 7z header encryption; split
+  volumes (7z/ZIP, custom size); 7z SFX (GUI/console stub). Reader-side
+  open of split volumes (`.7z.001` / `.zip.001`).
+- Preview panel: text (UTF-8/GBK/UTF-16 with BOM detection), images
+  (png/jpg/gif/bmp/webp), hex-dump fallback, external-open action.
+- Create progress/cancellation reuse the M2 job pipeline; every new error
+  key and preview string exists in both zh-CN and en-US.
+
+Not yet (M4): settings, file associations, tray, shell context menu,
+ARM64 packaging. (The task center was dropped by decision — extraction is
+short enough that M2's lightweight progress/queue/notice UI is the whole
+of it.)
 
 ## Milestones
 
 - M1 — engine foundation (tag: `m1-engine`)
-- **M2 — main UI** (this tag: `m2-ui`)
-- M3 — creation, encryption, multi-volume, SFX
-- M4 — shell integration, installer, acceptance pass
+- M2 — main UI (tag: `m2-ui`)
+- **M3 — create & preview** (this tag: `m3-create-preview`)
+- M4 — shell integration, settings, ARM64 packaging, installer,
+  acceptance pass
