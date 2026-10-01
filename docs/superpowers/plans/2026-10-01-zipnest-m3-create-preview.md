@@ -537,6 +537,57 @@ fn splits_7z_into_volumes() {
 
 ---
 
+### Task 7b: 读取端多卷打开（.7z.001 / .zip.001）
+
+> **为何新增：** Task 7 能创建分卷，但读取端不支持多卷打开——**自己建的分卷自己打不开**（`Archive::open("x.7z.001")` 现在不识别 `.NNN` 且没有卷回调）。对"全功能"产品这是半成品。7-Zip 的 handler 通过 `IArchiveOpenVolumeCallback`（group 6 / **0x30**；方法 `GetProperty(PROPID, PROPVARIANT*)`、`GetStream(const wchar_t* name, IInStream**)`）向调用方索要后续卷。
+
+**Files:**
+- Modify: `crates/archive-core/src/com/mod.rs`, `com/vtables.rs`, `com/callbacks.rs`, `archive.rs`
+- Test: `crates/archive-core/tests/create.rs`
+
+**Interfaces:**
+- Consumes: Task 7 的产物布局（`<base>.7z.001/.002`、`<base>.zip.001`）。
+- Produces: `Archive::open` 可直接打开首卷、透明读取整个多卷归档（list + read_entry 均可用）。
+
+- [ ] **Step 1: 失败测试**
+```rust
+#[test]
+fn opens_split_7z_from_first_volume() {
+    let base = tmp("rvol7z"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "big.bin", &vec![0x33u8; 2_500_000]);
+    let dest = base.join("vol.7z");
+    let srcs = vec![CreateSource { path: src, node: "big.bin".into() }];
+    let mut o = opts(CreateFormat::SevenZ); o.volume_bytes = Some(1_000_000);
+    create_archive(&srcs, &dest, &o, &mut |_| true).unwrap();
+    assert!(base.join("vol.7z.002").exists());
+    let arc = Archive::open(&base.join("vol.7z.001"), ArchiveOpenOptions::default()).unwrap();
+    let e = arc.entries().unwrap().into_iter().find(|e| e.path.ends_with("big.bin")).expect("entry");
+    assert_eq!(arc.read_entry(e.index, &ArchiveOpenOptions::default(), None).unwrap().len(), 2_500_000);
+    let _ = std::fs::remove_dir_all(&base);
+}
+```
+（ZIP 分卷同理 `vol.zip.001`。）
+
+- [ ] **Step 2: 实现**
+  - `com/mod.rs`：`pub const IID_IARCHIVE_OPEN_VOLUME_CALLBACK: Guid = guid7(6, 0x30);`
+  - `com/vtables.rs`：
+```rust
+#[repr(C)]
+pub struct OpenVolumeCallbackVt {
+    pub query_interface: QueryInterfaceFn,
+    pub add_ref: AddRefFn,
+    pub release: ReleaseFn,
+    pub get_property: unsafe extern "system" fn(this: *mut c_void, prop_id: u32, value: *mut PropVariant) -> Hresult,
+    pub get_stream: unsafe extern "system" fn(this: *mut c_void, name: *const u16, in_stream: *mut *mut c_void) -> Hresult,
+}
+```
+  - `com/callbacks.rs`：`OpenCallback` 的 QI 也匹配 `IID_IARCHIVE_OPEN_VOLUME_CALLBACK`（自身即该接口指针）；新增 `get_property`（`kpidName` → 首卷文件名 BSTR；**执行时以 `vendor/7zip-sdk/PropID.h` 确认 `kpidName` 数值**）与 `get_stream`（在首卷同目录打开 `name`，返回 `FileStreamOwner`）。`OpenState` 记录首卷目录与文件名。回调生命周期须覆盖 Open 及引擎可能持有的后续取卷引用（handler 若 AddRef，则应存活至 `Archive` drop——确认 refcount 正确）。
+  - `archive.rs`：`clsid_candidates` 识别尾部 `.NNN`（3 位数字）——`<stem>.7z.001`/`<stem>.zip.001` 去掉 `.NNN` 后按 `<stem>` 扩展选 CLSID。
+- [ ] **Step 3: 通过 + 交叉验证**：与 `7z t x.7z.001` 结果一致；ZIP 分卷同样可开。
+- [ ] **Step 4: Commit** `git commit -am "feat(engine): open split volumes from the first part"`
+
+---
+
 ### Task 8: 自解压 SFX — 先 spike 再实现
 
 **Files:** Create `vendor/7zip-sfx/{7z.sfx,7zCon.sfx,LICENSE.txt}`；Modify `create.rs`；Test `tests/create.rs`
