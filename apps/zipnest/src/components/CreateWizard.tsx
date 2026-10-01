@@ -135,14 +135,27 @@ export default function CreateWizard({ open, onClose, onStart }: Props) {
   const addSources = (paths: string[]) =>
     setSources((prev) => [...prev, ...paths.filter((p) => !prev.includes(p))]);
 
-  const pickFiles = async () => {
-    const picked = await openDialog({ multiple: true });
+  // The dialog can return a single path (string) or several (string[]) depending
+  // on platform/mode; accept both so a single pick is never silently dropped.
+  const addPicked = (picked: string | string[] | null) => {
     if (Array.isArray(picked)) addSources(picked);
+    else if (typeof picked === "string" && picked) addSources([picked]);
+  };
+
+  const pickFiles = async () => {
+    try {
+      addPicked(await openDialog({ multiple: true }));
+    } catch (e) {
+      console.error("pick files failed", e);
+    }
   };
 
   const pickFolders = async () => {
-    const picked = await openDialog({ directory: true, multiple: true });
-    if (Array.isArray(picked)) addSources(picked);
+    try {
+      addPicked(await openDialog({ directory: true, multiple: true }));
+    } catch (e) {
+      console.error("pick folders failed", e);
+    }
   };
 
   const browseDest = async () => {
