@@ -1,7 +1,7 @@
 import { Dialog, DialogBody, DialogContent, DialogSurface, DialogTitle } from "@fluentui/react-components";
 import { t } from "../i18n";
-import alipayImg from "../assets/donate/alipay.png";
-import wechatImg from "../assets/donate/wechat.png";
+import alipayImg from "../assets/donate/alipay.jpg";
+import wechatImg from "../assets/donate/wechat.jpg";
 
 interface Props {
   open: boolean;
