@@ -643,9 +643,14 @@ fn create_progress_is_monotonic_and_cancel_stops() {
     let src = write_src(&base, "big.bin", &vec![7u8; 3_000_000]);
     let dest = base.join("out.7z");
     let srcs = vec![CreateSource { path: src, node: "big.bin".into() }];
-    let mut seen = 0u64;
-    let mut o = opts(CreateFormat::SevenZ); o.level = CompressionLevel::Normal;
-    create_archive(&srcs, &dest, &o, &mut |p| { seen += 1; assert!(p.done_bytes <= p.total_bytes.max(p.done_bytes)); true }).unwrap();
+    let o = { let mut o = opts(CreateFormat::SevenZ); o.level = CompressionLevel::Normal; o };
+    // Collect in the closure; assert AFTER the call (never panic inside the FFI callback).
+    let mut samples: Vec<(u64, u64)> = Vec::new();
+    create_archive(&srcs, &dest, &o, &mut |p| { samples.push((p.done_bytes, p.total_bytes)); true }).unwrap();
+    assert!(!samples.is_empty(), "progress callback must fire (payload large enough for a tick)");
+    for (done, total) in &samples { assert!(done <= total); }
+    assert!(samples.windows(2).all(|w| w[1].0 >= w[0].0), "done_bytes must be non-decreasing");
+    assert_eq!(samples.last().unwrap().1, 3_000_000, "total seeded from source scan");
     let _ = std::fs::remove_dir_all(&base);
 
     let dest2 = base.join("cancel.7z");
