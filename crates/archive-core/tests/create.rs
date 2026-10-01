@@ -1,7 +1,29 @@
-use archive_core::{create::{collect_sources, create_archive, CreateSource}, Archive, ArchiveOpenOptions, types::{CreateFormat, CompressionLevel, CompressionMethod, CreateOptions}};
+use archive_core::{create::{collect_sources, create_archive, CreateSource}, Archive, ArchiveOpenOptions, types::{CreateFormat, CompressionLevel, CompressionMethod, CreateOptions, SfxKind}};
 use std::path::PathBuf;
 
 fn tmp(name: &str) -> PathBuf { std::env::temp_dir().join(format!("zn-create-{}-{}", std::process::id(), name)) }
+
+/// The official `7z.exe` client, used to prove an SFX holds a readable archive.
+fn seven_zip_exe() -> PathBuf {
+    for p in [r"C:\Program Files\7-Zip\7z.exe", r"C:\Program Files (x86)\7-Zip\7z.exe"] {
+        let pb = PathBuf::from(p);
+        if pb.exists() { return pb; }
+    }
+    panic!("7z.exe not found; required to verify SFX output");
+}
+
+/// `7z l <archive>` stdout.
+fn list_with_7z(archive: &std::path::Path) -> String {
+    let out = std::process::Command::new(seven_zip_exe()).arg("l").arg(archive).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The vendored stub for `kind`, resolved relative to this crate at test time.
+fn vendored_stub(kind: SfxKind) -> Vec<u8> {
+    let name = match kind { SfxKind::Gui => "7z.sfx", SfxKind::Console => "7zCon.sfx" };
+    let path = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../vendor/7zip-sfx")).join(name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("stub {} unreadable: {e}", path.display()))
+}
 
 fn write_src(dir: &std::path::Path, rel: &str, body: &[u8]) -> PathBuf {
     let p = dir.join(rel);
@@ -467,6 +489,79 @@ fn rejects_volumes_for_tar_formats() {
     let err = create_archive(&srcs, &base.join("out.tar"), &o, &mut |_| true)
         .expect_err("volumes on TAR must be rejected");
     assert_eq!(err.kind(), "error.engine", "got {err:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Create a 7z SFX with `kind` and assert it is a runnable PE whose embedded
+/// archive the official 7-Zip client can read.
+fn assert_sfx_roundtrip(kind: SfxKind, tag: &str) {
+    let base = tmp(tag); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "a.txt", b"sfx body");
+    let dest = base.join("packed.exe");
+    let srcs = vec![CreateSource { path: src, node: "a.txt".into() }];
+    let mut o = opts(CreateFormat::SevenZ); o.sfx = Some(kind);
+    let stats = create_archive(&srcs, &dest, &o, &mut |_| true).unwrap();
+
+    // The product is a PE executable whose prefix is exactly the vendored stub,
+    // followed by a normal .7z archive.
+    let head = std::fs::read(&dest).unwrap();
+    assert_eq!(&head[0..2], b"MZ", "SFX must be a PE executable");
+    let stub = vendored_stub(kind);
+    assert!(head.starts_with(&stub), "output must begin with the vendored stub");
+    assert!(head.len() > stub.len(), "a payload must follow the stub");
+    assert_eq!(stats.bytes_out, head.len() as u64, "bytes_out is the whole .exe");
+
+    // The official client reads the embedded archive past the stub.
+    let listing = list_with_7z(&dest);
+    assert!(listing.contains("a.txt"), "7z must find the embedded archive, got:\n{listing}");
+
+    // The intermediate .7z must not survive the concat.
+    let leftovers = leftover_tmp(&base);
+    assert!(leftovers.is_empty(), "temp archive left behind: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn creates_7z_sfx_runnable() {
+    assert_sfx_roundtrip(SfxKind::Console, "sfx-con");
+}
+
+#[test]
+fn creates_7z_gui_sfx_runnable() {
+    assert_sfx_roundtrip(SfxKind::Gui, "sfx-gui");
+}
+
+#[test]
+fn rejects_sfx_for_non_7z_formats() {
+    // The stubs carry only a 7z payload; other formats must be refused rather
+    // than producing an .exe the stub cannot open.
+    let base = tmp("sfx-badfmt"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "a.txt", b"x");
+    let srcs = vec![CreateSource { path: src, node: "a.txt".into() }];
+    for fmt in [CreateFormat::Zip, CreateFormat::Tar] {
+        let dest = base.join("out.exe");
+        let mut o = opts(fmt); o.sfx = Some(SfxKind::Console);
+        let err = create_archive(&srcs, &dest, &o, &mut |_| true)
+            .expect_err("SFX on a non-7z format must be rejected");
+        assert_eq!(err.kind(), "error.engine", "{fmt:?} gave {err:?}");
+        assert!(!dest.exists(), "no output may be written when SFX is refused");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn rejects_sfx_with_volumes() {
+    // A split SFX is out of scope: the stub expects one contiguous stream.
+    let base = tmp("sfx-vol"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "a.txt", b"x");
+    let srcs = vec![CreateSource { path: src, node: "a.txt".into() }];
+    let dest = base.join("out.exe");
+    let mut o = opts(CreateFormat::SevenZ); o.sfx = Some(SfxKind::Console); o.volume_bytes = Some(1_000_000);
+    let err = create_archive(&srcs, &dest, &o, &mut |_| true)
+        .expect_err("SFX with volumes must be rejected");
+    assert_eq!(err.kind(), "error.engine", "got {err:?}");
+    assert!(!dest.exists(), "no output may be written when SFX+volumes is refused");
+    assert!(!base.join("out.exe.001").exists(), "no volume may be written");
     let _ = std::fs::remove_dir_all(&base);
 }
 

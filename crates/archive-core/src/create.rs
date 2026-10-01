@@ -11,7 +11,9 @@
 //! Task 7 adds split volumes: for ZIP/7z the output is written to
 //! `<dest>.001`, `.002`, ... through the multi-volume stream in `outstream`,
 //! because the handler only ever sees a single stream (7-Zip's own client
-//! splits the same way). SFX remains the only rejected option.
+//! splits the same way). Task 8 adds self-extracting archives: a 7z build is
+//! prepended with a vendored SFX stub, producing a runnable `<stub> + <7z>`
+//! `.exe`.
 
 use crate::com::callbacks;
 use crate::com::outcallback::{self, SourceItem, UpdateState};
@@ -25,7 +27,9 @@ use crate::com::{
 };
 use crate::dll;
 use crate::error::ZipnestError;
-use crate::types::{CompressionMethod, CreateFormat, CreateOptions, CreateProgress, CreateStats};
+use crate::types::{
+    CompressionMethod, CreateFormat, CreateOptions, CreateProgress, CreateStats, SfxKind,
+};
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -139,10 +143,11 @@ impl Drop for TempCleanup {
     }
 }
 
-/// A unique scratch path for the intermediate `.tar`, placed beside the
-/// destination: that directory is known writable (the destination lives there),
-/// which keeps the write on one volume and lets tests observe cleanup.
-fn temp_tar_path(dest: &Path) -> PathBuf {
+/// A unique scratch path beside the destination with extension `ext`, placed
+/// there because that directory is known writable (the destination lives in
+/// it), which keeps the write on one volume and lets tests observe cleanup.
+/// The `zipnest` marker is what those tests look for.
+fn temp_scratch_path(dest: &Path, ext: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -155,7 +160,15 @@ fn temp_tar_path(dest: &Path) -> PathBuf {
         .unwrap_or_else(|| "out".to_string());
     dest.parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(format!(".{name}.zipnest-{}-{nanos}-{seq}.tar", std::process::id()))
+        .join(format!(
+            ".{name}.zipnest-{}-{nanos}-{seq}.{ext}",
+            std::process::id()
+        ))
+}
+
+/// A unique scratch path for the intermediate `.tar`.
+fn temp_tar_path(dest: &Path) -> PathBuf {
+    temp_scratch_path(dest, "tar")
 }
 
 /// Inner node name for a compressed TAR: the destination filename with the
@@ -175,6 +188,82 @@ fn inner_tar_node(dest: &Path) -> Result<String, ZipnestError> {
         .or_else(|| name.strip_suffix(".xz"))
         .unwrap_or(&name);
     Ok(archive_security::sanitize_entry_path(stripped)?)
+}
+
+/// File name of the vendored SFX stub for `kind`.
+fn sfx_stub_name(kind: SfxKind) -> &'static str {
+    match kind {
+        SfxKind::Gui => "7z.sfx",
+        SfxKind::Console => "7zCon.sfx",
+    }
+}
+
+/// Locate the SFX stub for `kind`.
+///
+/// Search order mirrors [`crate::dll::load`]: an explicit override (dev/tests),
+/// the deployed `<exe>/engines/sfx/` layout, then the vendored copy under
+/// `vendor/7zip-sfx/` (the crate manifest dir at test time, or the workspace
+/// root two levels up).
+fn find_sfx_stub(kind: SfxKind) -> Result<PathBuf, ZipnestError> {
+    let name = sfx_stub_name(kind);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(dir) = std::env::var("ZIPNEST_SFX_DIR") {
+        if !dir.is_empty() {
+            candidates.push(PathBuf::from(dir).join(name));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("engines").join("sfx").join(name));
+        }
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    candidates.push(manifest.join("vendor").join("7zip-sfx").join(name));
+    candidates.push(
+        manifest
+            .join("..")
+            .join("..")
+            .join("vendor")
+            .join("7zip-sfx")
+            .join(name),
+    );
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .ok_or(ZipnestError::Engine(E_FAIL))
+}
+
+/// Concatenate `stub` then `archive` into `dest`, returning the byte length.
+///
+/// 7-Zip locates the archive by scanning from the tail, so a plain
+/// `stub + 7z` byte stream is a valid SFX (the spike and `7z a -sfx` agree on
+/// this layout). On any failure the partial `dest` is removed so no truncated
+/// `.exe` survives.
+fn concat_files(stub: &Path, archive: &Path, dest: &Path) -> Result<u64, ZipnestError> {
+    use std::io::{Read, Write};
+    let copied = (|| -> std::io::Result<u64> {
+        let mut out = std::fs::File::create(dest)?;
+        let mut buf = vec![0u8; 64 * 1024];
+        for part in [stub, archive] {
+            let mut f = std::fs::File::open(part)?;
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&buf[..n])?;
+            }
+        }
+        out.flush()?;
+        std::fs::metadata(dest).map(|m| m.len())
+    })();
+    match copied {
+        Ok(len) => Ok(len),
+        Err(e) => {
+            let _ = std::fs::remove_file(dest);
+            Err(ZipnestError::Io(e))
+        }
+    }
 }
 
 /// Stat every source and build the item table; also returns the pre-scanned
@@ -288,14 +377,21 @@ unsafe fn apply_properties(raw: *mut c_void, opts: &CreateOptions) {
 /// variants write a temporary `.tar` and wrap it. A password on the TAR family
 /// is rejected with [`ZipnestError::PasswordUnsupported`]. With
 /// `opts.volume_bytes`, ZIP/7z are split into `<dest>.001`, `.002`, ... (the
-/// TAR family and SFX reject volumes with `E_NOTIMPL`); SFX is not wired.
+/// TAR family and SFX reject volumes with `E_NOTIMPL`). `opts.sfx` builds a
+/// runnable `.exe` by prepending the matching stub to a 7z archive; it is
+/// 7z-only.
 pub fn create_archive(
     sources: &[CreateSource],
     dest: &Path,
     opts: &CreateOptions,
     progress: &mut dyn FnMut(&CreateProgress) -> bool,
 ) -> Result<CreateStats, ZipnestError> {
-    if opts.sfx.is_some() {
+    // SFX appends a 7z payload to an executable stub, so it is 7z-only and
+    // cannot be split (the stub reads one contiguous stream). Reject the
+    // impossible combinations before writing anything.
+    if opts.sfx.is_some()
+        && (opts.format != CreateFormat::SevenZ || opts.volume_bytes.is_some())
+    {
         return Err(ZipnestError::Engine(E_NOTIMPL));
     }
     if let Some(limit) = opts.volume_bytes {
@@ -332,8 +428,44 @@ pub fn create_archive(
     ) {
         return create_compressed_tar(sources, dest, opts, progress);
     }
+    if let Some(kind) = opts.sfx {
+        return create_sfx(kind, sources, dest, opts, progress);
+    }
     let clsid = clsid_for(opts.format).ok_or(ZipnestError::Engine(E_NOTIMPL))?;
     write_archive(clsid, sources, dest, opts, progress)
+}
+
+/// Create a self-extracting `.exe`: build a normal 7z into a scratch file, then
+/// prepend the stub for `kind` and write the concatenation to `dest`.
+///
+/// `rsfx` is deliberately not used: the SDK note (see
+/// `vendor/7zip-sdk/Archive/IArchive.h`) says it makes a handler copy a stub it
+/// already holds from an *opened* SFX. A fresh create has no such stub and
+/// there is no API to hand one to a new handler, so manual concatenation — the
+/// same layout `7z a -sfx` produces — is the correct mechanism. The scratch
+/// archive is removed on both the success and the error path.
+fn create_sfx(
+    kind: SfxKind,
+    sources: &[CreateSource],
+    dest: &Path,
+    opts: &CreateOptions,
+    progress: &mut dyn FnMut(&CreateProgress) -> bool,
+) -> Result<CreateStats, ZipnestError> {
+    let stub = find_sfx_stub(kind)?;
+    let archive = temp_scratch_path(dest, "7z");
+    let _cleanup = TempCleanup(archive.clone());
+
+    // Build a plain .7z first; clearing `sfx` keeps this from recurring.
+    let mut inner = opts.clone();
+    inner.sfx = None;
+    let stats = write_archive(CLSID_FORMAT_7Z, sources, &archive, &inner, progress)?;
+
+    let bytes_out = concat_files(&stub, &archive, dest)?;
+    Ok(CreateStats {
+        files: stats.files,
+        bytes_in: stats.bytes_in,
+        bytes_out,
+    })
 }
 
 /// Two-pass create for `TarGz`/`TarBz2`/`TarXz`: build a temporary `.tar`, then
