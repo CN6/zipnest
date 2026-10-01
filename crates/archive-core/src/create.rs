@@ -43,9 +43,28 @@ pub fn collect_sources(
     Ok(out)
 }
 
-fn rel_node(path: &Path, base: &Path) -> String {
-    let rel = path.strip_prefix(base).unwrap_or(path);
-    rel.to_string_lossy().replace('\\', "/")
+/// The safe archive node for `path`, relative to `base`.
+///
+/// Returns `Ok(None)` when `path` *is* `base` (no name of its own), and an
+/// error when `path` is not lexically under `base` or the relative name is
+/// unsafe (absolute/traversal/reserved). Callers must never write an
+/// unsanitized name into the archive (zip-slip).
+fn rel_node(path: &Path, base: &Path) -> Result<Option<String>, ZipnestError> {
+    let rel = path.strip_prefix(base).map_err(|_| {
+        ZipnestError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "source {} is not under base {}",
+                path.display(),
+                base.display()
+            ),
+        ))
+    })?;
+    if rel.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let raw = rel.to_string_lossy().replace('\\', "/");
+    Ok(Some(archive_security::sanitize_entry_path(&raw)?))
 }
 
 fn collect_one(
@@ -59,8 +78,7 @@ fn collect_one(
         return Ok(());
     }
     if meta.is_dir() {
-        let node = rel_node(path, base);
-        if !node.is_empty() {
+        if let Some(node) = rel_node(path, base)? {
             out.push(CreateSource {
                 path: path.to_path_buf(),
                 node,
@@ -73,9 +91,12 @@ fn collect_one(
             collect_one(&e.path(), base, out)?;
         }
     } else {
+        let node = rel_node(path, base)?.ok_or(ZipnestError::Security(
+            archive_security::SecurityViolation::Empty,
+        ))?;
         out.push(CreateSource {
             path: path.to_path_buf(),
-            node: rel_node(path, base),
+            node,
         });
     }
     Ok(())

@@ -104,6 +104,16 @@ fn collects_empty_directory_entry() {
 }
 
 #[test]
+fn rejects_source_outside_base() {
+    let base = tmp("outside"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let other = tmp("outside-elsewhere"); let _ = std::fs::remove_dir_all(&other); std::fs::create_dir_all(&other).unwrap();
+    let src = write_src(&other, "x.txt", b"x");
+    let err = collect_sources(&[src], &base).unwrap_err();
+    assert_eq!(err.kind(), "error.io", "an input not under base must be rejected, got {err:?}");
+    let _ = std::fs::remove_dir_all(&base); let _ = std::fs::remove_dir_all(&other);
+}
+
+#[test]
 fn skips_symlinked_entries() {
     use std::os::windows::fs::{symlink_dir, symlink_file};
     let base = tmp("symlink"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
