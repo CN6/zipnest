@@ -21,19 +21,41 @@ interface Props {
 export default function DonateDialog({ open, onClose }: Props) {
   return (
     <Dialog modalType="modal" open={open} onOpenChange={(_, d) => !d && onClose()}>
-      <DialogSurface>
+      <DialogSurface style={{ maxWidth: 560 }}>
         <DialogBody>
           <DialogTitle>{t("settings.donate.title")}</DialogTitle>
           <DialogContent>
             <p style={{ marginTop: 0, color: "#555" }}>{t("settings.donate.body")}</p>
-            <div style={{ display: "flex", gap: 16, justifyContent: "center", marginTop: 8 }}>
+            <div
+              style={{
+                display: "flex",
+                gap: 24,
+                justifyContent: "center",
+                alignItems: "flex-start",
+                marginTop: 12,
+              }}
+            >
               <div style={{ textAlign: "center" }}>
-                <img src={wechatImg} alt={t("settings.donate.wechat")} width={140} height={176} />
-                <div style={{ fontSize: 12, color: "#666" }}>{t("settings.donate.wechat")}</div>
+                {/* 240 px wide so phones can scan it comfortably; the QR files
+                    themselves stay full-res in src/assets/donate/. */}
+                <img
+                  src={wechatImg}
+                  alt={t("settings.donate.wechat")}
+                  style={{ width: 240, height: "auto", display: "block" }}
+                />
+                <div style={{ fontSize: 14, color: "#666", marginTop: 4 }}>
+                  {t("settings.donate.wechat")}
+                </div>
               </div>
               <div style={{ textAlign: "center" }}>
-                <img src={alipayImg} alt={t("settings.donate.alipay")} width={140} height={176} />
-                <div style={{ fontSize: 12, color: "#666" }}>{t("settings.donate.alipay")}</div>
+                <img
+                  src={alipayImg}
+                  alt={t("settings.donate.alipay")}
+                  style={{ width: 240, height: "auto", display: "block" }}
+                />
+                <div style={{ fontSize: 14, color: "#666", marginTop: 4 }}>
+                  {t("settings.donate.alipay")}
+                </div>
               </div>
             </div>
           </DialogContent>

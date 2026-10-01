@@ -52,6 +52,19 @@ export default function App() {
   const [createOpen, setCreateOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [donateOpen, setDonateOpen] = useState(false);
+  // Fullscreen adaptive zoom: scale the whole UI up with the window so it
+  // stays readable on large screens (design width ≈ 816px; 2560px fullscreen
+  // → ~1.6x, capped).
+  const [zoom, setZoom] = useState(1);
+  useEffect(() => {
+    const update = () => {
+      const w = window.innerWidth;
+      setZoom(Math.min(1.7, Math.max(1, w / 816)));
+    };
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
   // Context menu: the entry it targets plus viewport position.
   const [ctxMenu, setCtxMenu] = useState<{
     entry: { path: string; is_dir: boolean };
@@ -221,7 +234,7 @@ export default function App() {
 
   return (
     <FluentProvider theme={webLightTheme}>
-      <div className="app">
+      <div className="app" style={{ zoom }}>
         <Toolbar
           locale={locale}
           onToggleLocale={toggleLocale}
