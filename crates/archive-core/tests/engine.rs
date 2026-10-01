@@ -112,6 +112,12 @@ fn extracts_plain_zip_to_disk() {
         std::fs::read_to_string(dest.join("sub/b.txt")).unwrap().trim(),
         "nested content"
     );
+    // c.txt is the only Deflate-compressed entry in the fixture (8406 bytes);
+    // Store entries passed while Deflate silently produced 0 bytes.
+    let c_len = std::fs::metadata(dest.join("c.txt"))
+        .expect("c.txt must exist")
+        .len();
+    assert_eq!(c_len, 8406, "deflated entry must be fully written");
     let _ = std::fs::remove_dir_all(&dest);
 }
 

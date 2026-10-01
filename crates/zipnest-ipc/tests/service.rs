@@ -112,6 +112,68 @@ fn extract_emits_progress_and_finished_ok() {
     std::fs::remove_dir_all(&dest).ok();
 }
 
+// c.txt is the only Deflate-compressed entry in plain.zip (8406 bytes).
+// Store entries extracted fine while this one came out as 0 bytes through
+// the UI/IPC path — pin the full byte count.
+#[test]
+fn extract_deflated_entry_writes_full_bytes() {
+    let (svc, events) = service();
+    let r = svc
+        .open_archive(fx("plain.zip").to_string_lossy().into(), None)
+        .unwrap();
+    let dest = std::env::temp_dir().join(format!("zipnest-t4c-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    let job = svc
+        .extract(r.id, vec!["c.txt".into()], dest.to_string_lossy().into(), true, None)
+        .unwrap();
+    wait_events(&events, 5000, |v| v.iter().any(|(n, _)| n == "job_finished"));
+    let v = events.lock().unwrap();
+    let fin = v.iter().find(|(n, _)| n == "job_finished").unwrap();
+    assert_eq!(fin.1["job_id"], job);
+    assert_eq!(fin.1["ok"], true, "extract failed: {:?}", fin.1);
+    drop(v);
+    let len = std::fs::metadata(dest.join("c.txt"))
+        .expect("c.txt must exist")
+        .len();
+    assert_eq!(len, 8406, "deflated entry must be fully written");
+    std::fs::remove_dir_all(&dest).ok();
+}
+
+// The exact selection the UI made during smoke: a directory plus two files
+// (3 non-dir indices of the 4-entry archive) — subset extract regressed to
+// 0-byte output for the deflated entry even though whole-archive and
+// single-entry extracts were fine.
+#[test]
+fn extract_ui_selection_subset_writes_full_bytes() {
+    let (svc, events) = service();
+    let r = svc
+        .open_archive(fx("plain.zip").to_string_lossy().into(), None)
+        .unwrap();
+    let dest = std::env::temp_dir().join(format!("zipnest-t4d-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    let job = svc
+        .extract(
+            r.id,
+            vec!["sub".into(), "a.txt".into(), "c.txt".into()],
+            dest.to_string_lossy().into(),
+            true,
+            None,
+        )
+        .unwrap();
+    wait_events(&events, 5000, |v| v.iter().any(|(n, _)| n == "job_finished"));
+    let v = events.lock().unwrap();
+    let fin = v.iter().find(|(n, _)| n == "job_finished").unwrap();
+    assert_eq!(fin.1["job_id"], job);
+    assert_eq!(fin.1["ok"], true, "extract failed: {:?}", fin.1);
+    drop(v);
+    let len = std::fs::metadata(dest.join("c.txt"))
+        .expect("c.txt must exist")
+        .len();
+    assert_eq!(len, 8406, "deflated entry must be fully written");
+    assert_eq!(std::fs::read_to_string(dest.join("sub/b.txt")).unwrap().trim(), "nested content");
+    std::fs::remove_dir_all(&dest).ok();
+}
+
 #[test]
 fn extract_wrong_password_reports_key() {
     let (svc, events) = service();
@@ -128,5 +190,63 @@ fn extract_wrong_password_reports_key() {
     assert_eq!(fin.1["job_id"], job);
     assert_eq!(fin.1["ok"], false);
     assert_eq!(fin.1["error_key"].as_str(), Some("error.password_incorrect"));
+    std::fs::remove_dir_all(&dest).ok();
+}
+
+// The password given at open time must carry over to extract — the UI has
+// no second prompt for the happy path (desktop archiver session semantics).
+#[test]
+fn open_with_password_then_extract_without_it_reuses_open_password() {
+    let (svc, events) = service();
+    let r = svc
+        .open_archive(fx("enc.7z").to_string_lossy().into(), Some("secret".into()))
+        .unwrap();
+    let dest = std::env::temp_dir().join(format!("zipnest-t4e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    let job = svc
+        .extract(r.id, vec!["a.txt".into()], dest.to_string_lossy().into(), true, None)
+        .unwrap();
+    wait_events(&events, 5000, |v| v.iter().any(|(n, _)| n == "job_finished"));
+    {
+        let v = events.lock().unwrap();
+        let fin = v.iter().find(|(n, _)| n == "job_finished").unwrap();
+        assert_eq!(fin.1["job_id"], job);
+        assert_eq!(fin.1["ok"], true, "extract failed: {:?}", fin.1);
+    }
+    let len = std::fs::metadata(dest.join("a.txt"))
+        .expect("a.txt must exist")
+        .len();
+    assert_eq!(len, 19, "encrypted entry must be fully written");
+    std::fs::remove_dir_all(&dest).ok();
+}
+
+// Encrypted entries with no password from either source must fail with a
+// re-promptable key, not an opaque engine error.
+#[test]
+fn extract_encrypted_without_any_password_prompts() {
+    let (svc, events) = service();
+    // enc.zip: entry-encrypted, header readable — opens without a password.
+    let r = svc
+        .open_archive(fx("enc.zip").to_string_lossy().into(), None)
+        .unwrap();
+    let dest = std::env::temp_dir().join(format!("zipnest-t4f-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    let job = svc
+        .extract(r.id, vec!["a.txt".into()], dest.to_string_lossy().into(), true, None)
+        .unwrap();
+    wait_events(&events, 5000, |v| v.iter().any(|(n, _)| n == "job_finished"));
+    {
+        let v = events.lock().unwrap();
+        let fin = v.iter().find(|(n, _)| n == "job_finished").unwrap();
+        assert_eq!(fin.1["job_id"], job);
+        assert_eq!(fin.1["ok"], false);
+        assert_eq!(
+            fin.1["error_key"].as_str(),
+            Some("error.password_required"),
+            "expected password_required, got {:?}",
+            fin.1
+        );
+    }
+    assert!(!dest.exists() || std::fs::read_dir(&dest).unwrap().next().is_none());
     std::fs::remove_dir_all(&dest).ok();
 }

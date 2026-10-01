@@ -706,9 +706,8 @@ unsafe extern "system" fn disk_get_stream(
         file: Mutex::new(file),
         state: Arc::clone(st),
     }));
-    // Hand out an addref'd reference (engine releases it; we keep ours and
-    // drop it in `disk_release`).
-    fos_add_ref(stream as *mut c_void);
+    // The initial ref is the engine's: it owns the pointer we hand out and
+    // releases it when the entry completes (COM caller-owns convention).
     *out_stream = stream as *mut c_void;
     S_OK
 }

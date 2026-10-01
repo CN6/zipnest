@@ -95,12 +95,21 @@ export function useArchive() {
       setSelected(new Set());
       anchorRef.current = null;
       setStatus("open");
+      setPasswordDialogOpen(false);
+      setPendingPassword(null);
+      setPasswordWrong(false);
       return r;
     } catch (e) {
       const key = errKey(e);
       if (key === "error.password_required") {
         setPendingPassword({ kind: "open", path });
         setPasswordDialogOpen(true);
+      } else if (key === "error.password_incorrect") {
+        // Wrong password on open: keep the dialog up with inline feedback
+        // and restore the pending holder (cleared at entry above).
+        setPendingPassword({ kind: "open", path });
+        setPasswordDialogOpen(true);
+        setPasswordWrong(true);
       } else {
         setErrorKey(key);
       }
@@ -179,6 +188,57 @@ export function useArchive() {
 
   // ---- extract lifecycle -------------------------------------------------
 
+  // Job events race the invoke() response: a fast job can emit progress (or
+  // even finish) before `extract` resolves and jobRef is set. Buffer those
+  // early events by job id and replay them the moment jobRef is assigned.
+  const earlyEvents = useRef(
+    new Map<number, Array<{ kind: "p"; p: JobProgressEvent } | { kind: "f"; f: JobFinishedEvent }>>(),
+  );
+
+  const applyProgress = useCallback((p: JobProgressEvent) => {
+    setJob((prev) =>
+      prev && prev.jobId === p.job_id
+        ? {
+            jobId: p.job_id,
+            doneItems: p.done_items,
+            totalItems: p.total_items,
+            doneBytes: p.done_bytes,
+            totalBytes: p.total_bytes,
+            speedBps: p.speed_bps,
+            etaSecs: p.eta_secs,
+            started: true,
+          }
+        : prev,
+    );
+  }, []);
+
+  const applyFinished = useCallback((p: JobFinishedEvent) => {
+    jobRef.current = null;
+    setJob(null);
+    setStatus("open");
+    if (p.ok) {
+      setNotice("extract.success");
+      setPendingPassword(null);
+      setPasswordDialogOpen(false);
+      return;
+    }
+    const key = p.error_key ?? "error.engine";
+    if (key === "error.password_incorrect") {
+      // Keep the holder args; open the dialog for a retry.
+      setPasswordDialogOpen(true);
+      setPasswordWrong(true);
+    } else if (key === "error.password_required") {
+      // Encrypted entries but no password anywhere: prompt (holder args
+      // are still pending from startExtract).
+      setPasswordDialogOpen(true);
+      setPasswordWrong(false);
+    } else if (key === "error.cancelled") {
+      setNotice("job.canceled");
+    } else {
+      setErrorKey(key);
+    }
+  }, []);
+
   const startExtract = useCallback(
     async (paths: string[], dest: string, overwrite: boolean, password?: string) => {
       if (!archive || paths.length === 0) return;
@@ -202,11 +262,21 @@ export function useArchive() {
         });
         setExtractDest(dest);
         setStatus("extracting");
+        // Replay anything that arrived while the invoke was in flight.
+        const early = earlyEvents.current.get(jobId);
+        if (early) {
+          earlyEvents.current.delete(jobId);
+          for (const ev of early) {
+            if (jobRef.current !== jobId) break; // finished already
+            if (ev.kind === "p") applyProgress(ev.p);
+            else applyFinished(ev.f);
+          }
+        }
       } catch (e) {
         setErrorKey(errKey(e));
       }
     },
-    [archive],
+    [archive, applyProgress, applyFinished],
   );
 
   const cancelJob = useCallback(() => {
@@ -236,50 +306,31 @@ export function useArchive() {
     const unsubs: Promise<() => void>[] = [
       listen<JobProgressEvent>("job_progress", (e) => {
         const p = e.payload;
-        if (p.job_id !== jobRef.current) return;
-        setJob((prev) =>
-          prev && prev.jobId === p.job_id
-            ? {
-                jobId: p.job_id,
-                doneItems: p.done_items,
-                totalItems: p.total_items,
-                doneBytes: p.done_bytes,
-                totalBytes: p.total_bytes,
-                speedBps: p.speed_bps,
-                etaSecs: p.eta_secs,
-                started: true,
-              }
-            : prev,
-        );
+        if (p.job_id === jobRef.current) {
+          applyProgress(p);
+        } else if (jobRef.current == null) {
+          // Invoke response hasn't landed yet — buffer until startExtract
+          // assigns jobRef and replays.
+          const arr = earlyEvents.current.get(p.job_id) ?? [];
+          arr.push({ kind: "p", p });
+          earlyEvents.current.set(p.job_id, arr);
+        }
       }),
       listen<JobFinishedEvent>("job_finished", (e) => {
         const p = e.payload;
-        if (p.job_id !== jobRef.current) return;
-        jobRef.current = null;
-        setJob(null);
-        setStatus("open");
-        if (p.ok) {
-          setNotice("extract.success");
-          setPendingPassword(null);
-          setPasswordDialogOpen(false);
-          return;
-        }
-        const key = p.error_key ?? "error.engine";
-        if (key === "error.password_incorrect") {
-          // Keep the holder args; open the dialog for a retry.
-          setPasswordDialogOpen(true);
-          setPasswordWrong(true);
-        } else if (key === "error.cancelled") {
-          setNotice("job.canceled");
-        } else {
-          setErrorKey(key);
+        if (p.job_id === jobRef.current) {
+          applyFinished(p);
+        } else if (jobRef.current == null) {
+          const arr = earlyEvents.current.get(p.job_id) ?? [];
+          arr.push({ kind: "f", f: p });
+          earlyEvents.current.set(p.job_id, arr);
         }
       }),
     ];
     return () => {
       unsubs.forEach((u) => u.then((fn) => fn()).catch(() => {}));
     };
-  }, []);
+  }, [applyProgress, applyFinished]);
 
   return {
     status,

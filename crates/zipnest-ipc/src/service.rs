@@ -130,7 +130,10 @@ impl IpcService {
     }
 
     pub fn open_archive(&self, path: String, password: Option<String>) -> Result<OpenArchiveResult, IpcError> {
-        let archive = Archive::open(std::path::Path::new(&path), ArchiveOpenOptions { password })?;
+        let archive = Archive::open(
+            std::path::Path::new(&path),
+            ArchiveOpenOptions { password: password.clone() },
+        )?;
         let entries = archive.entries()?;
         let encrypted = entries.iter().any(|e| e.encrypted);
         let format = std::path::Path::new(&path)
@@ -138,7 +141,7 @@ impl IpcService {
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
         let root = children_of(&entries, "").into_iter().map(to_dto).collect();
-        let (id, _) = self.registry.insert(archive);
+        let (id, _) = self.registry.insert(archive, password);
         Ok(OpenArchiveResult { id, encrypted, format, entries: root })
     }
 
@@ -158,7 +161,11 @@ impl IpcService {
             .find(|e| e.path == path)
             .map(|e| e.index)
             .ok_or_else(|| IpcError::new("error.not_an_archive"))?;
-        Ok(guard.0.read_entry(idx, &ArchiveOpenOptions::default(), Some(max_bytes))?)
+        // Preview reuses the open-time password for encrypted entries.
+        let opts = ArchiveOpenOptions {
+            password: self.registry.password(id),
+        };
+        Ok(guard.0.read_entry(idx, &opts, Some(max_bytes))?)
     }
 
     fn lock_archive(&self, id: u64) -> Result<SharedArchive, IpcError> {
@@ -189,6 +196,9 @@ impl IpcService {
             return Err(IpcError::new("error.io"));
         }
         let shared = self.lock_archive(id)?;
+        // Callers may omit the password; fall back to the one supplied at
+        // open time (session-scoped, memory only).
+        let password = password.or_else(|| self.registry.password(id));
         let emit = Arc::clone(&self.emit);
 
         let job_id = self.jobs.submit("extract", Box::new(move |ctx| {
@@ -218,6 +228,16 @@ impl IpcService {
             }
             if wanted.is_empty() {
                 return Err("error.not_an_archive".into());
+            }
+            // Encrypted entries with no password anywhere (argument or
+            // open-time): fail with a re-promptable key instead of letting
+            // the engine surface an opaque data error.
+            let needs_password = entries
+                .iter()
+                .filter(|e| wanted.contains(&e.index))
+                .any(|e| e.encrypted);
+            if needs_password && password.is_none() {
+                return Err("error.password_required".into());
             }
             let total_items = wanted.len() as u64;
             let total_bytes: u64 = entries
