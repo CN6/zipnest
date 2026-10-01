@@ -3,7 +3,7 @@
 //! the frontend maps through i18n. Command names are the JS contract.
 
 use tauri::State;
-use zipnest_ipc::{EntryDto, IpcError, IpcService, OpenArchiveResult};
+use zipnest_ipc::{CreateRequest, EntryDto, IpcError, IpcService, OpenArchiveResult};
 
 #[tauri::command]
 pub fn open_archive(
@@ -43,6 +43,21 @@ pub fn extract(
     password: Option<String>,
 ) -> Result<u64, IpcError> {
     svc.extract(id, paths, dest, overwrite, password)
+}
+
+/// Queue a create job from on-disk `sources`; returns its id. The `options`
+/// object is validated in `zipnest-ipc` (unknown format/level/method/sfx are
+/// rejected with a stable key) before the job is queued.
+#[tauri::command]
+pub fn create_archive(
+    svc: State<'_, IpcService>,
+    sources: Vec<String>,
+    dest: String,
+    options: serde_json::Value,
+) -> Result<u64, IpcError> {
+    let options: CreateRequest =
+        serde_json::from_value(options).map_err(|_| IpcError::new("error.engine"))?;
+    svc.create_archive(sources, dest, options)
 }
 
 #[tauri::command]

@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
+  CreateOptions,
   EntryDto,
   JobFinishedEvent,
   JobProgressEvent,
   OpenArchiveResult,
+  createArchive as ipcCreateArchive,
   errKey,
   extract as ipcExtract,
   jobCancel,
@@ -17,7 +19,7 @@ export interface SortState {
   key: SortKey;
   asc: boolean;
 }
-export type Status = "closed" | "opening" | "open" | "extracting";
+export type Status = "closed" | "opening" | "open" | "extracting" | "creating";
 
 export interface JobState {
   jobId: number;
@@ -73,8 +75,13 @@ export function useArchive() {
   /** True after a submitted password was rejected (dialog shows a hint). */
   const [passwordWrong, setPasswordWrong] = useState(false);
   const [extractDest, setExtractDest] = useState("");
+  const [createDest, setCreateDest] = useState("");
   const anchorRef = useRef<string | null>(null);
   const jobRef = useRef<number | null>(null);
+  /** Which lifecycle started the in-flight job (drives finish handling). */
+  const jobKindRef = useRef<"extract" | "create">("extract");
+  /** Status to restore once a create job settles (create is archive-agnostic). */
+  const restoreStatusRef = useRef<Status>("closed");
 
   const rows = useMemo(() => sortRows(rawRows, sort), [rawRows, sort]);
 
@@ -213,16 +220,26 @@ export function useArchive() {
   }, []);
 
   const applyFinished = useCallback((p: JobFinishedEvent) => {
+    const kind = jobKindRef.current;
     jobRef.current = null;
     setJob(null);
-    setStatus("open");
+    // Extract returns to the (still-open) listing; create leaves whatever
+    // archive was open before it untouched.
+    setStatus(kind === "create" ? restoreStatusRef.current : "open");
     if (p.ok) {
-      setNotice("extract.success");
+      setNotice(kind === "create" ? "create.success" : "extract.success");
       setPendingPassword(null);
       setPasswordDialogOpen(false);
       return;
     }
     const key = p.error_key ?? "error.engine";
+    if (kind === "create") {
+      // Creation failures never carry a retryable password prompt; a password
+      // is supplied up front, and TAR+password is blocked in the wizard.
+      if (key === "error.cancelled") setNotice("job.canceled");
+      else setErrorKey(key);
+      return;
+    }
     if (key === "error.password_incorrect") {
       // Keep the holder args; open the dialog for a retry.
       setPasswordDialogOpen(true);
@@ -245,6 +262,7 @@ export function useArchive() {
       setErrorKey(null);
       setNotice(null);
       setPasswordWrong(false);
+      jobKindRef.current = "extract";
       try {
         const jobId = await ipcExtract(archive.id, paths, dest, overwrite, password);
         // Holder for a possible password retry; dialog only opens on failure.
@@ -277,6 +295,49 @@ export function useArchive() {
       }
     },
     [archive, applyProgress, applyFinished],
+  );
+
+  // A create job needs no open archive and leaves any open listing alone; it
+  // reuses the same job state machine (progress strip + cancel + finish) that
+  // extract drives through `job_progress`/`job_finished`.
+  const startCreate = useCallback(
+    async (sources: string[], dest: string, options: CreateOptions) => {
+      if (sources.length === 0 || !dest.trim()) return;
+      setErrorKey(null);
+      setNotice(null);
+      setPasswordWrong(false);
+      jobKindRef.current = "create";
+      restoreStatusRef.current = status === "open" ? "open" : "closed";
+      try {
+        const jobId = await ipcCreateArchive(sources, dest, options);
+        jobRef.current = jobId;
+        setJob({
+          jobId,
+          doneItems: 0,
+          totalItems: 0,
+          doneBytes: 0,
+          totalBytes: 0,
+          speedBps: 0,
+          etaSecs: 0,
+          started: false,
+        });
+        setCreateDest(dest);
+        setStatus("creating");
+        // Replay anything that arrived while the invoke was in flight.
+        const early = earlyEvents.current.get(jobId);
+        if (early) {
+          earlyEvents.current.delete(jobId);
+          for (const ev of early) {
+            if (jobRef.current !== jobId) break; // finished already
+            if (ev.kind === "p") applyProgress(ev.p);
+            else applyFinished(ev.f);
+          }
+        }
+      } catch (e) {
+        setErrorKey(errKey(e));
+      }
+    },
+    [status, applyProgress, applyFinished],
   );
 
   const cancelJob = useCallback(() => {
@@ -348,6 +409,7 @@ export function useArchive() {
     passwordDialogOpen,
     passwordWrong,
     extractDest,
+    createDest,
     parentOf,
     openByPath,
     navigate,
@@ -360,6 +422,7 @@ export function useArchive() {
     clearNotice,
     setErrorKey,
     startExtract,
+    startCreate,
     cancelJob,
     submitPassword,
     dismissPassword,

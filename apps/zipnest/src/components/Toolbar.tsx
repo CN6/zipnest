@@ -6,6 +6,7 @@ interface Props {
   locale: Locale;
   onToggleLocale: () => void;
   onOpen: () => void;
+  onNew: () => void;
   onExtract: () => void;
   archivePath: string;
   selectedCount: number;
@@ -13,11 +14,12 @@ interface Props {
   disabled: boolean;
 }
 
-/** Top bar: open archive, extract selection, language toggle, selection info. */
+/** Top bar: open archive, new archive, extract selection, language, selection. */
 export default function Toolbar({
   locale,
   onToggleLocale,
   onOpen,
+  onNew,
   onExtract,
   archivePath,
   selectedCount,
@@ -28,6 +30,9 @@ export default function Toolbar({
     <header className="toolbar">
       <Button appearance="primary" onClick={onOpen} disabled={disabled}>
         {t("app.open")}
+      </Button>
+      <Button appearance="secondary" onClick={onNew} disabled={disabled}>
+        {t("create.new")}
       </Button>
       <Button appearance="secondary" onClick={onExtract} disabled={!extractEnabled || disabled}>
         {t("extract.start")}

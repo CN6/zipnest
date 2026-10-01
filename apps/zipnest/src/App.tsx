@@ -10,11 +10,12 @@ import "./App.css";
 
 import { getLocale, setLocale, t, Locale } from "./i18n";
 import { ArchiveApi, useArchive } from "./hooks/useArchive";
-import { openEntry, revealInExplorer } from "./ipc";
+import { CreateOptions, openEntry, revealInExplorer } from "./ipc";
 import Toolbar from "./components/Toolbar";
 import Breadcrumbs from "./components/Breadcrumbs";
 import EntryTable from "./components/EntryTable";
 import ExtractDialog from "./components/ExtractDialog";
+import CreateWizard from "./components/CreateWizard";
 import PasswordDialog from "./components/PasswordDialog";
 import ProgressBarStrip from "./components/ProgressBar";
 
@@ -27,7 +28,7 @@ const ARCHIVE_FILTERS = [
 
 function activate(arch: ArchiveApi, path: string, isDir: boolean) {
   // The extract job holds the archive mutex; navigating would just block.
-  if (arch.status === "extracting") return;
+  if (arch.status === "extracting" || arch.status === "creating") return;
   if (isDir) {
     void arch.navigate(path);
     return;
@@ -43,6 +44,7 @@ export default function App() {
   const arch = useArchive();
   const [locale, setLocaleState] = useState<Locale>(getLocale());
   const [extractOpen, setExtractOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
   // Context menu: the entry it targets plus viewport position.
   const [ctxMenu, setCtxMenu] = useState<{
     entry: { path: string; is_dir: boolean };
@@ -76,6 +78,11 @@ export default function App() {
     setExtractOpen(false);
     const paths = arch.selectedEntries.map((e) => e.path);
     void arch.startExtract(paths, dest, overwrite);
+  };
+
+  const startCreate = (sources: string[], dest: string, options: CreateOptions) => {
+    setCreateOpen(false);
+    void arch.startCreate(sources, dest, options);
   };
 
   // Drag & drop: Tauri intercepts HTML5 drops, so use the webview event.
@@ -121,6 +128,13 @@ export default function App() {
 
   const showEmpty = arch.status === "closed" || arch.rows.length === 0;
   const noticeText = arch.notice ? t(arch.notice) : "";
+  const busy = arch.status === "opening" || arch.status === "extracting" || arch.status === "creating";
+  const destToReveal =
+    arch.notice === "create.success"
+      ? arch.createDest
+      : arch.notice === "extract.success"
+        ? arch.extractDest
+        : "";
 
   return (
     <FluentProvider theme={webLightTheme}>
@@ -129,18 +143,17 @@ export default function App() {
           locale={locale}
           onToggleLocale={toggleLocale}
           onOpen={() => void pickArchive()}
+          onNew={() => setCreateOpen(true)}
           onExtract={() => setExtractOpen(true)}
           archivePath={arch.archivePath}
           selectedCount={arch.selected.size}
           extractEnabled={arch.status === "open" && arch.selected.size > 0}
-          disabled={arch.status === "opening" || arch.status === "extracting"}
+          disabled={busy}
         />
         {arch.status !== "closed" && (
           <Breadcrumbs
             cwd={arch.cwd}
-            onNavigate={(dir) =>
-              arch.status === "extracting" ? undefined : void arch.navigate(dir)
-            }
+            onNavigate={(dir) => (busy ? undefined : void arch.navigate(dir))}
           />
         )}
         {arch.status !== "closed" && arch.rows.length > 0 && (
@@ -152,7 +165,7 @@ export default function App() {
             onActivate={(entry) => activate(arch, entry.path, entry.is_dir)}
             onClickRow={(entry, index, e) => arch.clickSelect(entry, index, e)}
             onContextMenu={(entry, x, y) => {
-              if (arch.status === "extracting") return;
+              if (busy) return;
               setCtxMenu({ entry: { path: entry.path, is_dir: entry.is_dir }, x, y });
             }}
           />
@@ -186,11 +199,11 @@ export default function App() {
           <span>
             {noticeText || (arch.status !== "closed" ? `${arch.rows.length}` : "")}
           </span>
-          {arch.notice === "extract.success" && arch.extractDest && (
+          {destToReveal && (
             <Button
               appearance="subtle"
               size="small"
-              onClick={() => void revealInExplorer(arch.extractDest).catch(() => {})}
+              onClick={() => void revealInExplorer(destToReveal).catch(() => {})}
             >
               {t("reveal")}
             </Button>
@@ -210,6 +223,11 @@ export default function App() {
           open={extractOpen}
           onClose={() => setExtractOpen(false)}
           onStart={startExtract}
+        />
+        <CreateWizard
+          open={createOpen}
+          onClose={() => setCreateOpen(false)}
+          onStart={startCreate}
         />
         <PasswordDialog
           open={arch.passwordDialogOpen}

@@ -22,6 +22,21 @@ export interface IpcError {
   key: string;
 }
 
+/**
+ * Wire shape of `zipnest-ipc::CreateRequest`. Field names are snake_case
+ * because the Rust struct derives `Deserialize` without a rename (only the
+ * top-level command args are camelCase-converted by Tauri).
+ */
+export interface CreateOptions {
+  format: string;
+  level: string;
+  method: string;
+  password: string | null;
+  encrypt_names: boolean;
+  volume_bytes: number | null;
+  sfx: string | null;
+}
+
 export interface JobProgressEvent {
   job_id: number;
   done_items: number;
@@ -64,6 +79,9 @@ export const extract = (
   password?: string,
 ) =>
   invoke<number>("extract", { id, paths, dest, overwrite, password: password ?? null });
+
+export const createArchive = (sources: string[], dest: string, options: CreateOptions) =>
+  invoke<number>("create_archive", { sources, dest, options });
 
 export const jobCancel = (jobId: number) => invoke<boolean>("job_cancel", { jobId });
 

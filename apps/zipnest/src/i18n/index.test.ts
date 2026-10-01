@@ -10,6 +10,7 @@ const RUST_ERROR_KEYS = [
   "error.not_an_archive",
   "error.password_required",
   "error.password_incorrect",
+  "error.password_unsupported",
   "error.cancelled",
   "error.engine",
   "error.security_blocked",
