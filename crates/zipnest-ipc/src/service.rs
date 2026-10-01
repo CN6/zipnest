@@ -43,7 +43,7 @@ pub struct OpenArchiveResult {
 /// - `sfx`: `"gui" | "console"` (7z-only; omitted when not building an SFX)
 ///
 /// The password is memory-only; `Debug` redacts it and it is never logged.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize)]
 pub struct CreateRequest {
     pub format: String,
     pub level: String,

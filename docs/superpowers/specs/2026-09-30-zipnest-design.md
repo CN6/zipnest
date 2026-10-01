@@ -94,8 +94,8 @@
 | 模块 | 内容 |
 |---|---|
 | `archive-viewer` | 目录树 + 虚拟列表（TanStack Virtual，百万条目）、多选、列排序、拖拽提取 |
-| `preview-panel` | 文本（UTF-8/GBK/UTF-16 探测）、图片、音视频（WebView2 可播 mp3/mp4-h264/aac，其余显示"外部打开"）、未知格式 hex；未解压文件流式读入临时区预览 |
-| `create-wizard` | 格式/等级/密码(AES-256)/分卷大小/固实开关/自解压输出 |
+| `preview-panel` | 文本（UTF-8/GBK/UTF-16 探测）、图片、未知格式 hex、外部打开；未解压文件流式读入临时区预览。音视频：延后（M3 未实现 WebView2 mp3/mp4-h264/aac 播放） |
+| `create-wizard` | 格式/等级/密码(AES-256)/分卷大小/自解压输出。固实（solid）开关：延后 |
 | `password-dialog` | 由 Rust 事件触发；支持会话内记住 |
 | `task-center` | **已移除（M3 决策，非实现项）**：不做独立任务中心；进行中/历史任务、速度、ETA、取消均由 M2 的轻量进度/队列/通知 UI 承担 |
 | `settings` | 语言、默认解压目录、覆盖策略、关联管理、限额配置 |
@@ -166,7 +166,7 @@
 |---|---|---|
 | ARM64 7z.dll 来源 | P0 | 实现首日验证：官方 ARM64 包 → 不行则 7-Zip 源码自编（LGPL 允许）；两路都堵死则 ARM64 格式集降级为纯 Rust crate 回退 |
 | 7z.dll COM 封装复杂度 | P1 | 先实现 open/list/extract 最小闭环，写+分卷+SFX 逐步叠加；集成测试兜底 |
-| WebView2 音视频格式覆盖 | P2 | 播放失败自动降级"外部打开" |
+| WebView2 音视频格式覆盖 | P2 | 音视频预览延后（M3 未实现）；延后项既定回退为"外部打开" |
 | 机器级注册表 Deny（本机已清除 18 处） | P2 | 产品侧统一走 HKCU per-user 注册，规避机器级 ACL 干扰 |
 | 本机 UAC 已禁用（EnableLUA=0） | P3 | 与开发无关；产品不依赖提权 |
 
