@@ -86,13 +86,16 @@ pub fn create_archive(
     let num_items = items.len() as u32;
 
     let dll = dll::load()?;
+    // Open the output stream first: if this fails, no handler ref exists yet.
+    let out = outstream::new(dest)?;
+
     let mut raw: *mut c_void = std::ptr::null_mut();
     let hr = unsafe { dll.create_object(&clsid, &IID_IOUT_ARCHIVE, &mut raw) };
     if hr != S_OK || raw.is_null() {
+        unsafe { outstream::release_void(out) };
         return Err(crate::error::map_hresult(hr));
     }
 
-    let out = outstream::new(dest)?;
     let state = Arc::new(UpdateState {
         done_bytes: AtomicU64::new(0),
         total_bytes: AtomicU64::new(total_bytes),
