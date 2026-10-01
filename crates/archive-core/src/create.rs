@@ -20,11 +20,66 @@ use crate::dll;
 use crate::error::ZipnestError;
 use crate::types::{CreateFormat, CreateOptions, CreateProgress, CreateStats};
 use std::os::raw::c_void;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub use crate::types::CreateSource;
+
+/// Expand `inputs` into a flat item table, walking directories recursively so a
+/// directory tree can be added while preserving its structure.
+///
+/// `node` is each item's path relative to `base`, always `/`-separated.
+/// Directory entries are emitted too (so empty directories stay visible).
+/// Symbolic links — files or directories — are skipped rather than followed.
+pub fn collect_sources(
+    inputs: &[PathBuf],
+    base: &Path,
+) -> Result<Vec<CreateSource>, ZipnestError> {
+    let mut out = Vec::new();
+    for input in inputs {
+        collect_one(input, base, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn rel_node(path: &Path, base: &Path) -> String {
+    let rel = path.strip_prefix(base).unwrap_or(path);
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+fn collect_one(
+    path: &Path,
+    base: &Path,
+    out: &mut Vec<CreateSource>,
+) -> Result<(), ZipnestError> {
+    let meta = std::fs::symlink_metadata(path)?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Ok(());
+    }
+    if meta.is_dir() {
+        let node = rel_node(path, base);
+        if !node.is_empty() {
+            out.push(CreateSource {
+                path: path.to_path_buf(),
+                node,
+            });
+        }
+        let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(path)?
+            .collect::<Result<_, _>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            collect_one(&e.path(), base, out)?;
+        }
+    } else {
+        out.push(CreateSource {
+            path: path.to_path_buf(),
+            node: rel_node(path, base),
+        });
+    }
+    Ok(())
+}
 
 /// Handler CLSID for a supported container, or `None` when creation is not
 /// implemented yet (TAR family — later task).

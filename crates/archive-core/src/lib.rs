@@ -17,7 +17,7 @@ pub mod types;
 pub mod com;
 
 pub use archive::Archive;
-pub use create::create_archive;
+pub use create::{collect_sources, create_archive};
 pub use error::{map_hresult, ZipnestError};
 pub use types::{
     ArchiveEntry, ArchiveOpenOptions, CompressionLevel, CompressionMethod, CreateFormat,
