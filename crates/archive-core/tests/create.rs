@@ -257,7 +257,7 @@ fn create_reports_progress_and_cancel_stops() {
         assert!(done <= total, "done_bytes {done} exceeded total_bytes {total}");
     }
     for w in samples.windows(2) {
-        assert!(w[0].0 <= w[1].0, "done_bytes must be non-decreasing, got {:?}", &samples);
+        assert!(w[0].0 <= w[1].0, "done_bytes must be non-decreasing, got {:?}", samples);
     }
     assert!(samples.last().unwrap().0 > 0, "no bytes reported as completed");
     assert_eq!(samples.last().unwrap().1, 3_000_000, "total_bytes must be the pre-scanned source size");
