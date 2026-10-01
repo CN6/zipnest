@@ -241,6 +241,47 @@ fn cleans_up_temp_tar_on_failure() {
 }
 
 #[test]
+fn create_progress_is_monotonic_and_cancel_stops() {
+    let base = tmp("prog"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "big.bin", &vec![7u8; 3_000_000]);
+    let dest = base.join("out.7z");
+    let srcs = vec![CreateSource { path: src, node: "big.bin".into() }];
+    let mut seen = 0u64;
+    let mut o = opts(CreateFormat::SevenZ); o.level = CompressionLevel::Normal;
+    create_archive(&srcs, &dest, &o, &mut |p| { seen += 1; assert!(p.done_bytes <= p.total_bytes.max(p.done_bytes)); true }).unwrap();
+    // Keep the source and its directory alive for the cancel pass: deleting the
+    // whole base here would make the second create fail with an io error before
+    // the handler can ever consult the progress callback.
+    let _ = std::fs::remove_file(&dest);
+
+    let dest2 = base.join("cancel.7z");
+    let err = create_archive(&srcs, &dest2, &o, &mut |_| false).expect_err("cancel must abort");
+    assert_eq!(err.error_key(), "error.cancelled");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Cancel during the WRAP pass of a compressed TAR (not the first TAR pass):
+/// the temp `.tar` must still be cleaned up. The wrap pass is the one that
+/// reports the inner node (`out.tar`); the first pass only reports sources.
+#[test]
+fn cancelling_wrap_pass_removes_temp_tar() {
+    let base = tmp("wrapcancel"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    write_src(&base, "src/big.bin", &vec![7u8; 3_000_000]);
+    let dest = base.join("out.tar.gz");
+    let sources = archive_core::create::collect_sources(&[base.join("src")], &base).unwrap();
+    let mut saw_wrap = false;
+    let err = create_archive(&sources, &dest, &opts(CreateFormat::TarGz), &mut |p| {
+        if p.current_path.ends_with(".tar") { saw_wrap = true; return false; }
+        true
+    }).expect_err("cancel during wrap must abort");
+    assert!(saw_wrap, "cancel must have fired during the wrap pass, not the first pass");
+    assert_eq!(err.error_key(), "error.cancelled", "got {err:?}");
+    let leftovers = leftover_tmp(&base);
+    assert!(leftovers.is_empty(), "temp tar left behind after wrap cancel: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn creates_7z_with_one_file_roundtrip() {
     let base = tmp("7z"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
     let src = write_src(&base, "a.txt", b"seven zip body");
