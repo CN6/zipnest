@@ -49,7 +49,7 @@
 - [x] 4 设置 UI（语言/目录/覆盖/限额/关联开关）
 - [x] 5 i18n 全量核对（en/zh 各 112 key，集合一致；扫描无真缺失）
 - [x] 6 打包：release exe + 便携 zip（`ZipNest_0.1.0_x64_portable.zip`）；NSIS 安装器因本机 GitHub 不可达暂缓；ARM64 需独立环境/ARM64 7z.dll
-- [ ] 7 验收
+- [x] 7 验收清单（`docs/acceptance-checklist.md`；B 节手动项待游戏空窗实跑）
 
 ## 实机发现（2026-10-01）
 
