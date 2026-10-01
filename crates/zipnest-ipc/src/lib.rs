@@ -8,7 +8,9 @@ pub mod error;
 pub mod registry;
 pub mod service;
 pub mod settings;
+pub mod shell;
 
 pub use error::IpcError;
 pub use service::{CreateRequest, EntryDto, IpcService, OpenArchiveResult};
 pub use settings::{Settings, SettingsPatch, SettingsStore};
+pub use shell::{ShellApplier, ShellOptions};

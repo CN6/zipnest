@@ -5,6 +5,7 @@
 use tauri::State;
 use zipnest_ipc::{
     CreateRequest, EntryDto, IpcError, IpcService, OpenArchiveResult, Settings, SettingsPatch,
+    ShellOptions,
 };
 
 #[tauri::command]
@@ -82,6 +83,22 @@ pub fn settings_set(
     let patch: SettingsPatch = serde_json::from_value(patch)
         .map_err(|_| IpcError::new("error.settings.invalid"))?;
     svc.settings_set(patch)
+}
+
+/// Register or unregister this build's per-user Explorer integration and
+/// remember the choice. HKCU only, so it never needs elevation.
+#[tauri::command]
+pub fn shell_register(
+    svc: State<'_, IpcService>,
+    associate: bool,
+    context_menu: bool,
+) -> Result<Settings, IpcError> {
+    let exe = std::env::current_exe().map_err(|_| IpcError::new("error.io"))?;
+    svc.shell_register(
+        &exe,
+        ShellOptions { associate, context_menu },
+        &zipnest_ipc::shell::WindowsRegistry,
+    )
 }
 
 /// Reveal an on-disk path in Explorer (used for extraction destinations).

@@ -248,6 +248,33 @@ impl IpcService {
         self.settings.lock().map_err(|_| IpcError::new("error.engine"))
     }
 
+    /// Register or unregister the per-user Explorer integration for `exe`, then
+    /// remember the choice. The registry side is injected through `applier` so
+    /// tests never touch the real registry.
+    pub fn shell_register(
+        &self,
+        exe: &std::path::Path,
+        opts: crate::shell::ShellOptions,
+        applier: &dyn crate::shell::ShellApplier,
+    ) -> Result<Settings, IpcError> {
+        use crate::shell;
+        let assoc = if opts.associate { shell::assoc_ops(exe) } else { shell::assoc_removals() };
+        let menu = if opts.context_menu {
+            shell::context_menu_ops(exe)
+        } else {
+            shell::context_menu_removals()
+        };
+        applier
+            .run(&assoc)
+            .and_then(|()| applier.run(&menu))
+            .map_err(|_| IpcError::new("error.io"))?;
+        self.lock_settings()?.set(SettingsPatch {
+            associate: Some(opts.associate),
+            context_menu: Some(opts.context_menu),
+            ..Default::default()
+        })
+    }
+
     pub fn open_archive(&self, path: String, password: Option<String>) -> Result<OpenArchiveResult, IpcError> {
         let archive = Archive::open(
             std::path::Path::new(&path),
@@ -462,5 +489,61 @@ impl IpcService {
             Ok(())
         }));
         Ok(job_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell::{RegOp, ShellApplier, ShellOptions};
+    use std::sync::Mutex;
+
+    /// Records the ops the service would apply instead of touching the registry.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<RegOp>>);
+
+    impl ShellApplier for Recorder {
+        fn run(&self, ops: &[RegOp]) -> std::io::Result<()> {
+            self.0.lock().unwrap().extend_from_slice(ops);
+            Ok(())
+        }
+    }
+
+    fn service_with_settings(name: &str) -> IpcService {
+        let root = std::env::temp_dir().join(format!("zipnest-svc-{}-{name}", std::process::id()));
+        IpcService::with_settings_path(
+            Arc::new(|_, _| {}),
+            Duration::ZERO,
+            root.join("settings.json"),
+        )
+    }
+
+    #[test]
+    fn shell_register_applies_ops_and_persists_flags() {
+        let svc = service_with_settings("register");
+        let exe = std::path::Path::new(r"C:\Apps\ZipNest.exe");
+
+        let rec = Recorder::default();
+        let out = svc
+            .shell_register(exe, ShellOptions { associate: true, context_menu: false }, &rec)
+            .unwrap();
+        assert!(out.associate && !out.context_menu);
+        assert!(rec
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| matches!(o, RegOp::SetValue { key, .. } if key.contains(r"ZipNest.zip"))));
+
+        // Turning everything off emits removals only.
+        let rec2 = Recorder::default();
+        let out2 = svc.shell_register(exe, ShellOptions::default(), &rec2).unwrap();
+        assert!(!out2.associate && !out2.context_menu);
+        assert!(rec2
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|o| matches!(o, RegOp::DeleteKey { .. } | RegOp::DeleteValue { .. })));
     }
 }

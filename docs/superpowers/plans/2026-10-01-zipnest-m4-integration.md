@@ -42,8 +42,8 @@
 
 ## 状态
 
-- [ ] 1 设置持久化
-- [ ] 2 Shell 集成
+- [x] 1 设置持久化（`caeedca`）
+- [x] 2 Shell 集成（HKCU，`reg.exe`；`shell_register` 命令）
 - [ ] 3 托盘 / 单实例
 - [ ] 4 设置 UI
 - [ ] 5 i18n 全量

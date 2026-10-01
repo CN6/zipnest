@@ -33,6 +33,7 @@ pub fn run() {
             commands::job_cancel,
             commands::settings_get,
             commands::settings_set,
+            commands::shell_register,
             commands::reveal_in_explorer,
             commands::open_entry,
         ])
