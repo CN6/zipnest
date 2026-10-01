@@ -252,6 +252,20 @@ unsafe fn apply_properties(raw: *mut c_void, opts: &CreateOptions) {
             &mut values,
         );
     }
+    if opts.encrypt_names && opts.format == CreateFormat::SevenZ {
+        // `he` (encrypt headers) seals the 7z index and file names as well as
+        // the payload, so the archive cannot even be listed without the
+        // password. It is a string property ("on"/"off"), not a boolean. ZIP
+        // has no equivalent header encryption, so `encrypt_names` is ignored
+        // there (the UI greys it out).
+        add(
+            "he",
+            PropVariant::from_bstr("on"),
+            &mut names_keep,
+            &mut names,
+            &mut values,
+        );
+    }
 
     let sp_vt = &**(sp as *const *const SetPropertiesVt);
     (sp_vt.set_properties)(sp, names.as_ptr(), values.as_ptr(), names.len() as u32);
@@ -289,6 +303,13 @@ pub fn create_archive(
         )
     {
         return Err(ZipnestError::PasswordUnsupported);
+    }
+    // 7z header encryption needs a key; without one the `he` property would be
+    // a no-op at best and an engine failure at worst. Reject the impossible
+    // combination instead of writing a plaintext index the caller thinks is
+    // sealed. `PasswordRequired` is the closest existing i18n key.
+    if opts.encrypt_names && opts.format == CreateFormat::SevenZ && opts.password.is_none() {
+        return Err(ZipnestError::PasswordRequired);
     }
     if matches!(
         opts.format,

@@ -276,6 +276,44 @@ fn creates_encrypted_7z_needs_password() {
 }
 
 #[test]
+fn creates_header_encrypted_7z_hides_names() {
+    let base = tmp("he"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "a.txt", b"hidden");
+    let dest = base.join("he.7z");
+    let srcs = vec![CreateSource { path: src, node: "a.txt".into() }];
+    let mut o = opts(CreateFormat::SevenZ); o.password = Some("pw".into()); o.encrypt_names = true;
+    create_archive(&srcs, &dest, &o, &mut |_| true).unwrap();
+    // Header-encrypted: even the entry names are sealed, so opening without a
+    // password fails before any name is exposed.
+    let err = Archive::open(&dest, ArchiveOpenOptions::default()).expect_err("no password");
+    assert_eq!(err.error_key(), "error.password_required");
+    // The correct password reveals the names and the payload (proof the archive
+    // is merely header-encrypted, not corrupt).
+    let pw = ArchiveOpenOptions { password: Some("pw".into()) };
+    let arc = Archive::open(&dest, pw).unwrap();
+    let names: Vec<String> = arc.entries().unwrap().iter().map(|e| e.path.replace('\\', "/")).collect();
+    assert!(names.contains(&"a.txt".to_string()), "correct password must reveal names, got {names:?}");
+    assert_eq!(arc.read_entry(0, &ArchiveOpenOptions { password: Some("pw".into()) }, None).unwrap(), b"hidden");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn rejects_7z_header_encryption_without_password() {
+    // Encrypting the 7z index without a key is impossible; the request must be
+    // refused rather than silently writing an unencrypted index.
+    let base = tmp("he-nopw"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "a.txt", b"x");
+    let srcs = vec![CreateSource { path: src, node: "a.txt".into() }];
+    let dest = base.join("out.7z");
+    let mut o = opts(CreateFormat::SevenZ); o.encrypt_names = true;
+    let err = create_archive(&srcs, &dest, &o, &mut |_| true)
+        .expect_err("header encryption without a password must be rejected");
+    assert_eq!(err.error_key(), "error.password_required");
+    assert!(!dest.exists(), "no archive may be written when header encryption is refused");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn rejects_password_for_tar_formats() {
     // TAR/compressed-TAR handlers have no encryption; a password request must
     // be rejected outright rather than silently ignored.
