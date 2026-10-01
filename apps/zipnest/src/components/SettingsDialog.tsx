@@ -17,6 +17,14 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { t } from "../i18n";
 import { errKey, Settings, settingsGet, settingsSet, shellRegister } from "../ipc";
 
+/** Map persisted language values to their i18n keys (the locale files use
+ * `settings.language.zh` / `.en`, not the raw "zh-CN" / "en-US" values). */
+const LANGUAGE_KEY: Record<string, string> = {
+  system: "settings.language.system",
+  "zh-CN": "settings.language.zh",
+  "en-US": "settings.language.en",
+};
+
 interface Props {
   open: boolean;
   onClose: () => void;
@@ -88,6 +96,9 @@ export default function SettingsDialog({ open, onClose, onLanguageChange, onDona
       );
       if (shell.warnings.length > 0) {
         setError(shell.warnings[0]);
+        // Apply the language even when a shell toggle was denied, so the user
+        // is not stuck half-migrated because of an unrelated OS policy.
+        onLanguageChange(settings.language);
         return; // stay open with the warning; the denied toggles already reverted
       }
       onLanguageChange(settings.language);
@@ -107,7 +118,7 @@ export default function SettingsDialog({ open, onClose, onLanguageChange, onDona
           <DialogContent>
             <Field label={t("settings.language")}>
               <Dropdown
-                value={t(`settings.language.${settings.language}`)}
+                value={t(LANGUAGE_KEY[settings.language] ?? settings.language)}
                 selectedOptions={[settings.language]}
                 onOptionSelect={(_, d) => patch({ language: d.optionValue ?? settings.language })}
               >
