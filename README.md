@@ -1,10 +1,25 @@
 # ZipNest
 
 Full-featured archive manager for Windows (x64 + ARM64), built on the
-official 7-Zip engine (`7z.dll`, dynamically loaded). Free for everyone —
+official 7-Zip engine (`7z.dll`, dynamically loaded). Free and open source —
 donations optional, **no feature is ever gated**.
 
-## Status: M3 (create & preview) — done
+## License
+
+- Project code: **MIT** (see `LICENSE`).
+- `7z.dll` is the unmodified official 7-Zip binary (LGPL), loaded at runtime,
+  never statically linked. Its license is bundled in `licenses/7zip.txt`.
+- `vendor/7zip-sdk` headers are part of the 7-Zip SDK (LGPL), source:
+  https://www.7-zip.org/
+
+## Donate
+
+ZipNest is free. If you want to say thanks, open **Settings → Support us**
+inside the app. Replace the placeholder QR images at
+`apps/zipnest/src/assets/donate/` (`alipay.png`, `wechat.png`) with your own
+receipt QR codes.
+
+## Status: M4 (integration & delivery) — done
 
 The engine layer lives in two crates:
 
