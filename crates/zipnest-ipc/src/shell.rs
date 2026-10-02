@@ -143,8 +143,9 @@ fn menu_key(target: MenuTarget) -> String {
     format!(r"{CLASSES}\{base}")
 }
 
-/// Context-menu ops for one target. Files and folders get `%1`; the desktop /
-/// folder background gets `%V` (the folder itself).
+/// Context-menu ops for one target: a top-level "ZipNest" verb whose default
+/// action is open, plus a submenu "添加到压缩包…" that passes `--add "%1"`.
+/// Files and folders get `%1`; the desktop/folder background gets `%V`.
 pub fn menu_ops(target: MenuTarget, exe: &std::path::Path) -> Vec<RegOp> {
     let (base, arg) = match target {
         MenuTarget::File => (r"*\shell\ZipNest", "\"%1\""),
@@ -152,10 +153,19 @@ pub fn menu_ops(target: MenuTarget, exe: &std::path::Path) -> Vec<RegOp> {
         MenuTarget::Background => (r"Directory\Background\shell\ZipNest", "\"%V\""),
     };
     let key = format!(r"{CLASSES}\{base}");
+    let exe_q = quoted(exe);
     vec![
+        // Top-level verb + default (open) command.
         RegOp::set(key.clone(), Some("MUIVerb"), "ZipNest"),
-        RegOp::set(key.clone(), Some("Icon"), format!("{},0", quoted(exe))),
-        RegOp::set(format!(r"{key}\command"), None, format!("{} {arg}", quoted(exe))),
+        RegOp::set(key.clone(), Some("Icon"), format!("{},0", exe_q)),
+        RegOp::set(format!(r"{key}\command"), None, format!("{exe_q} {arg}")),
+        // Submenu entry: "添加到压缩包…".
+        RegOp::set(
+            format!(r"{key}\shell\add"),
+            Some("MUIVerb"),
+            "添加到压缩包…",
+        ),
+        RegOp::set(format!(r"{key}\shell\add\command"), None, format!("{exe_q} --add {arg}")),
     ]
 }
 
@@ -171,7 +181,7 @@ pub fn background_menu_ops(exe: &std::path::Path) -> Vec<RegOp> {
     menu_ops(MenuTarget::Background, exe)
 }
 
-/// Undo every context-menu entry.
+/// Undo every context-menu entry (top-level verb tree is deleted recursively).
 pub fn context_menu_removals() -> Vec<RegOp> {
     [MenuTarget::File, MenuTarget::Directory, MenuTarget::Background]
         .iter()

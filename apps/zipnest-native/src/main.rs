@@ -20,9 +20,9 @@ const DESIGN_WIDTH: f32 = 900.0;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.2.9";
+const CURRENT_VERSION: &str = "0.2.10";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.2.9";
+const UPDATE_UA: &str = "ZipNest-Updater/0.2.10";
 
 #[derive(Clone, Default)]
 enum UpdateState {
@@ -155,11 +155,31 @@ fn load_app_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> Result<(), eframe::Error> {
-    // Support "open with ZipNest": a path on the command line (double-clicking
-    // an associated archive) is opened right after startup.
-    let launch_path: Option<String> = std::env::args()
-        .nth(1)
-        .filter(|a| !a.starts_with('-') && std::path::Path::new(a).is_file());
+    // Launch intent from Explorer/CLI:
+    //   zipnest.exe <archive>        → open that archive
+    //   zipnest.exe --add <path>...  → open the create wizard pre-filled
+    let args: Vec<String> = std::env::args().collect();
+    let mut launch_open: Option<String> = None;
+    let mut launch_add: Vec<String> = Vec::new();
+    {
+        let mut add_mode = false;
+        for a in args.iter().skip(1) {
+            if a == "--add" {
+                add_mode = true;
+                continue;
+            }
+            if a.starts_with('-') {
+                continue;
+            }
+            if add_mode {
+                if std::path::Path::new(a).exists() {
+                    launch_add.push(a.clone());
+                }
+            } else if launch_open.is_none() && std::path::Path::new(a).is_file() {
+                launch_open = Some(a.clone());
+            }
+        }
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([DESIGN_WIDTH, 620.0])
         .with_title("ZipNest 解压缩");
@@ -175,7 +195,7 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "ZipNest",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, launch_path.clone())))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, launch_open, launch_add)))),
     )
 }
 
@@ -183,7 +203,8 @@ struct App {
     ctx: egui::Context,
     svc: Arc<IpcService>,
     settings: zipnest_ipc::Settings,
-    launch_path: Option<String>,
+    launch_open: Option<String>,
+    launch_add: Vec<String>,
     archive: Option<zipnest_ipc::OpenArchiveResult>,
     archive_path: String,
     cwd: String,
@@ -223,11 +244,16 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, launch_path: Option<String>) -> Self {
+fn new(
+        cc: &eframe::CreationContext<'_>,
+        launch_open: Option<String>,
+        launch_add: Vec<String>,
+    ) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
         let mut app = Self::init(cc);
-        app.launch_path = launch_path;
+        app.launch_open = launch_open;
+        app.launch_add = launch_add;
         app
     }
 
@@ -271,7 +297,8 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             ctx,
             svc,
             settings,
-            launch_path: None,
+            launch_open: None,
+            launch_add: Vec::new(),
             archive: None,
             archive_path: String::new(),
             cwd: String::new(),
@@ -1271,9 +1298,44 @@ impl eframe::App for App {
 fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs();
 
-        // Consume a launch path passed on the command line ("open with ZipNest").
-        if let Some(path) = self.launch_path.take() {
+        // Consume launch intents passed on the command line.
+        if let Some(path) = self.launch_open.take() {
             self.open_archive(&path);
+        }
+        if !self.launch_add.is_empty() {
+            self.create_sources = self.launch_add.clone();
+            self.create_dest = String::new();
+            self.show_create = true;
+            self.launch_add.clear();
+        }
+
+        // Drag & drop: files/folders dropped onto the window open the create
+        // wizard pre-filled (pack them), archives open directly.
+        let dropped: Vec<String> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            let all_archives = dropped.iter().all(|p| {
+                std::path::Path::new(p)
+                    .extension()
+                    .map(|e| {
+                        let e = e.to_string_lossy().to_lowercase();
+                        matches!(e.as_str(), "zip" | "7z" | "rar" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "iso")
+                    })
+                    .unwrap_or(false)
+            });
+            if all_archives && dropped.len() == 1 {
+                self.open_archive(&dropped[0]);
+            } else {
+                self.create_sources = dropped;
+                self.create_dest = String::new();
+                self.show_create = true;
+            }
         }
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -1309,6 +1371,7 @@ egui::CentralPanel::default().show(ctx, |ui| {
         self.error_window(ctx);
     }
 }
+
 
 
 
