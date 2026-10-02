@@ -142,7 +142,7 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([DESIGN_WIDTH, 620.0])
-            .with_title("ZipNest"),
+            .with_title("ZipNest 解压缩"),
         ..Default::default()
     };
     eframe::run_native(
@@ -215,6 +215,9 @@ impl App {
             std::time::Duration::from_millis(100),
         ));
         let settings = svc.settings_get().unwrap_or_default();
+        // Fixed zoom from settings, applied ONCE at startup. Never re-zoom per
+        // frame — that feedback loop made fullscreen flicker badly.
+        cc.egui_ctx.set_zoom_factor(settings.ui_zoom.clamp(100, 200) as f32 / 100.0);
         let lang = match settings.language.as_str() {
             "zh-CN" => "zh-CN",
             "en-US" => "en-US",
@@ -791,10 +794,22 @@ impl App {
                 }
                 ui.label(self.t("settings.overwrite"));
                 ui.horizontal(|ui| {
+                    // 带语境：明确这是"文件已存在时"的处理方式
+                    ui.label(self.t("settings.overwrite.hint"));
                     for (v, k) in [("ask", "settings.overwrite.ask"), ("overwrite", "settings.overwrite.overwrite"), ("skip", "settings.overwrite.skip"), ("rename", "settings.overwrite.rename")] {
                         let sel = self.settings.overwrite_policy == v;
                         if ui.selectable_label(sel, self.t(k)).clicked() {
                             self.settings.overwrite_policy = v.to_string();
+                        }
+                    }
+                });
+                ui.label(self.t("settings.ui_zoom"));
+                ui.horizontal(|ui| {
+                    for z in [100u32, 125, 150, 175, 200] {
+                        let sel = self.settings.ui_zoom == z;
+                        if ui.selectable_label(sel, self.t("settings.ui_zoom.percent").replace("{percent}", &z.to_string())).clicked() {
+                            self.settings.ui_zoom = z;
+                            ctx.set_zoom_factor(z as f32 / 100.0);
                         }
                     }
                 });
@@ -809,11 +824,12 @@ impl App {
                     let menu = self.settings.context_menu;
                     let exe = std::env::current_exe().unwrap_or_default();
                     let _ = svc.shell_register(&exe, ShellOptions { associate: assoc, context_menu: menu }, &zipnest_ipc::shell::WindowsRegistry);
-                    let _ = svc.settings_set(SettingsPatch {
+let _ = svc.settings_set(SettingsPatch {
                         language: Some(self.settings.language.clone()),
                         default_extract_dir: Some(self.settings.default_extract_dir.clone()),
                         overwrite_policy: Some(self.settings.overwrite_policy.clone()),
                         preview_max_bytes: Some(self.settings.preview_max_bytes),
+                        ui_zoom: Some(self.settings.ui_zoom),
                         ..Default::default()
                     });
                     if self.settings.language != "system" {
@@ -1054,9 +1070,7 @@ fn parse_volume(input: &str) -> Option<u64> {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let scale = (ctx.screen_rect().width() / DESIGN_WIDTH).clamp(1.0, 1.7);
-        ctx.set_zoom_factor(scale);
+fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs();
 
         // Consume a launch path passed on the command line ("open with ZipNest").

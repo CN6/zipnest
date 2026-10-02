@@ -28,6 +28,9 @@ pub struct Settings {
     pub context_menu: bool,
     /// Cap for in-app previews, in bytes.
     pub preview_max_bytes: u64,
+    /// UI zoom percent, 100 = 100%. Fixed value applied at startup; the app
+    /// never re-zooms per frame (that caused fullscreen flicker).
+    pub ui_zoom: u32,
 }
 
 impl Default for Settings {
@@ -39,6 +42,7 @@ impl Default for Settings {
             associate: false,
             context_menu: false,
             preview_max_bytes: 8 * 1024 * 1024,
+            ui_zoom: 100,
         }
     }
 }
@@ -52,6 +56,7 @@ pub struct SettingsPatch {
     pub associate: Option<bool>,
     pub context_menu: Option<bool>,
     pub preview_max_bytes: Option<u64>,
+    pub ui_zoom: Option<u32>,
 }
 
 fn invalid() -> IpcError {
@@ -85,6 +90,9 @@ impl Settings {
         }
         if let Some(v) = patch.preview_max_bytes {
             self.preview_max_bytes = v;
+        }
+        if let Some(v) = patch.ui_zoom {
+            self.ui_zoom = v.clamp(100, 200);
         }
         Ok(())
     }
