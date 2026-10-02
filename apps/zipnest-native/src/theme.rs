@@ -1,0 +1,105 @@
+﻿//! Win11 / Fluent-style theme for the egui shell: system fonts, light
+//! surfaces, rounded corners, subtle borders, a blue accent.
+
+use eframe::egui;
+use egui::{Margin, Rounding, Stroke};
+
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    // Latin: Segoe UI (Win11 default), monospace: Consolas; CJK falls back
+    // to Microsoft YaHei so Chinese text is sharp everywhere.
+    let mut add = |name: &'static str, fam: egui::FontFamily| {
+        for f in ["segoeui.ttf", "seguiemj.ttf", "consola.ttf", "msyh.ttc", "msyh.ttf", "simhei.ttf"] {
+            let path = format!("C:\\Windows\\Fonts\\{f}");
+            if let Ok(bytes) = std::fs::read(&path) {
+                let key = format!("{name}-{f}");
+                fonts.font_data.insert(key.clone(), egui::FontData::from_owned(bytes));
+                fonts.families.entry(fam).or_default().push(key);
+                return;
+            }
+        }
+    };
+    add("ui", egui::FontFamily::Proportional);
+    add("mono", egui::FontFamily::Monospace);
+    ctx.set_fonts(fonts);
+}
+
+fn visual() -> egui::Visuals {
+    let mut v = egui::Visuals::light();
+    v.panel_fill = egui::Color32::from_rgb(250, 250, 250); // app canvas
+    v.window_fill = egui::Color32::from_rgb(255, 255, 255);
+    v.window_stroke = Stroke::new(1.0, egui::Color32::from_rgb(230, 230, 230));
+    v.window_rounding = Rounding::same(10.0);
+    v.window_shadow = egui::epaint::Shadow {
+        offset: egui::vec2(0.0, 8.0),
+        blur: 24.0,
+        spread: 0.0,
+        color: egui::Color32::from_black_alpha(40),
+    };
+    v.faint_bg_color = egui::Color32::from_rgb(245, 245, 245);
+    v.extreme_bg_color = egui::Color32::from_rgb(255, 255, 255);
+    v.selection.bg_fill = egui::Color32::from_rgb(205, 229, 255);
+    v.selection.stroke = Stroke::new(1.0, egui::Color32::from_rgb(0, 103, 192));
+    v.hyperlink_color = egui::Color32::from_rgb(0, 103, 192);
+    v
+}
+
+pub fn apply(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.visuals = visual();
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    style.spacing.window_margin = Margin::same(14.0);
+    style.spacing.menu_margin = Margin::same(6.0);
+    style.visuals.widgets.inactive.rounding = Rounding::same(6.0);
+    style.visuals.widgets.hovered.rounding = Rounding::same(6.0);
+    style.visuals.widgets.active.rounding = Rounding::same(6.0);
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, egui::Color32::from_rgb(222, 222, 222));
+    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(238, 242, 248);
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, egui::Color32::from_rgb(0, 103, 192));
+    ctx.set_style(style);
+}
+
+/// Primary/accent button (filled blue, white text) for the toolbar.
+pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE))
+            .fill(egui::Color32::from_rgb(0, 103, 192))
+            .rounding(Rounding::same(6.0))
+            .stroke(Stroke::NONE),
+    )
+}
+
+/// Subtle ghost button (no fill until hover) for secondary actions.
+pub fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let fill = if ui.rect_contains_pointer(ui.max_rect()) {
+        egui::Color32::from_rgb(238, 242, 248)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.add(
+        egui::Button::new(text)
+            .fill(fill)
+            .rounding(Rounding::same(6.0))
+            .stroke(Stroke::NONE),
+    )
+}
+
+/// A toolbar row drawn as a white "card" strip with a hairline bottom border.
+pub fn top_bar(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(255, 255, 255))
+        .inner_margin(Margin::symmetric(14.0, 10.0))
+        .rounding(Rounding::ZERO)
+        .stroke(Stroke::NONE)
+        .show(ui, add_contents);
+}
+
+/// Bottom status bar strip.
+pub fn status_bar(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(245, 246, 248))
+        .inner_margin(Margin::symmetric(14.0, 6.0))
+        .stroke(Stroke::new(1.0, egui::Color32::from_rgb(232, 232, 232)))
+        .show(ui, add_contents);
+}

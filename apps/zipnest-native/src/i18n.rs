@@ -1,4 +1,4 @@
-//! Tiny i18n: zh/en string tables, Chinese font loading, and image decode.
+﻿//! Tiny i18n: zh/en string tables, Chinese font loading, and image decode.
 
 use eframe::egui;
 use std::collections::HashMap;
@@ -8,27 +8,6 @@ pub fn os_language() -> &'static str {
     // Windows returns e.g. "zh-CN" in GetUserDefaultUILanguage via env? Not set;
     // fall back to zh by default for this user, overridden by settings later.
     "zh-CN"
-}
-
-pub fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    for name in ["msyh.ttc", "msyh.ttf", "simhei.ttf", "simsun.ttc"] {
-        let path = format!("C:\\Windows\\Fonts\\{name}");
-        if let Ok(bytes) = std::fs::read(&path) {
-            fonts
-                .font_data
-                .insert("zh".to_owned(), egui::FontData::from_owned(bytes));
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts
-                    .families
-                    .entry(family)
-                    .or_default()
-                    .push("zh".to_owned());
-            }
-            break;
-        }
-    }
-    ctx.set_fonts(fonts);
 }
 
 /// Decode a JPEG/PNG into an egui color image. Used for QR codes.
@@ -104,6 +83,14 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "settings.shell.associate" => "默认用 ZipNest 打开压缩包",
             "settings.shell.context_menu" => "右键菜单",
             "settings.save" => "保存",
+            "update.check" => "检查更新",
+            "update.title" => "检查更新",
+            "update.checking" => "正在检查更新…",
+            "update.found" => "发现新版本",
+            "update.download" => "下载并安装",
+            "update.ready" => "新版本已下载。点击安装将自动关闭当前版本并覆盖更新。",
+            "update.install" => "立即安装",
+            "update.failed" => "检查更新失败",
         }
     });
 
@@ -160,5 +147,14 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "settings.shell.associate" => "Open archives with ZipNest by default",
             "settings.shell.context_menu" => "Context menu",
             "settings.save" => "Save",
+            "update.check" => "Check for updates",
+            "update.title" => "Update",
+            "update.checking" => "Checking for updates…",
+            "update.found" => "A new version is available",
+            "update.download" => "Download & install",
+            "update.ready" => "New version downloaded. Install will close this version and overwrite it.",
+            "update.install" => "Install now",
+            "update.failed" => "Update check failed",
         }
     });
+

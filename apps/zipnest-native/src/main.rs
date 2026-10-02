@@ -1,12 +1,106 @@
 ﻿//! ZipNest native UI (egui). Same-process calls into `zipnest-ipc`; no webview.
 
 mod i18n;
+mod theme;
 
 use eframe::egui;
 use std::sync::{Arc, Mutex};
 use zipnest_ipc::{CreateRequest, EntryDto, IpcService, SettingsPatch, ShellOptions};
 
 const DESIGN_WIDTH: f32 = 900.0;
+
+// --- auto-update ---
+const CURRENT_VERSION: &str = "0.2.0";
+const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
+const UPDATE_UA: &str = "ZipNest-Updater/0.2.0";
+
+#[derive(Clone, Default)]
+enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    Found { tag: String, url: String },
+    Downloading { done: u64, total: u64 },
+    Ready { path: String },
+    Failed(String),
+}
+
+fn parse_version(tag: &str) -> Vec<u32> {
+    tag.trim_start_matches('v')
+        .split('.')
+        .filter_map(|p| p.parse::<u32>().ok())
+        .collect()
+}
+
+fn is_newer(tag: &str) -> bool {
+    parse_version(CURRENT_VERSION) < parse_version(tag)
+}
+
+fn fetch_latest() -> Result<(String, String), String> {
+    let body = ureq::get(UPDATE_API)
+        .set("User-Agent", UPDATE_UA)
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_string()
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let tag = v["tag_name"].as_str().unwrap_or("").to_string();
+    let url = v["assets"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|a| a["name"].as_str().unwrap_or("").ends_with("setup.exe"))
+                .and_then(|a| a["browser_download_url"].as_str().map(|s| s.to_string()))
+        })
+        .ok_or_else(|| "no setup asset".to_string())?;
+    Ok((tag, url))
+}
+
+fn download_setup(url: &str, state: &Arc<Mutex<UpdateState>>) -> Result<String, String> {
+    let resp = ureq::get(url)
+        .set("User-Agent", UPDATE_UA)
+        .call()
+        .map_err(|e| e.to_string())?;
+    let total = resp
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let mut reader = resp.into_reader();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        use std::io::Read;
+        let n = reader.read(&mut chunk).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        *state.lock().unwrap() = UpdateState::Downloading {
+            done: buf.len() as u64,
+            total,
+        };
+    }
+    let path = std::env::temp_dir().join("zipnest-update-setup.exe");
+    std::fs::write(&path, &buf).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn spawn_update_check(state: Arc<Mutex<UpdateState>>) {
+    std::thread::spawn(move || {
+        *state.lock().unwrap() = UpdateState::Checking;
+        match fetch_latest() {
+            Ok((tag, url)) => {
+                let next = if is_newer(&tag) {
+                    UpdateState::Found { tag, url }
+                } else {
+                    UpdateState::Idle
+                };
+                *state.lock().unwrap() = next;
+            }
+            Err(e) => *state.lock().unwrap() = UpdateState::Failed(e),
+        }
+    });
+}
 
 #[derive(Default, Clone)]
 struct JobState {
@@ -97,11 +191,14 @@ struct App {
     // assets
     qr_wechat: Option<egui::TextureHandle>,
     qr_alipay: Option<egui::TextureHandle>,
+    // auto-update
+    update: Arc<Mutex<UpdateState>>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, launch_path: Option<String>) -> Self {
-        i18n::install_fonts(&cc.egui_ctx);
+        theme::install_fonts(&cc.egui_ctx);
+        theme::apply(&cc.egui_ctx);
         let mut app = Self::init(cc);
         app.launch_path = launch_path;
         app
@@ -128,6 +225,12 @@ impl App {
             .map(|img| cc.egui_ctx.load_texture("wechat", img, egui::TextureOptions::NEAREST));
         let qr_alipay = i18n::load_image(include_bytes!("assets/donate/alipay.jpg"))
             .map(|img| cc.egui_ctx.load_texture("alipay", img, egui::TextureOptions::NEAREST));
+        let update: Arc<Mutex<UpdateState>> = Default::default();
+        let check = Arc::clone(&update);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            spawn_update_check(check);
+        });
         Self {
             ctx,
             svc,
@@ -164,6 +267,7 @@ impl App {
             show_donate: false,
             qr_wechat,
             qr_alipay,
+            update,
         }
     }
 
@@ -286,91 +390,137 @@ impl App {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.button(self.t("app.open")).clicked() {
-                self.open_picker = true;
-            }
-            if ui.button(self.t("create.new")).clicked() {
-                self.show_create = true;
-                self.create_sources.clear();
-                self.create_dest = self.current_archive_dir();
-            }
-            let extract_enabled = self.archive.is_some() && !self.selected.is_empty();
-            if ui.add_enabled(extract_enabled, egui::Button::new(self.t("extract.start"))).clicked() {
-                self.extract_dest = self.current_archive_dir();
-                self.show_extract = true;
-            }
-            ui.separator();
-            if let Some(a) = &self.archive {
-                ui.label(a.format.clone());
-            } else {
-                ui.label(self.t("browser.empty"));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(self.t("settings.donate")).clicked() {
-                    self.show_donate = true;
+        theme::top_bar(ui, |ui| {
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, &self.t("app.open")).clicked() {
+                    self.open_picker = true;
                 }
-                if ui.button(if self.lang == "zh-CN" { "EN" } else { "中文" }).clicked() {
-                    self.lang = if self.lang == "zh-CN" { "en-US" } else { "zh-CN" }.into();
-                    self.settings.language = self.lang.clone();
-                    let _ = self.svc.settings_set(SettingsPatch {
-                        language: Some(self.lang.clone()),
-                        ..Default::default()
-                    });
+                if theme::ghost_button(ui, &self.t("create.new")).clicked() {
+                    self.show_create = true;
+                    self.create_sources.clear();
+                    self.create_dest = self.current_archive_dir();
                 }
-                if ui.button(self.t("settings.title")).clicked() {
-                    self.show_settings = true;
+                let extract_enabled = self.archive.is_some() && !self.selected.is_empty();
+                let mut btn = egui::Button::new(self.t("extract.start"))
+                    .rounding(egui::Rounding::same(6.0));
+                if extract_enabled {
+                    btn = btn.fill(egui::Color32::from_rgb(0, 103, 192))
+                        .stroke(egui::Stroke::NONE);
                 }
+                if ui.add_enabled(extract_enabled, btn).clicked() {
+                    self.extract_dest = self.current_archive_dir();
+                    self.show_extract = true;
+                }
+                ui.separator();
+                if let Some(a) = &self.archive {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(a.format.clone())
+                                .size(13.0)
+                                .color(egui::Color32::from_rgb(90, 90, 90)),
+                        ),
+                    );
+                } else {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(self.t("browser.empty"))
+                                .size(13.0)
+                                .color(egui::Color32::from_rgb(120, 120, 120)),
+                        ),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::ghost_button(ui, &self.t("settings.donate")).clicked() {
+                        self.show_donate = true;
+                    }
+                    if theme::ghost_button(ui, if self.lang == "zh-CN" { "EN" } else { "中文" }).clicked() {
+                        self.lang = if self.lang == "zh-CN" { "en-US" } else { "zh-CN" }.into();
+                        self.settings.language = self.lang.clone();
+                        let _ = self.svc.settings_set(SettingsPatch {
+                            language: Some(self.lang.clone()),
+                            ..Default::default()
+                        });
+                    }
+                    if theme::ghost_button(ui, &self.t("settings.title")).clicked() {
+                        self.show_settings = true;
+                    }
+                });
             });
         });
     }
 
     fn browser(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(self.t("browser.columns.name"));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(self.t("browser.columns.encrypted"));
-                ui.label(self.t("browser.columns.mtime"));
-                ui.label(self.t("browser.columns.size"));
-            });
-        });
-        ui.separator();
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            let mut click_dir: Option<String> = None;
-            let mut dbl: Option<String> = None;
-            let mut click_file: Option<String> = None;
-            let rows = self.rows.clone();
-            for e in &rows {
-                let selected = self.selected.contains(&e.path);
-                let mut text = format!("{} {}", if e.is_dir { "📁" } else { "📄" }, e.name);
-                let size = if e.is_dir {
-                    String::new()
-                } else {
-                    format!("{:>10}", pretty_size(e.size))
-                };
-                let enc = if e.encrypted { "🔒" } else { "" };
-                text = format!("{text}{size:>12}  {enc}");
-                let resp = ui.selectable_label(selected, text);
-                if resp.double_clicked() && e.is_dir {
-                    dbl = Some(e.path.clone());
-                } else if resp.clicked() {
-                    if e.is_dir {
-                        click_dir = Some(e.path.clone());
-                    } else {
-                        click_file = Some(e.path.clone());
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(255, 255, 255))
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+            .rounding(egui::Rounding::same(8.0))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(233, 233, 233)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(self.t("browser.columns.name"))
+                                .size(12.0)
+                                .strong(),
+                        ),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        for (key, pad) in [
+                            (self.t("browser.columns.encrypted"), 0.0),
+                            (self.t("browser.columns.mtime"), 40.0),
+                            (self.t("browser.columns.size"), 20.0),
+                        ] {
+                            ui.add_space(pad);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(key).size(12.0).color(egui::Color32::from_rgb(130, 130, 130)),
+                                ),
+                            );
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    let mut click_dir: Option<String> = None;
+                    let mut dbl: Option<String> = None;
+                    let mut click_file: Option<String> = None;
+                    let rows = self.rows.clone();
+                    for e in &rows {
+                        let selected = self.selected.contains(&e.path);
+                        let name = if e.is_dir {
+                            format!("📁 {}", e.name)
+                        } else {
+                            format!("📄 {}", e.name)
+                        };
+                        let size = if e.is_dir {
+                            String::new()
+                        } else {
+                            pretty_size(e.size)
+                        };
+                        let enc = if e.encrypted { "🔒" } else { "" };
+                        let text = format!("{name}\t{size}\t{enc}");
+                        let resp = ui.selectable_label(selected, text);
+                        if resp.double_clicked() && e.is_dir {
+                            dbl = Some(e.path.clone());
+                        } else if resp.clicked() {
+                            if e.is_dir {
+                                click_dir = Some(e.path.clone());
+                            } else {
+                                click_file = Some(e.path.clone());
+                            }
+                        }
+                        ui.end_row();
                     }
-                }
-                ui.end_row();
-            }
-            if let Some(d) = dbl.or(click_dir) {
-                self.navigate(&d);
-            } else if let Some(f) = click_file {
-                self.selected.clear();
-                self.selected.insert(f.clone());
-                self.preview_for = f;
-                self.preview_selected();
-            }
-        });
+                    if let Some(d) = dbl.or(click_dir) {
+                        self.navigate(&d);
+                    } else if let Some(f) = click_file {
+                        self.selected.clear();
+                        self.selected.insert(f.clone());
+                        self.preview_for = f;
+                        self.preview_selected();
+                    }
+                });
+            });
     }
 
     fn preview_panel(&mut self, ui: &mut egui::Ui) {
@@ -399,23 +549,38 @@ impl App {
     }
 
     fn statusbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(
-                self.notice
-                    .as_ref()
-                    .map(|n| self.t(n))
-                    .unwrap_or_else(|| {
-                        if self.archive.is_some() {
-                            format!("{}", self.rows.len())
-                        } else {
-                            String::new()
+        theme::status_bar(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            self.notice
+                                .as_ref()
+                                .map(|n| self.t(n))
+                                .unwrap_or_else(|| {
+                                    if self.archive.is_some() {
+                                        format!("{}", self.rows.len())
+                                    } else {
+                                        String::new()
+                                    }
+                                }),
+                        )
+                        .color(egui::Color32::from_rgb(110, 110, 110)),
+                    ),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let upd = self.update.lock().unwrap().clone();
+                    if matches!(upd, UpdateState::Idle) {
+                        if theme::ghost_button(ui, &self.t("update.check")).clicked() {
+                            spawn_update_check(Arc::clone(&self.update));
                         }
-                    }),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(self.t("settings.donate")).clicked() {
-                    self.show_donate = true;
-                }
+                    } else if matches!(upd, UpdateState::Checking) {
+                        ui.add(egui::Spinner::new());
+                    }
+                    if theme::ghost_button(ui, &self.t("settings.donate")).clicked() {
+                        self.show_donate = true;
+                    }
+                });
             });
         });
     }
@@ -685,6 +850,114 @@ impl App {
         self.show_donate = open;
     }
 
+    fn update_window(&mut self, ctx: &egui::Context) {
+        let st = self.update.lock().unwrap().clone();
+        match st {
+            UpdateState::Idle => {}
+            UpdateState::Checking => {
+                let title = self.t("update.title");
+                let msg = self.t("update.checking");
+                egui::Window::new(title)
+                    .collapsible(false)
+                    .show(ctx, |ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(msg);
+                    });
+            }
+            UpdateState::Found { tag, url } => {
+                let title = self.t("update.title");
+                let found = format!("{} ({})", self.t("update.found"), tag);
+                let dl = self.t("update.download");
+                let cancel = self.t("extract.cancel");
+                let upd = Arc::clone(&self.update);
+                let url = url.clone();
+                let mut open = true;
+                egui::Window::new(title)
+                    .collapsible(false)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.label(found);
+                        ui.horizontal(|ui| {
+                            if ui.button(dl).clicked() {
+                                *upd.lock().unwrap() = UpdateState::Downloading { done: 0, total: 0 };
+                                let url2 = url.clone();
+                                let upd2 = Arc::clone(&upd);
+                                std::thread::spawn(move || {
+                                    match download_setup(&url2, &upd2) {
+                                        Ok(path) => *upd2.lock().unwrap() = UpdateState::Ready { path },
+                                        Err(e) => *upd2.lock().unwrap() = UpdateState::Failed(e),
+                                    }
+                                });
+                            }
+                            if ui.button(cancel).clicked() {
+                                *upd.lock().unwrap() = UpdateState::Idle;
+                            }
+                        });
+                    });
+                if !open {
+                    *self.update.lock().unwrap() = UpdateState::Idle;
+                }
+            }
+            UpdateState::Downloading { done, total } => {
+                let title = self.t("update.title");
+                let pct = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                egui::Window::new(title).collapsible(false).show(ctx, |ui| {
+                    ui.add(egui::ProgressBar::new(pct).show_percentage());
+                    ui.label(format!("{} / {}", done / 1024, total / 1024));
+                });
+            }
+            UpdateState::Ready { path } => {
+                let title = self.t("update.title");
+                let ready = self.t("update.ready");
+                let install = self.t("update.install");
+                let cancel = self.t("extract.cancel");
+                let path2 = path.clone();
+                let upd = Arc::clone(&self.update);
+                let mut open = true;
+                egui::Window::new(title)
+                    .collapsible(false)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.label(ready);
+                        ui.horizontal(|ui| {
+                            if ui.button(install).clicked() {
+                                // Let the installer replace this running exe:
+                                // wait 2s then run the new setup silently, then exit.
+                                let cmd = format!("timeout /t 2 /nobreak >nul & \"{}\" /S", path2);
+                                let _ = std::process::Command::new("cmd").args(["/c", &cmd]).spawn();
+                                std::process::exit(0);
+                            }
+                            if ui.button(cancel).clicked() {
+                                *upd.lock().unwrap() = UpdateState::Idle;
+                            }
+                        });
+                    });
+                if !open {
+                    *self.update.lock().unwrap() = UpdateState::Idle;
+                }
+            }
+            UpdateState::Failed(msg) => {
+                let title = self.t("update.title");
+                let failed = format!("{}: {}", self.t("update.failed"), msg);
+                let cancel = self.t("extract.cancel");
+                let upd = Arc::clone(&self.update);
+                let mut open = true;
+                egui::Window::new(title)
+                    .collapsible(false)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.label(failed);
+                        if ui.button(cancel).clicked() {
+                            *upd.lock().unwrap() = UpdateState::Idle;
+                        }
+                    });
+                if !open {
+                    *self.update.lock().unwrap() = UpdateState::Idle;
+                }
+            }
+        }
+    }
+
     fn error_window(&mut self, ctx: &egui::Context) {
         if let Some(err) = self.error.clone() {
             let mut open = true;
@@ -825,6 +1098,7 @@ impl eframe::App for App {
         self.settings_dialog(ctx);
         self.donate_dialog(ctx);
         self.job_window(ctx);
+        self.update_window(ctx);
         self.error_window(ctx);
     }
 }
