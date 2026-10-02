@@ -705,7 +705,8 @@ ui.horizontal(|ui| {
                 self.help_hint(ui, &hint);
                 for l in ["store", "fastest", "normal", "maximum", "ultra"] {
                     let sel = self.create_level == l;
-                    if ui.selectable_label(sel, l).clicked() {
+                    let lbl = self.t(&format!("create.level.{l}"));
+                    if ui.selectable_label(sel, lbl).clicked() {
                         self.create_level = l.to_string();
                     }
                 }
@@ -716,7 +717,8 @@ ui.horizontal(|ui| {
                 self.help_hint(ui, &hint);
                 for m in ["auto", "copy", "deflate", "lzma2", "bzip2"] {
                     let sel = self.create_method == m;
-                    if ui.selectable_label(sel, m).clicked() {
+                    let lbl = self.t(&format!("create.method.{m}"));
+                    if ui.selectable_label(sel, lbl).clicked() {
                         self.create_method = m.to_string();
                     }
                 }
@@ -739,9 +741,10 @@ ui.horizontal(|ui| {
                 ui.label(self.t("create.volume"));
                 let hint = self.t("help.volume");
                 self.help_hint(ui, &hint);
-                for v in ["off", "10m", "100m", "1g", "custom"] {
+for v in ["off", "10m", "100m", "1g", "custom"] {
                     let sel = self.create_volume == v;
-                    if ui.selectable_label(sel, v).clicked() {
+                    let lbl = self.t(&format!("create.volume.{v}"));
+                    if ui.selectable_label(sel, lbl).clicked() {
                         self.create_volume = v.to_string();
                     }
                 }
