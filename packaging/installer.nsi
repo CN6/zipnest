@@ -1,14 +1,14 @@
-﻿; ZipNest 0.2.6 native installer (NSIS Unicode)
+﻿; ZipNest 0.2.7 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.2.6"
+!define VERSION "0.2.7"
 !define INSTDIR "$PROGRAMFILES\ZipNest"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\ZipNest"
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.2.6_x64-setup.exe"
+OutFile "ZipNest_0.2.7_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -45,10 +45,12 @@ Section "Install"
 
 ; Start menu shortcut
   CreateDirectory "$SMPROGRAMS\ZipNest"
-  CreateShortCut "$SMPROGRAMS\ZipNest\ZipNest.lnk" "$INSTDIR\zipnest.exe"
-  CreateShortCut "$SMPROGRAMS\ZipNest\卸载 ZipNest.lnk" "$INSTDIR\uninstall.exe"
+  CreateShortCut "$SMPROGRAMS\ZipNest\ZipNest.lnk" "$INSTDIR\zipnest.exe" "" "$INSTDIR\zipnest.exe" 0
+  CreateShortCut "$SMPROGRAMS\ZipNest\卸载 ZipNest.lnk" "$INSTDIR\uninstall.exe" "" "$INSTDIR\uninstall.exe" 0
   ; Desktop shortcut
-  CreateShortCut "$DESKTOP\ZipNest.lnk" "$INSTDIR\zipnest.exe"
+  CreateShortCut "$DESKTOP\ZipNest.lnk" "$INSTDIR\zipnest.exe" "" "$INSTDIR\zipnest.exe" 0
+  ; Refresh the shell icon cache so the new shortcut icon shows immediately.
+  System::Call "shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)"
 SectionEnd
 
 Section "Uninstall"
@@ -68,6 +70,7 @@ Delete "$SMPROGRAMS\ZipNest\ZipNest.lnk"
   Delete "$DESKTOP\ZipNest.lnk"
   DeleteRegKey HKCU "${UNINSTKEY}"
 SectionEnd
+
 
 
 

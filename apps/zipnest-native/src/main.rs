@@ -20,9 +20,9 @@ const DESIGN_WIDTH: f32 = 900.0;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.2.6";
+const CURRENT_VERSION: &str = "0.2.7";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.2.6";
+const UPDATE_UA: &str = "ZipNest-Updater/0.2.7";
 
 #[derive(Clone, Default)]
 enum UpdateState {
@@ -572,7 +572,15 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                                     egui::Color32::from_rgb(236, 184, 70),
                                 );
                             } else {
-                                // white page with folded corner
+                                // White page with a type-colored accent: tint
+                                // by extension so exe/images/audio never look
+                                // identical. (No emoji font needed.)
+                                let ext = e
+                                    .name
+                                    .rsplit_once('.')
+                                    .map(|(_, s)| s.to_lowercase())
+                                    .unwrap_or_default();
+                                let (accent, label) = entry_accent(&ext);
                                 let page = egui::Rect::from_min_size(
                                     icon_rect.min + egui::vec2(4.0, 2.0),
                                     egui::vec2(14.0, 16.0),
@@ -587,20 +595,26 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                                     egui::Rounding::same(2.0),
                                     egui::Stroke::new(1.0, egui::Color32::from_rgb(160, 160, 170)),
                                 );
-                                painter.line_segment(
-                                    [
-                                        page.min + egui::vec2(3.0, 6.0),
-                                        page.min + egui::vec2(11.0, 6.0),
-                                    ],
-                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 190)),
+                                // colored label chip at top of the page
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        page.min + egui::vec2(2.0, 2.0),
+                                        egui::vec2(10.0, 4.0),
+                                    ),
+                                    egui::Rounding::same(1.0),
+                                    accent,
                                 );
-                                painter.line_segment(
-                                    [
-                                        page.min + egui::vec2(3.0, 10.0),
-                                        page.min + egui::vec2(11.0, 10.0),
-                                    ],
-                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 190)),
-                                );
+                                if let Some(txt) = label {
+                                    let f = egui::FontId::proportional(8.0);
+                                    let gc = page.center() + egui::vec2(1.0, 5.0);
+                                    painter.text(
+                                        gc,
+                                        egui::Align2::CENTER_CENTER,
+                                        txt,
+                                        f,
+                                        accent,
+                                    );
+                                }
                             }
                             if e.encrypted {
                                 // small red lock at the far right of the row
@@ -1195,6 +1209,29 @@ fn pretty_size(b: u64) -> String {
     }
 }
 
+/// Color + short label used on the painted file icon, by extension.
+fn entry_accent(ext: &str) -> (egui::Color32, Option<&'static str>) {
+    match ext {
+        "exe" | "msi" | "bat" | "cmd" => (egui::Color32::from_rgb(0, 103, 192), Some("EXE")),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "svg" => {
+            (egui::Color32::from_rgb(56, 142, 98), Some("IMG"))
+        }
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "mid" => {
+            (egui::Color32::from_rgb(121, 85, 196), Some("AU"))
+        }
+        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" => {
+            (egui::Color32::from_rgb(198, 66, 110), Some("VI"))
+        }
+        "zip" | "7z" | "rar" | "tar" | "gz" | "bz2" | "xz" | "iso" | "tgz" => {
+            (egui::Color32::from_rgb(236, 143, 60), Some("ZIP"))
+        }
+        "pdf" => (egui::Color32::from_rgb(210, 60, 60), Some("PDF")),
+        "doc" | "docx" | "txt" | "md" => (egui::Color32::from_rgb(90, 110, 220), Some("TXT")),
+        "xls" | "xlsx" | "csv" => (egui::Color32::from_rgb(46, 125, 90), Some("XL")),
+        _ => (egui::Color32::from_rgb(121, 128, 140), None),
+    }
+}
+
 fn format_preview_hex(bytes: &[u8]) -> String {
     let cap = bytes.len().min(4096);
     let mut s = String::new();
@@ -1275,6 +1312,7 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.error_window(ctx);
     }
 }
+
 
 
 
