@@ -20,9 +20,9 @@ const DESIGN_WIDTH: f32 = 900.0;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.2.7";
+const CURRENT_VERSION: &str = "0.2.8";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.2.7";
+const UPDATE_UA: &str = "ZipNest-Updater/0.2.8";
 
 #[derive(Clone, Default)]
 enum UpdateState {
@@ -451,13 +451,22 @@ fn t(&self, key: &str) -> String {
                     self.create_dest = self.current_archive_dir();
                 }
 let extract_enabled = self.archive.is_some();
-                let mut btn = egui::Button::new(self.t("extract.start"))
-                    .rounding(egui::Rounding::same(6.0));
-                if extract_enabled {
-                    btn = btn.fill(egui::Color32::from_rgb(0, 103, 192))
-                        .stroke(egui::Stroke::NONE);
-                }
-                if ui.add_enabled(extract_enabled, btn).clicked() {
+                let extract_btn = egui::Button::new(
+                    egui::RichText::new(self.t("extract.start"))
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(egui::Color32::from_rgb(0, 103, 192))
+                .stroke(egui::Stroke::NONE)
+                .rounding(egui::Rounding::same(6.0));
+                if ui
+                    .add_enabled(extract_enabled, extract_btn)
+                    .on_hover_text(if self.selected.is_empty() {
+                        self.t("extract.all_hint")
+                    } else {
+                        String::new()
+                    })
+                    .clicked()
+                {
                     self.extract_dest = self.current_archive_dir();
                     // No selection → extract the whole archive (empty paths
                     // tells the engine to unpack everything).
@@ -548,10 +557,7 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         // dependency; emoji rendering was removed to avoid the
                         // glyph-atlas bug, so icons are drawn directly).
                         let resp = ui.horizontal(|ui| {
-                            let icon_rect = egui::Rect::from_min_size(
-                                ui.cursor().min,
-                                egui::vec2(22.0, 20.0),
-                            );
+                            let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 20.0), egui::Sense::hover());
                             let painter = ui.painter();
                             if e.is_dir {
                                 // amber folder
@@ -1282,14 +1288,9 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             self.statusbar(ui);
         });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Two-pane: browser + preview
-            egui::SidePanel::right("preview")
-                .default_width(300.0)
-                .resizable(true)
-                .show_inside(ui, |ui| {
-                    self.preview_panel(ui);
-                });
+egui::CentralPanel::default().show(ctx, |ui| {
+            // Browser only — the preview side panel was removed (it showed
+            // raw hex/text that users found noisy; not worth the space).
             self.browser(ui);
         });
 
@@ -1312,6 +1313,8 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.error_window(ctx);
     }
 }
+
+
 
 
 
