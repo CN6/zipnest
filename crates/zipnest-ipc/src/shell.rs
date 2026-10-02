@@ -1,4 +1,4 @@
-//! Per-user Explorer integration (HKCU only).
+﻿//! Per-user Explorer integration (HKCU only).
 //!
 //! Everything here is **HKCU** on purpose: machine-wide `HKLM` registration
 //! needs elevation, which the product never requests (spec §10). The registry
@@ -195,8 +195,182 @@ pub trait ShellApplier {
     fn run(&self, ops: &[RegOp]) -> std::io::Result<()>;
 }
 
-/// Writes through `reg.exe` (no extra crate, no elevation).
+/// Writes directly through the Win32 registry API — no `reg.exe` child
+/// process, no console flash, no UI blocking on a shell wait. This is the
+/// only implementation users run; tests use their own recorder applier.
 pub struct WindowsRegistry;
+
+#[cfg(windows)]
+mod win32 {
+    use super::{RegKind, RegOp};
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+
+    const HKEY_CURRENT_USER: isize = 0x8000_0001;
+    const ERROR_SUCCESS: i32 = 0;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_MORE_DATA: i32 = 234;
+    const KEY_SET_VALUE: u32 = 0x0002;
+    const KEY_CREATE_SUB_KEY: u32 = 0x0004;
+    const KEY_WOW64_64KEY: u32 = 0x0100;
+    const REG_SZ: u32 = 1;
+    const REG_EXPAND_SZ: u32 = 2;
+    const REG_DWORD: u32 = 4;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegCreateKeyExW(
+            hkey: isize,
+            subkey: *const u16,
+            reserved: u32,
+            class: *const u16,
+            options: u32,
+            sam: u32,
+            security: *const c_void,
+            result: *mut isize,
+            disposition: *mut u32,
+        ) -> i32;
+        fn RegSetValueExW(
+            hkey: isize,
+            name: *const u16,
+            reserved: u32,
+            kind: u32,
+            data: *const u8,
+            len: u32,
+        ) -> i32;
+        fn RegDeleteTreeW(hkey: isize, subkey: *const u16) -> i32;
+        fn RegDeleteValueW(hkey: isize, name: *const u16) -> i32;
+        fn RegCloseKey(hkey: isize) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s).encode_wide().collect()
+    }
+
+    /// `HKCU\Software\Classes\...` → (root, subkey, value name)
+    fn split(key: &str) -> (isize, String) {
+        let rest = key
+            .strip_prefix("HKCU\\")
+            .or_else(|| key.strip_prefix("hkcu\\"))
+            .unwrap_or(key)
+            .replace('/', "\\");
+        (HKEY_CURRENT_USER, rest)
+    }
+
+    fn set_value(key: &str, name: Option<&str>, value: &str, kind: RegKind) -> i32 {
+        let (root, sub) = split(key);
+        let mut sub_w = wide(&sub); sub_w.push(0);
+        let mut hkey = 0isize;
+        let rc = unsafe {
+            RegCreateKeyExW(
+                root,
+                sub_w.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_WOW64_64KEY,
+                std::ptr::null(),
+                &mut hkey,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return rc;
+        }
+        let name_w: Vec<u16> = match name { Some(n) => { let mut v = wide(n); v.push(0); v } None => vec![0] };
+        let (reg_kind, data_bytes) = match kind {
+            RegKind::Dword => {
+                let n = value.parse::<u32>().unwrap_or(0);
+                (REG_DWORD, n.to_ne_bytes().to_vec())
+            }
+            RegKind::ExpandSz => {
+                let mut v = wide(value);
+                v.push(0);
+                let mut bytes = Vec::new();
+                for u in &v {
+                    bytes.extend_from_slice(&u.to_le_bytes());
+                }
+                (REG_EXPAND_SZ, bytes)
+            }
+            RegKind::Sz => {
+                let mut v = wide(value);
+                v.push(0);
+                let mut bytes = Vec::new();
+                for u in &v {
+                    bytes.extend_from_slice(&u.to_le_bytes());
+                }
+                (REG_SZ, bytes)
+            }
+        };
+        let rc = unsafe {
+            RegSetValueExW(
+                hkey,
+                name_w.as_ptr(),
+                0,
+                reg_kind,
+                data_bytes.as_ptr(),
+                data_bytes.len() as u32,
+            )
+        };
+        unsafe {
+            RegCloseKey(hkey);
+        }
+        rc
+    }
+
+    fn delete_key(key: &str) -> i32 {
+        let (root, sub) = split(key);
+        let mut sub_w = wide(&sub); sub_w.push(0);
+        unsafe { RegDeleteTreeW(root, sub_w.as_ptr()) }
+    }
+
+    fn delete_value(key: &str, name: &str) -> i32 {
+        let (root, sub) = split(key);
+        let mut sub_w = wide(&sub); sub_w.push(0);
+        let mut hkey = 0isize;
+        let rc = unsafe {
+            RegCreateKeyExW(
+                root,
+                sub_w.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                KEY_SET_VALUE | KEY_WOW64_64KEY,
+                std::ptr::null(),
+                &mut hkey,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return rc;
+        }
+        let mut name_w = wide(name); name_w.push(0);
+        let rc = unsafe { RegDeleteValueW(hkey, name_w.as_ptr()) };
+        unsafe {
+            RegCloseKey(hkey);
+        }
+        rc
+    }
+
+    fn rc_to_io(rc: i32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(rc)
+    }
+
+    pub fn apply(ops: &[RegOp]) -> std::io::Result<()> {
+        for op in ops {
+            let rc = match op {
+                RegOp::SetValue { key, name, value, kind } => set_value(key, name.as_deref(), value, *kind),
+                RegOp::DeleteKey { key } => delete_key(key),
+                RegOp::DeleteValue { key, name } => delete_value(key, name),
+            };
+            // Deleting something that was never registered is a no-op.
+            if rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND && rc != ERROR_MORE_DATA {
+                return Err(rc_to_io(rc));
+            }
+        }
+        Ok(())
+    }
+}
 
 impl ShellApplier for WindowsRegistry {
     fn run(&self, ops: &[RegOp]) -> std::io::Result<()> {
@@ -207,35 +381,7 @@ impl ShellApplier for WindowsRegistry {
         }
         #[cfg(windows)]
         {
-            for op in ops {
-                let status = match op {
-                    RegOp::SetValue { key, name, value, kind } => {
-                        let vtype = match kind {
-                            RegKind::Sz => "REG_SZ",
-                            RegKind::ExpandSz => "REG_EXPAND_SZ",
-                            RegKind::Dword => "REG_DWORD",
-                        };
-                        let mut args = vec!["add".to_string(), key.clone(), "/f".into(), "/t".into(), vtype.into()];
-                        match name {
-                            Some(n) => args.extend(["/v".into(), n.clone()]),
-                            None => args.extend(["/ve".into()]),
-                        }
-                        args.push("/d".to_string());
-                        args.push(value.clone());
-                        std::process::Command::new("reg").args(&args).status()?
-                    }
-                    RegOp::DeleteKey { key } => std::process::Command::new("reg")
-                        .args(["delete", key, "/f"])
-                        .status()?,
-                    RegOp::DeleteValue { key, name } => std::process::Command::new("reg")
-                        .args(["delete", key, "/v", name, "/f"])
-                        .status()?,
-                };
-                if !status.success() {
-                    return Err(std::io::Error::other(format!("reg.exe failed for {op:?}")));
-                }
-            }
-            Ok(())
+            win32::apply(ops)
         }
     }
 }
@@ -339,3 +485,4 @@ mod tests {
         assert!(removals.iter().all(|o| matches!(o, RegOp::DeleteKey { .. })));
     }
 }
+

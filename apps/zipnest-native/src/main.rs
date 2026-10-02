@@ -20,9 +20,9 @@ const DESIGN_WIDTH: f32 = 900.0;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.2.8";
+const CURRENT_VERSION: &str = "0.2.9";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.2.8";
+const UPDATE_UA: &str = "ZipNest-Updater/0.2.9";
 
 #[derive(Clone, Default)]
 enum UpdateState {
@@ -1103,23 +1103,19 @@ UpdateState::Ready { path } => {
                         ui.label(ready);
                         ui.horizontal(|ui| {
                             if ui.button(install).clicked() {
-                                // Silent install: run the setup with /S (no UI,
-                                // no console window). The installer replaces this
-                                // exe; wait briefly so our process is released,
-                                // then exit. `wmic`/powershell-free: use
-                                // Start-Process with -WindowStyle Hidden to avoid
-                                // any black console flash.
-                                let ps = format!(
-                                    "Start-Process -WindowStyle Hidden -FilePath '{}' -ArgumentList '/S'",
-                                    path2.replace('\'', "''")
-                                );
-                                let _ = std::process::Command::new("powershell")
-                                    .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-                                    .creation_flags(crate::CREATE_NO_WINDOW)
-                                    .spawn();
-                                // Give the installer a moment to start, then quit
-                                // so the exe isn't locked by our own process.
-                                std::thread::sleep(std::time::Duration::from_millis(1500));
+                                // Run the downloaded NSIS installer directly with
+                                // /S (silent). No cmd/powershell wrapper, no
+                                // console window. Spawn it detached, close our
+                                // window, and let it replace this exe.
+                                #[cfg(windows)]
+                                {
+                                    use std::os::windows::process::CommandExt;
+                                    let _ = std::process::Command::new(&path2)
+                                        .arg("/S")
+                                        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                                        .spawn();
+                                }
+                                std::thread::sleep(std::time::Duration::from_secs(1));
                                 std::process::exit(0);
                             }
                             if ui.button(cancel).clicked() {
@@ -1313,6 +1309,7 @@ egui::CentralPanel::default().show(ctx, |ui| {
         self.error_window(ctx);
     }
 }
+
 
 
 
