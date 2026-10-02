@@ -5,16 +5,24 @@
 mod i18n;
 mod theme;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use eframe::egui;
 use std::sync::{Arc, Mutex};
 use zipnest_ipc::{CreateRequest, EntryDto, IpcService, SettingsPatch, ShellOptions};
 
 const DESIGN_WIDTH: f32 = 900.0;
 
+// Windows: CREATE_NO_WINDOW — spawn helpers (e.g. the updater installer)
+// without any console flash.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.2.5";
+const CURRENT_VERSION: &str = "0.2.6";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.2.5";
+const UPDATE_UA: &str = "ZipNest-Updater/0.2.6";
 
 #[derive(Clone, Default)]
 enum UpdateState {
@@ -234,6 +242,9 @@ impl App {
             std::time::Duration::from_millis(100),
         ));
         let settings = svc.settings_get().unwrap_or_default();
+        // Clean up a previously downloaded update installer that already ran
+        // (it is only needed while the update is being applied).
+        let _ = std::fs::remove_file(std::env::temp_dir().join("zipnest-update-setup.exe"));
         // Fixed zoom from settings, applied ONCE at startup. Never re-zoom per
         // frame — that feedback loop made fullscreen flicker badly.
         cc.egui_ctx.set_zoom_factor(settings.ui_zoom.clamp(100, 200) as f32 / 100.0);
@@ -247,12 +258,15 @@ impl App {
             .map(|img| cc.egui_ctx.load_texture("wechat", img, egui::TextureOptions::NEAREST));
         let qr_alipay = i18n::load_image(include_bytes!("assets/donate/alipay.jpg"))
             .map(|img| cc.egui_ctx.load_texture("alipay", img, egui::TextureOptions::NEAREST));
-        let update: Arc<Mutex<UpdateState>> = Default::default();
-        let check = Arc::clone(&update);
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            spawn_update_check(check);
-        });
+let update: Arc<Mutex<UpdateState>> = Default::default();
+        // Auto-check is user-controllable in Settings (on by default).
+        if settings.auto_check_update {
+            let check = Arc::clone(&update);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                spawn_update_check(check);
+            });
+        }
         Self {
             ctx,
             svc,
@@ -938,6 +952,12 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                         }
                     }
                 });
+                let update_lbl = self.t("settings.auto_update");
+                ui.checkbox(&mut self.settings.auto_check_update, update_lbl);
+                ui.label(self.t("settings.version"));
+                ui.horizontal(|ui| {
+                    ui.label("v".to_string() + CURRENT_VERSION);
+                });
                 ui.label(self.t("settings.shell.associate"));
                 ui.checkbox(&mut self.settings.associate, "");
                 ui.label(self.t("settings.shell.context_menu"));
@@ -955,6 +975,7 @@ let _ = svc.settings_set(SettingsPatch {
                         overwrite_policy: Some(self.settings.overwrite_policy.clone()),
                         preview_max_bytes: Some(self.settings.preview_max_bytes),
                         ui_zoom: Some(self.settings.ui_zoom),
+                        auto_check_update: Some(self.settings.auto_check_update),
                         ..Default::default()
                     });
                     if self.settings.language != "system" {
@@ -1047,7 +1068,7 @@ let _ = svc.settings_set(SettingsPatch {
                     ui.label(format!("{} / {}", done / 1024, total / 1024));
                 });
             }
-            UpdateState::Ready { path } => {
+UpdateState::Ready { path } => {
                 let title = self.t("update.title");
                 let ready = self.t("update.ready");
                 let install = self.t("update.install");
@@ -1062,10 +1083,23 @@ let _ = svc.settings_set(SettingsPatch {
                         ui.label(ready);
                         ui.horizontal(|ui| {
                             if ui.button(install).clicked() {
-                                // Let the installer replace this running exe:
-                                // wait 2s then run the new setup silently, then exit.
-                                let cmd = format!("timeout /t 2 /nobreak >nul & \"{}\" /S", path2);
-                                let _ = std::process::Command::new("cmd").args(["/c", &cmd]).spawn();
+                                // Silent install: run the setup with /S (no UI,
+                                // no console window). The installer replaces this
+                                // exe; wait briefly so our process is released,
+                                // then exit. `wmic`/powershell-free: use
+                                // Start-Process with -WindowStyle Hidden to avoid
+                                // any black console flash.
+                                let ps = format!(
+                                    "Start-Process -WindowStyle Hidden -FilePath '{}' -ArgumentList '/S'",
+                                    path2.replace('\'', "''")
+                                );
+                                let _ = std::process::Command::new("powershell")
+                                    .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+                                    .creation_flags(crate::CREATE_NO_WINDOW)
+                                    .spawn();
+                                // Give the installer a moment to start, then quit
+                                // so the exe isn't locked by our own process.
+                                std::thread::sleep(std::time::Duration::from_millis(1500));
                                 std::process::exit(0);
                             }
                             if ui.button(cancel).clicked() {
@@ -1241,6 +1275,7 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.error_window(ctx);
     }
 }
+
 
 
 

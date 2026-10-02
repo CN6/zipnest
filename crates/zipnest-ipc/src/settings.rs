@@ -31,6 +31,8 @@ pub struct Settings {
     /// UI zoom percent, 100 = 100%. Fixed value applied at startup; the app
     /// never re-zooms per frame (that caused fullscreen flicker).
     pub ui_zoom: u32,
+    /// Auto-check for updates when the app starts.
+    pub auto_check_update: bool,
 }
 
 impl Default for Settings {
@@ -43,6 +45,7 @@ impl Default for Settings {
             context_menu: false,
             preview_max_bytes: 8 * 1024 * 1024,
             ui_zoom: 100,
+            auto_check_update: true,
         }
     }
 }
@@ -57,6 +60,7 @@ pub struct SettingsPatch {
     pub context_menu: Option<bool>,
     pub preview_max_bytes: Option<u64>,
     pub ui_zoom: Option<u32>,
+    pub auto_check_update: Option<bool>,
 }
 
 fn invalid() -> IpcError {
@@ -93,6 +97,9 @@ impl Settings {
         }
         if let Some(v) = patch.ui_zoom {
             self.ui_zoom = v.clamp(100, 200);
+        }
+        if let Some(v) = patch.auto_check_update {
+            self.auto_check_update = v;
         }
         Ok(())
     }
