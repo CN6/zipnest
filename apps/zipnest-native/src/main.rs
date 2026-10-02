@@ -12,9 +12,9 @@ use zipnest_ipc::{CreateRequest, EntryDto, IpcService, SettingsPatch, ShellOptio
 const DESIGN_WIDTH: f32 = 900.0;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.2.4";
+const CURRENT_VERSION: &str = "0.2.5";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.2.4";
+const UPDATE_UA: &str = "ZipNest-Updater/0.2.5";
 
 #[derive(Clone, Default)]
 enum UpdateState {
@@ -436,7 +436,7 @@ fn t(&self, key: &str) -> String {
                     self.create_sources.clear();
                     self.create_dest = self.current_archive_dir();
                 }
-                let extract_enabled = self.archive.is_some() && !self.selected.is_empty();
+let extract_enabled = self.archive.is_some();
                 let mut btn = egui::Button::new(self.t("extract.start"))
                     .rounding(egui::Rounding::same(6.0));
                 if extract_enabled {
@@ -445,6 +445,8 @@ fn t(&self, key: &str) -> String {
                 }
                 if ui.add_enabled(extract_enabled, btn).clicked() {
                     self.extract_dest = self.current_archive_dir();
+                    // No selection → extract the whole archive (empty paths
+                    // tells the engine to unpack everything).
                     self.show_extract = true;
                 }
                 ui.separator();
@@ -516,26 +518,99 @@ fn t(&self, key: &str) -> String {
                     });
                 });
                 ui.add_space(4.0);
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     let mut click_dir: Option<String> = None;
                     let mut dbl: Option<String> = None;
                     let mut click_file: Option<String> = None;
                     let rows = self.rows.clone();
                     for e in &rows {
                         let selected = self.selected.contains(&e.path);
-                        let name = if e.is_dir {
-                            format!("📁 {}", e.name)
-                        } else {
-                            format!("📄 {}", e.name)
-                        };
                         let size = if e.is_dir {
                             String::new()
                         } else {
                             pretty_size(e.size)
                         };
-                        let enc = if e.encrypted { "🔒" } else { "" };
-                        let text = format!("{name}\t{size}\t{enc}");
-                        let resp = ui.selectable_label(selected, text);
+                        // Row: painted icon + selectable name (no emoji font
+                        // dependency; emoji rendering was removed to avoid the
+                        // glyph-atlas bug, so icons are drawn directly).
+                        let resp = ui.horizontal(|ui| {
+                            let icon_rect = egui::Rect::from_min_size(
+                                ui.cursor().min,
+                                egui::vec2(22.0, 20.0),
+                            );
+                            let painter = ui.painter();
+                            if e.is_dir {
+                                // amber folder
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        icon_rect.min + egui::vec2(3.0, 5.0),
+                                        egui::vec2(16.0, 12.0),
+                                    ),
+                                    egui::Rounding::same(2.0),
+                                    egui::Color32::from_rgb(236, 184, 70),
+                                );
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        icon_rect.min + egui::vec2(3.0, 3.0),
+                                        egui::vec2(6.0, 3.0),
+                                    ),
+                                    egui::Rounding::same(1.0),
+                                    egui::Color32::from_rgb(236, 184, 70),
+                                );
+                            } else {
+                                // white page with folded corner
+                                let page = egui::Rect::from_min_size(
+                                    icon_rect.min + egui::vec2(4.0, 2.0),
+                                    egui::vec2(14.0, 16.0),
+                                );
+                                painter.rect_filled(
+                                    page,
+                                    egui::Rounding::same(2.0),
+                                    egui::Color32::from_rgb(250, 250, 252),
+                                );
+                                painter.rect_stroke(
+                                    page,
+                                    egui::Rounding::same(2.0),
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(160, 160, 170)),
+                                );
+                                painter.line_segment(
+                                    [
+                                        page.min + egui::vec2(3.0, 6.0),
+                                        page.min + egui::vec2(11.0, 6.0),
+                                    ],
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 190)),
+                                );
+                                painter.line_segment(
+                                    [
+                                        page.min + egui::vec2(3.0, 10.0),
+                                        page.min + egui::vec2(11.0, 10.0),
+                                    ],
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 190)),
+                                );
+                            }
+                            if e.encrypted {
+                                // small red lock at the far right of the row
+                                let lock_c = icon_rect.right_center()
+                                    + egui::vec2(150.0, 0.0);
+                                painter.rect_filled(
+                                    egui::Rect::from_center_size(lock_c, egui::vec2(7.0, 6.0)),
+                                    egui::Rounding::same(1.0),
+                                    egui::Color32::from_rgb(200, 60, 60),
+                                );
+                                painter.circle_stroke(
+                                    lock_c + egui::vec2(0.0, -4.0),
+                                    3.0,
+                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(200, 60, 60)),
+                                );
+                            }
+                            ui.add_space(2.0);
+                            let label = ui.selectable_label(selected, &e.name);
+                            // size column
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(size);
+                            });
+                            label
+                        }).inner;
                         if resp.double_clicked() && e.is_dir {
                             dbl = Some(e.path.clone());
                         } else if resp.clicked() {
@@ -1166,6 +1241,7 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.error_window(ctx);
     }
 }
+
 
 
 

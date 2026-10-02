@@ -391,14 +391,23 @@ impl IpcService {
             let entries = guard.0.entries().map_err(|e| e.error_key().to_string())?;
 
             // Expand the selection: directories contribute all nested files.
+            // An empty selection means "extract the whole archive".
             let sel_norm: Vec<String> = paths.iter().map(|p| p.replace('\\', "/")).collect();
             let mut wanted: Vec<u32> = Vec::new();
-            for sel in &sel_norm {
-                let sel = sel.trim_end_matches('/');
-                let is_dir = entries
-                    .iter()
-                    .any(|e| e.path.replace('\\', "/").trim_end_matches('/') == sel && e.is_dir);
-                for e in &entries {
+            let whole_archive = sel_norm.is_empty()
+                || sel_norm.iter().any(|s| s.trim_end_matches('/').is_empty());
+            for e in &entries {
+                if whole_archive {
+                    if !e.is_dir && !wanted.contains(&e.index) {
+                        wanted.push(e.index);
+                    }
+                    continue;
+                }
+                for sel in &sel_norm {
+                    let sel = sel.trim_end_matches('/');
+                    let is_dir = entries
+                        .iter()
+                        .any(|e| e.path.replace('\\', "/").trim_end_matches('/') == sel && e.is_dir);
                     let p = e.path.replace('\\', "/");
                     let p = p.trim_end_matches('/');
                     let hit = if is_dir {

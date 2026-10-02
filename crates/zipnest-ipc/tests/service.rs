@@ -112,6 +112,30 @@ fn extract_emits_progress_and_finished_ok() {
     std::fs::remove_dir_all(&dest).ok();
 }
 
+// Empty selection = "extract the whole archive". This is the one-click
+// "解压整个压缩包" path from the UI (no rows selected).
+#[test]
+fn extract_empty_selection_unpacks_whole_archive() {
+    let (svc, _events) = service();
+    let r = svc
+        .open_archive(fx("plain.zip").to_string_lossy().into(), None)
+        .unwrap();
+    let dest = std::env::temp_dir().join(format!("zipnest-tall-{}", std::process::id()));
+    let job = svc
+        .extract(r.id, vec![], dest.to_string_lossy().into(), true, None)
+        .unwrap();
+    wait_events(&_events, 5000, |v| v.iter().any(|(n, _)| n == "job_finished"));
+    assert!(dest.join("a.txt").exists(), "whole archive should include a.txt");
+    assert!(dest.join("c.txt").exists(), "whole archive should include c.txt");
+    assert!(
+        dest.join("sub").join("b.txt").exists(),
+        "whole archive should recurse into sub/ (nested b.txt)"
+    );
+    assert!(!dest.join("sub").is_file(), "sub must stay a directory");
+    let _ = job;
+    std::fs::remove_dir_all(&dest).ok();
+}
+
 // c.txt is the only Deflate-compressed entry in plain.zip (8406 bytes).
 // Store entries extracted fine while this one came out as 0 bytes through
 // the UI/IPC path — pin the full byte count.
