@@ -274,8 +274,22 @@ impl App {
         }
     }
 
-    fn t(&self, key: &str) -> String {
+fn t(&self, key: &str) -> String {
         i18n::tr(&self.lang, key)
+    }
+
+    /// Small "?" that shows a tooltip on hover (help text for wizard fields).
+    fn help_hint(&mut self, ui: &mut egui::Ui, text: &str) {
+        let resp = ui.add(
+            egui::Button::new(egui::RichText::new("?")
+                .size(13.0)
+                .color(egui::Color32::from_rgb(0, 103, 192)))
+            .rounding(egui::Rounding::same(9.0))
+            .min_size(egui::vec2(18.0, 18.0))
+            .fill(egui::Color32::from_rgb(238, 242, 248))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(199, 210, 224))),
+        );
+        resp.on_hover_text(text);
     }
 
     /// Drain job events emitted by the service into UI state.
@@ -674,8 +688,10 @@ impl App {
                     self.create_dest = p.to_str().unwrap_or("").to_string();
                 }
             }
-            ui.horizontal(|ui| {
+ui.horizontal(|ui| {
                 ui.label(self.t("create.format"));
+                let hint = self.t("help.format");
+                self.help_hint(ui, &hint);
                 for f in ["zip", "7z", "tar", "tar.gz", "tar.bz2", "tar.xz"] {
                     let sel = self.create_format == f;
                     if ui.selectable_label(sel, f).clicked() {
@@ -685,6 +701,8 @@ impl App {
             });
             ui.horizontal(|ui| {
                 ui.label(self.t("create.level"));
+                let hint = self.t("help.level");
+                self.help_hint(ui, &hint);
                 for l in ["store", "fastest", "normal", "maximum", "ultra"] {
                     let sel = self.create_level == l;
                     if ui.selectable_label(sel, l).clicked() {
@@ -694,6 +712,8 @@ impl App {
             });
             ui.horizontal(|ui| {
                 ui.label(self.t("create.method"));
+                let hint = self.t("help.method");
+                self.help_hint(ui, &hint);
                 for m in ["auto", "copy", "deflate", "lzma2", "bzip2"] {
                     let sel = self.create_method == m;
                     if ui.selectable_label(sel, m).clicked() {
@@ -703,14 +723,22 @@ impl App {
             });
             ui.horizontal(|ui| {
                 ui.label(self.t("create.password"));
+                let hint = self.t("help.password");
+                self.help_hint(ui, &hint);
                 ui.text_edit_singleline(&mut self.create_password);
             });
             if self.create_format == "7z" {
                 let lbl = self.t("create.encrypt_names");
-                ui.checkbox(&mut self.create_encrypt_names, lbl);
+                let hint = self.t("help.encrypt_names");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.create_encrypt_names, lbl);
+                    self.help_hint(ui, &hint);
+                });
             }
             ui.horizontal(|ui| {
                 ui.label(self.t("create.volume"));
+                let hint = self.t("help.volume");
+                self.help_hint(ui, &hint);
                 for v in ["off", "10m", "100m", "1g", "custom"] {
                     let sel = self.create_volume == v;
                     if ui.selectable_label(sel, v).clicked() {
