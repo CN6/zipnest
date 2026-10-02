@@ -6,21 +6,28 @@ use egui::{Margin, Rounding, Stroke};
 
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    // Latin: Segoe UI (Win11 default), monospace: Consolas; CJK falls back
-    // to Microsoft YaHei so Chinese text is sharp everywhere.
-    let mut add = |name: &'static str, fam: egui::FontFamily| {
-        for f in ["segoeui.ttf", "seguiemj.ttf", "consola.ttf", "msyh.ttc", "msyh.ttf", "simhei.ttf"] {
-            let path = format!("C:\\Windows\\Fonts\\{f}");
-            if let Ok(bytes) = std::fs::read(&path) {
-                let key = format!("{name}-{f}");
-                fonts.font_data.insert(key.clone(), egui::FontData::from_owned(bytes));
-                fonts.families.entry(fam).or_default().push(key);
-                return;
-            }
+    let mut add = |path: &str, family: egui::FontFamily| {
+        if let Ok(bytes) = std::fs::read(path) {
+            let key = format!("sys-{}", std::path::Path::new(path).file_name().unwrap_or_default().to_string_lossy());
+            fonts.font_data.insert(key.clone(), egui::FontData::from_owned(bytes));
+            fonts.families.entry(family).or_default().push(key);
         }
     };
-    add("ui", egui::FontFamily::Proportional);
-    add("mono", egui::FontFamily::Monospace);
+    // Latin: Segoe UI (Win11 default). CJK: Microsoft YaHei fallback.
+    // Deliberately NO color/emoji fonts — egui's glyph engine cannot parse
+    // them and would render every glyph as a box.
+    add("C:\\Windows\\Fonts\\segoeui.ttf", egui::FontFamily::Proportional);
+    add("C:\\Windows\\Fonts\\msyh.ttc", egui::FontFamily::Proportional);
+    add("C:\\Windows\\Fonts\\consola.ttf", egui::FontFamily::Monospace);
+    add("C:\\Windows\\Fonts\\msyh.ttc", egui::FontFamily::Monospace);
+    // Move our system fonts ahead of the built-ins so they win.
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(list) = fonts.families.get_mut(&fam) {
+            let sys: Vec<String> = list.iter().filter(|k| k.starts_with("sys-")).cloned().collect();
+            let rest: Vec<String> = list.iter().filter(|k| !k.starts_with("sys-")).cloned().collect();
+            *list = sys.into_iter().chain(rest).collect();
+        }
+    }
     ctx.set_fonts(fonts);
 }
 
