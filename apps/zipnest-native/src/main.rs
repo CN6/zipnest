@@ -1,4 +1,6 @@
 ﻿//! ZipNest native UI (egui). Same-process calls into `zipnest-ipc`; no webview.
+//! Windows GUI subsystem: no console window pops up during normal use.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod i18n;
 mod theme;
@@ -10,9 +12,9 @@ use zipnest_ipc::{CreateRequest, EntryDto, IpcService, SettingsPatch, ShellOptio
 const DESIGN_WIDTH: f32 = 900.0;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.2.1";
+const CURRENT_VERSION: &str = "0.2.2";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.2.1";
+const UPDATE_UA: &str = "ZipNest-Updater/0.2.2";
 
 #[derive(Clone, Default)]
 enum UpdateState {
@@ -1147,3 +1149,4 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.error_window(ctx);
     }
 }
+
