@@ -264,6 +264,16 @@ impl IpcService {
         use crate::shell;
         let mut warnings = Vec::new();
 
+        // Guard: cargo build artifacts (target/debug, target/release) must
+        // never become the system default handler. Registering them pollutes
+        // Explorer associations with paths that only exist on a dev machine
+        // and with console-subsystem debug builds. Packaged apps run from
+        // Program Files / the portable folder and pass this check.
+        let exe_norm = exe.to_string_lossy().replace('\\', "/");
+        if exe_norm.contains("/target/") {
+            return Err(IpcError::new("error.shell.dev_path"));
+        }
+
         let associate_ok = if opts.associate {
             let ok = applier.run(&shell::assoc_ops(exe)).is_ok();
             if !ok {

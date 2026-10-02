@@ -49,6 +49,7 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "extract.cancel" => "取消",
             "extract.success" => "解压完成",
             "error.title" => "错误",
+            "error.shell.dev_path" => "开发版路径不能注册为默认打开程序，请使用安装后的 ZipNest。",
             "settings.title" => "设置",
             "settings.donate" => "支持我们",
             "settings.donate.title" => "支持 ZipNest",
@@ -141,6 +142,7 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "extract.cancel" => "Cancel",
             "extract.success" => "Extraction complete",
             "error.title" => "Error",
+            "error.shell.dev_path" => "A development build cannot be registered as the default handler. Use the installed ZipNest.",
             "settings.title" => "Settings",
             "settings.donate" => "Support us",
             "settings.donate.title" => "Support ZipNest",
@@ -213,4 +215,5 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "update.failed" => "Update check failed",
         }
     });
+
 
