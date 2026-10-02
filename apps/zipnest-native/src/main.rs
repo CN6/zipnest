@@ -10,9 +10,9 @@ use zipnest_ipc::{CreateRequest, EntryDto, IpcService, SettingsPatch, ShellOptio
 const DESIGN_WIDTH: f32 = 900.0;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.2.0";
+const CURRENT_VERSION: &str = "0.2.1";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.2.0";
+const UPDATE_UA: &str = "ZipNest-Updater/0.2.1";
 
 #[derive(Clone, Default)]
 enum UpdateState {
