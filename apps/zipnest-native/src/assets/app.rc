@@ -1,0 +1,3 @@
+// ZipNest app resources: the icon below is embedded so Explorer, taskbar,
+// shortcuts and Alt-Tab all show the same image.
+1 ICON "src/assets/zipnest.ico"

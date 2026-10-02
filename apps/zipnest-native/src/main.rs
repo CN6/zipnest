@@ -12,9 +12,9 @@ use zipnest_ipc::{CreateRequest, EntryDto, IpcService, SettingsPatch, ShellOptio
 const DESIGN_WIDTH: f32 = 900.0;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.2.2";
+const CURRENT_VERSION: &str = "0.2.3";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.2.2";
+const UPDATE_UA: &str = "ZipNest-Updater/0.2.3";
 
 #[derive(Clone, Default)]
 enum UpdateState {
@@ -135,16 +135,33 @@ enum PreviewKind {
     None,
 }
 
+fn load_app_icon() -> Option<egui::IconData> {
+    let img = image::load_from_memory(include_bytes!("assets/icon.png")).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width: w,
+        height: h,
+    })
+}
+
 fn main() -> Result<(), eframe::Error> {
     // Support "open with ZipNest": a path on the command line (double-clicking
     // an associated archive) is opened right after startup.
     let launch_path: Option<String> = std::env::args()
         .nth(1)
         .filter(|a| !a.starts_with('-') && std::path::Path::new(a).is_file());
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([DESIGN_WIDTH, 620.0])
+        .with_title("ZipNest 解压缩");
+    // Same icon embedded in the exe via build.rs: window and taskbar then match
+    // the Explorer icon and shortcuts.
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([DESIGN_WIDTH, 620.0])
-            .with_title("ZipNest 解压缩"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -1149,4 +1166,5 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.error_window(ctx);
     }
 }
+
 
