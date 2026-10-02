@@ -40,6 +40,11 @@ enum PreviewKind {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    // Support "open with ZipNest": a path on the command line (double-clicking
+    // an associated archive) is opened right after startup.
+    let launch_path: Option<String> = std::env::args()
+        .nth(1)
+        .filter(|a| !a.starts_with('-') && std::path::Path::new(a).is_file());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([DESIGN_WIDTH, 620.0])
@@ -49,7 +54,7 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "ZipNest",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, launch_path.clone())))),
     )
 }
 
@@ -57,6 +62,7 @@ struct App {
     ctx: egui::Context,
     svc: Arc<IpcService>,
     settings: zipnest_ipc::Settings,
+    launch_path: Option<String>,
     archive: Option<zipnest_ipc::OpenArchiveResult>,
     archive_path: String,
     cwd: String,
@@ -94,8 +100,14 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, launch_path: Option<String>) -> Self {
         i18n::install_fonts(&cc.egui_ctx);
+        let mut app = Self::init(cc);
+        app.launch_path = launch_path;
+        app
+    }
+
+    fn init(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = cc.egui_ctx.clone();
         let jobs: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Default::default();
         let emit_jobs = Arc::clone(&jobs);
@@ -120,6 +132,7 @@ impl App {
             ctx,
             svc,
             settings,
+            launch_path: None,
             archive: None,
             archive_path: String::new(),
             cwd: String::new(),
@@ -772,6 +785,11 @@ impl eframe::App for App {
         let scale = (ctx.screen_rect().width() / DESIGN_WIDTH).clamp(1.0, 1.7);
         ctx.set_zoom_factor(scale);
         self.poll_jobs();
+
+        // Consume a launch path passed on the command line ("open with ZipNest").
+        if let Some(path) = self.launch_path.take() {
+            self.open_archive(&path);
+        }
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
