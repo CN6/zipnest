@@ -20,9 +20,10 @@ const DESIGN_WIDTH: f32 = 900.0;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.3.2";
+const CURRENT_VERSION: &str = "0.3.3";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.3.2";
+const UPDATE_UA: &str = "ZipNest-Updater/0.3.3";
+const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
 
 #[derive(Clone, Default)]
 enum UpdateState {
@@ -30,8 +31,6 @@ enum UpdateState {
     Idle,
     Checking,
     Found { tag: String, url: String },
-    Downloading { done: u64, total: u64 },
-    Ready { path: String },
     Failed(String),
 }
 
@@ -55,44 +54,25 @@ fn fetch_latest() -> Result<(String, String), String> {
         .map_err(|e| e.to_string())?;
     let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     let tag = v["tag_name"].as_str().unwrap_or("").to_string();
-    let url = v["assets"]
-        .as_array()
-        .and_then(|arr| {
-            arr.iter()
-                .find(|a| a["name"].as_str().unwrap_or("").ends_with("setup.exe"))
-                .and_then(|a| a["browser_download_url"].as_str().map(|s| s.to_string()))
-        })
-        .ok_or_else(|| "no setup asset".to_string())?;
+    let url = v["html_url"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(RELEASES_PAGE)
+        .to_string();
     Ok((tag, url))
 }
 
-fn download_setup(url: &str, state: &Arc<Mutex<UpdateState>>) -> Result<String, String> {
-    let resp = ureq::get(url)
-        .set("User-Agent", UPDATE_UA)
-        .call()
-        .map_err(|e| e.to_string())?;
-    let total = resp
-        .header("Content-Length")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    let mut reader = resp.into_reader();
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        use std::io::Read;
-        let n = reader.read(&mut chunk).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        *state.lock().unwrap() = UpdateState::Downloading {
-            done: buf.len() as u64,
-            total,
-        };
+fn open_in_browser(url: &str) {
+    // Hand the URL to the default browser. `start` needs the empty "" title
+    // argument before the URL when the URL could be quoted.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
     }
-    let path = std::env::temp_dir().join("zipnest-update-setup.exe");
-    std::fs::write(&path, &buf).map_err(|e| e.to_string())?;
-    Ok(path.to_string_lossy().to_string())
 }
 
 fn spawn_update_check(state: Arc<Mutex<UpdateState>>) {
@@ -1143,74 +1123,23 @@ let _ = svc.settings_set(SettingsPatch {
             UpdateState::Found { tag, url } => {
                 let title = self.t("update.title");
                 let found = format!("{} ({})", self.t("update.found"), tag);
+                let hint = self.t("update.hint");
                 let dl = self.t("update.download");
                 let cancel = self.t("extract.cancel");
                 let upd = Arc::clone(&self.update);
-                let url = url.clone();
                 let mut open = true;
                 egui::Window::new(title)
                     .collapsible(false)
+                    .default_width(380.0)
+                    .default_pos(ctx.screen_rect().center() - egui::vec2(190.0, 60.0))
                     .open(&mut open)
                     .show(ctx, |ui| {
+                        theme::dialog_scale(ui);
                         ui.label(found);
+                        ui.label(hint);
                         ui.horizontal(|ui| {
                             if ui.button(dl).clicked() {
-                                *upd.lock().unwrap() = UpdateState::Downloading { done: 0, total: 0 };
-                                let url2 = url.clone();
-                                let upd2 = Arc::clone(&upd);
-                                std::thread::spawn(move || {
-                                    match download_setup(&url2, &upd2) {
-                                        Ok(path) => *upd2.lock().unwrap() = UpdateState::Ready { path },
-                                        Err(e) => *upd2.lock().unwrap() = UpdateState::Failed(e),
-                                    }
-                                });
-                            }
-                            if ui.button(cancel).clicked() {
-                                *upd.lock().unwrap() = UpdateState::Idle;
-                            }
-                        });
-                    });
-                if !open {
-                    *self.update.lock().unwrap() = UpdateState::Idle;
-                }
-            }
-            UpdateState::Downloading { done, total } => {
-                let title = self.t("update.title");
-                let pct = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                egui::Window::new(title).collapsible(false).show(ctx, |ui| {
-                    ui.add(egui::ProgressBar::new(pct).show_percentage());
-                    ui.label(format!("{} / {}", done / 1024, total / 1024));
-                });
-            }
-UpdateState::Ready { path } => {
-                let title = self.t("update.title");
-                let ready = self.t("update.ready");
-                let install = self.t("update.install");
-                let cancel = self.t("extract.cancel");
-                let path2 = path.clone();
-                let upd = Arc::clone(&self.update);
-                let mut open = true;
-                egui::Window::new(title)
-                    .collapsible(false)
-                    .open(&mut open)
-                    .show(ctx, |ui| {
-                        ui.label(ready);
-                        ui.horizontal(|ui| {
-                            if ui.button(install).clicked() {
-                                // Run the downloaded NSIS installer directly with
-                                // /S (silent). No cmd/powershell wrapper, no
-                                // console window. Spawn it detached, close our
-                                // window, and let it replace this exe.
-                                #[cfg(windows)]
-                                {
-                                    use std::os::windows::process::CommandExt;
-                                    let _ = std::process::Command::new(&path2)
-                                        .arg("/S")
-                                        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                                        .spawn();
-                                }
-                                std::thread::sleep(std::time::Duration::from_secs(1));
-                                std::process::exit(0);
+                                open_in_browser(&url);
                             }
                             if ui.button(cancel).clicked() {
                                 *upd.lock().unwrap() = UpdateState::Idle;
