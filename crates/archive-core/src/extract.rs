@@ -19,7 +19,7 @@ use crate::com::{
 };
 use crate::error::ZipnestError;
 use crate::types::{ArchiveEntry, ExtractOptions, ExtractProgress, ExtractStats};
-use archive_security::{sanitize_entry_path, ExtractQuota, SecurityViolation};
+use archive_security::{sanitize_entry_path, ExtractQuota};
 use std::ffi::c_void;
 use std::os::raw::c_void as RawCVoid;
 use std::path::PathBuf;
@@ -36,7 +36,6 @@ const ASK_EXTRACT: i32 = 0;
 
 /// Blocked-reason codes in [`DiskState::blocked`].
 const BLOCK_NONE: u8 = 0;
-const BLOCK_SECURITY: u8 = 1;
 const BLOCK_QUOTA: u8 = 2;
 
 // ===========================================================================
@@ -339,7 +338,7 @@ struct DiskState {
     quota: Mutex<ExtractQuota>,
     blocked: AtomicU8,    // BLOCK_*
     cancelled: AtomicU8,  // 1 when the user closure asked to stop
-    security: Mutex<Option<SecurityViolation>>,
+    skipped: Mutex<Vec<String>>,
     io_error: Mutex<Option<std::io::Error>>,
     first_op_res: AtomicI32,
     done_bytes: AtomicU64,
@@ -353,6 +352,13 @@ impl DiskState {
             .binary_search_by_key(&index, |e| e.index)
             .ok()
             .map(|i| &self.entries[i])
+    }
+
+    /// Record an entry we refused to write (path escape / hostile name).
+    fn record_skip(&self, raw: &str) {
+        if let Ok(mut s) = self.skipped.lock() {
+            s.push(raw.to_string());
+        }
     }
 
     /// Invoke the user closure; `false` arms the cancellation flag.
@@ -608,34 +614,23 @@ unsafe extern "system" fn disk_get_stream(
         return E_ABORT;
     }
 
-    // Security: sanitize the RAW archive path before it touches the disk.
+    // Security: sanitize the RAW archive path before it touches the disk. An
+    // unsafe or path-escaping entry is skipped — never written — but it does
+    // not abort the whole extraction, so unrelated files still land. Skipped
+    // names are reported back in `ExtractStats::skipped`.
     let rel = match sanitize_entry_path(&meta.raw_path) {
         Ok(r) => r,
-        Err(v) => {
-            let mut slot = match st.security.lock() {
-                Ok(s) => s,
-                Err(_) => return E_FAIL,
-            };
-            if slot.is_none() {
-                *slot = Some(v);
-            }
-            st.blocked.store(BLOCK_SECURITY, Ordering::SeqCst);
-            return E_FAIL;
+        Err(_) => {
+            st.record_skip(&meta.raw_path);
+            return S_OK; // null stream → engine skips this entry and continues
         }
     };
     let full: PathBuf = st.dest.join(&rel);
     if !full.starts_with(&st.dest) {
         // Double insurance (symlink-style escapes cannot happen here, but
         // never write outside dest even if join semantics change).
-        let mut slot = match st.security.lock() {
-            Ok(s) => s,
-            Err(_) => return E_FAIL,
-        };
-        if slot.is_none() {
-            *slot = Some(SecurityViolation::Traversal);
-        }
-        st.blocked.store(BLOCK_SECURITY, Ordering::SeqCst);
-        return E_FAIL;
+        st.record_skip(&meta.raw_path);
+        return S_OK;
     }
 
     if meta.is_dir {
@@ -749,7 +744,7 @@ pub(crate) fn extract_to_disk(
         quota: Mutex::new(ExtractQuota::new(opts.max_total_bytes)),
         blocked: AtomicU8::new(BLOCK_NONE),
         cancelled: AtomicU8::new(0),
-        security: Mutex::new(None),
+        skipped: Mutex::new(Vec::new()),
         io_error: Mutex::new(None),
         first_op_res: AtomicI32::new(0),
         done_bytes: AtomicU64::new(0),
@@ -798,18 +793,8 @@ pub(crate) fn extract_to_disk(
     if state.cancelled.load(Ordering::SeqCst) == 1 {
         return Err(ZipnestError::Cancelled);
     }
-    match state.blocked.load(Ordering::SeqCst) {
-        BLOCK_SECURITY => {
-            let v = state
-                .security
-                .lock()
-                .ok()
-                .and_then(|mut s| s.take())
-                .unwrap_or(SecurityViolation::Traversal);
-            return Err(ZipnestError::Security(v));
-        }
-        BLOCK_QUOTA => return Err(ZipnestError::QuotaExceeded),
-        _ => {}
+    if state.blocked.load(Ordering::SeqCst) == BLOCK_QUOTA {
+        return Err(ZipnestError::QuotaExceeded);
     }
     if let Some(e) = state.io_error.lock().ok().and_then(|mut s| s.take()) {
         return Err(ZipnestError::Io(e));
@@ -825,9 +810,15 @@ pub(crate) fn extract_to_disk(
         return Err(crate::error::map_hresult(hr));
     }
 
+    let skipped = state
+        .skipped
+        .lock()
+        .map(|mut s| std::mem::take(&mut *s))
+        .unwrap_or_default();
     Ok(ExtractStats {
         files: state.files_created.load(Ordering::Relaxed),
         bytes: state.done_bytes.load(Ordering::Relaxed),
+        skipped,
     })
 }
 

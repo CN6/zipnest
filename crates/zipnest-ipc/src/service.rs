@@ -464,7 +464,7 @@ impl IpcService {
                 true
             });
             drop(guard);
-            result.map_err(|e| {
+            let stats = result.map_err(|e| {
                 let key = e.error_key().to_string();
                 if key == "error.password_required" {
                     emit(
@@ -474,6 +474,18 @@ impl IpcService {
                 }
                 key
             })?;
+            if !stats.skipped.is_empty() {
+                // Some entries could not be written safely (hostile/Windows-
+                // reserved names). The safe ones are all extracted; tell the UI
+                // so the skips are visible instead of looking like data loss.
+                emit(
+                    "extract_skipped",
+                    serde_json::json!({
+                        "count": stats.skipped.len(),
+                        "names": stats.skipped,
+                    }),
+                );
+            }
             Ok(())
         }));
         Ok(job_id)

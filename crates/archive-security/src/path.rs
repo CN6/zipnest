@@ -57,7 +57,14 @@ pub fn sanitize_entry_path(raw: &str) -> Result<String, SecurityViolation> {
         return Err(SecurityViolation::Absolute);
     }
     if t.len() >= 2 && t.as_bytes()[1] == b':' {
-        return Err(SecurityViolation::Absolute);
+        // Only a real drive prefix is an escape: `X:` or `X:\`/`X:/`.
+        // A colon deeper in a name (`a:b.txt`, illegal on Windows) is not an
+        // escape; the per-component cleaner below rewrites it to `_` so the
+        // file is still extracted instead of being dropped.
+        let drive_absolute = t.len() == 2 || matches!(t.as_bytes()[2], b'/' | b'\\');
+        if drive_absolute {
+            return Err(SecurityViolation::Absolute);
+        }
     }
     if t.starts_with("//") || t.starts_with("\\\\") {
         return Err(SecurityViolation::Absolute);
@@ -125,9 +132,18 @@ mod tests {
         bad("/abs", SecurityViolation::Absolute);
         bad("C:\\abs", SecurityViolation::Absolute);
         bad("c:/abs", SecurityViolation::Absolute);
-        bad("C:rel", SecurityViolation::Absolute);
+        bad("C:", SecurityViolation::Absolute);
         bad("\\\\server\\share\\x", SecurityViolation::Absolute);
         bad("//server/share", SecurityViolation::Absolute);
+    }
+
+    #[test]
+    fn colon_in_a_name_is_cleaned_not_rejected() {
+        // Drive-relative-looking names are not escapes: Windows can't store the
+        // colon, so it is cleaned and the file is kept.
+        ok("C:rel", "C_rel");
+        ok("a:b.txt", "a_b.txt");
+        ok("dir/12:30:00.log", "dir/12_30_00.log");
     }
 
     #[test]

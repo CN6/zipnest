@@ -152,15 +152,17 @@ fn extract_quota_enforced() {
 }
 
 #[test]
-fn zip_slip_entry_is_blocked() {
+fn zip_slip_entry_is_skipped_and_other_files_extract() {
     use std::io::Write as _;
-    // Craft an archive with a malicious relative path.
+    // Craft an archive with a malicious relative path followed by a safe file.
     let evil = std::env::temp_dir().join(format!("zn-slip-{}.zip", std::process::id()));
     {
         let f = std::fs::File::create(&evil).unwrap();
         let mut w = zip::ZipWriter::new(f);
         w.start_file::<_, ()>("../../evil.txt", Default::default()).unwrap();
         w.write_all(b"pwned").unwrap();
+        w.start_file::<_, ()>("ok.txt", Default::default()).unwrap();
+        w.write_all(b"safe").unwrap();
         w.finish().unwrap();
     }
     let arc = Archive::open(&evil, ArchiveOpenOptions::default()).expect("open evil");
@@ -171,13 +173,58 @@ fn zip_slip_entry_is_blocked() {
         max_total_bytes: u64::MAX,
         overwrite: true,
     };
-    let err = arc.extract(&opts, None, &mut |_p| true).expect_err("must be blocked");
-    assert_eq!(err.error_key(), "error.security_blocked");
+    let stats = arc
+        .extract(&opts, None, &mut |_p| true)
+        .expect("one bad entry must not fail the whole extraction");
     // double insurance: nothing may land outside dest
     let escaped = std::env::temp_dir().join("evil.txt");
     assert!(!escaped.exists(), "must not escape temp");
+    assert!(!dest.join("evil.txt").exists());
+    assert!(
+        stats.skipped.iter().any(|p| p.ends_with("evil.txt")),
+        "the escapee must be reported as skipped: {:?}",
+        stats.skipped
+    );
+    // the safe file listed after it still lands
+    assert_eq!(std::fs::read_to_string(dest.join("ok.txt")).unwrap(), "safe");
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_file(&evil);
+}
+
+#[test]
+fn reserved_name_is_skipped_and_others_still_extract() {
+    use std::io::Write as _;
+    let z = std::env::temp_dir().join(format!("zn-reserved-{}.zip", std::process::id()));
+    {
+        let f = std::fs::File::create(&z).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        for (name, body) in [("good1.txt", "one"), ("aux.txt", "aux"), ("good2.txt", "two")] {
+            w.start_file::<_, ()>(name, Default::default()).unwrap();
+            w.write_all(body.as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+    }
+    let arc = Archive::open(&z, ArchiveOpenOptions::default()).unwrap();
+    let dest = tmpdir("reserved");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        overwrite: true,
+    };
+    let stats = arc
+        .extract(&opts, None, &mut |_p| true)
+        .expect("one bad name must not fail the whole extraction");
+    assert_eq!(std::fs::read_to_string(dest.join("good1.txt")).unwrap(), "one");
+    assert_eq!(
+        std::fs::read_to_string(dest.join("good2.txt")).unwrap(),
+        "two",
+        "files after the hostile name must still extract"
+    );
+    assert!(!dest.join("aux.txt").exists());
+    assert!(stats.skipped.iter().any(|p| p.ends_with("aux.txt")));
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_file(&z);
 }
 // ---- Task 9: password callback loop ----
 

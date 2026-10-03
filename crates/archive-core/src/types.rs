@@ -50,10 +50,14 @@ pub struct ExtractProgress {
 }
 
 /// Summary of a completed extraction.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct ExtractStats {
     pub files: u32,
     pub bytes: u64,
+    /// Archive paths that were skipped because they could not be written safely
+    /// (path escape, Windows reserved name, …). Everything safe still extracts;
+    /// the caller surfaces these so nothing looks silently lost.
+    pub skipped: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
