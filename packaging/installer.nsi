@@ -1,14 +1,14 @@
-﻿; ZipNest 0.3.0 native installer (NSIS Unicode)
+﻿; ZipNest 0.3.1 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.3.0"
+!define VERSION "0.3.1"
 !define INSTDIR "$PROGRAMFILES\ZipNest"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\ZipNest"
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.3.0_x64-setup.exe"
+OutFile "ZipNest_0.3.1_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin

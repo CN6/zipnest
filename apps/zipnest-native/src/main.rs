@@ -20,9 +20,9 @@ const DESIGN_WIDTH: f32 = 900.0;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.3.0";
+const CURRENT_VERSION: &str = "0.3.1";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.3.0";
+const UPDATE_UA: &str = "ZipNest-Updater/0.3.1";
 
 #[derive(Clone, Default)]
 enum UpdateState {
@@ -222,6 +222,7 @@ struct App {
     // dialogs
     show_extract: bool,
     extract_dest: String,
+    extract_skipped: u64,
     overwrite: bool,
     show_create: bool,
     create_sources: Vec<String>,
@@ -314,6 +315,7 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             preview_for: String::new(),
             show_extract: false,
             extract_dest: String::new(),
+            extract_skipped: 0,
             overwrite: true,
             show_create: false,
             create_sources: Vec::new(),
@@ -372,6 +374,9 @@ fn t(&self, key: &str) -> String {
                     j.speed_bps = payload["speed_bps"].as_u64().unwrap_or(0);
                     j.eta_secs = payload["eta_secs"].as_u64().unwrap_or(0);
                 }
+                "extract_skipped" => {
+                    self.extract_skipped = payload["count"].as_u64().unwrap_or(0);
+                }
                 "job_finished" => {
                     let ok = payload["ok"].as_bool().unwrap_or(false);
                     let err_key = payload["error_key"]
@@ -381,10 +386,15 @@ fn t(&self, key: &str) -> String {
                     j.ok = ok;
                     j.finished = true;
                     self.notice = if ok {
-                        Some("job.ok".into())
+                        if self.extract_skipped > 0 {
+                            Some("job.ok_skipped".into())
+                        } else {
+                            Some("job.ok".into())
+                        }
                     } else {
                         err_key.map(|k| if k.starts_with("error.") { k } else { "error.engine".into() })
                     };
+                    self.extract_skipped = 0;
                 }
                 _ => {}
             }
@@ -421,6 +431,23 @@ fn t(&self, key: &str) -> String {
         match p.rfind('/') {
             Some(i) => p[..i].to_string(),
             None => String::new(),
+        }
+    }
+
+    /// Default extract location: a subfolder named after the archive, so files
+    /// don't scatter into the archive's own folder (matches WinRAR/7-Zip).
+    fn default_extract_dest(&self) -> String {
+        let dir = self.current_archive_dir();
+        let stem = std::path::Path::new(&self.archive_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if stem.is_empty() {
+            dir
+        } else if dir.is_empty() {
+            stem.to_string()
+        } else {
+            format!("{dir}/{stem}")
         }
     }
 
@@ -494,7 +521,7 @@ let extract_enabled = self.archive.is_some();
                     })
                     .clicked()
                 {
-                    self.extract_dest = self.current_archive_dir();
+                    self.extract_dest = self.default_extract_dest();
                     // No selection → extract the whole archive (empty paths
                     // tells the engine to unpack everything).
                     self.show_extract = true;
