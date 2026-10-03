@@ -4,6 +4,16 @@
 /.superpowers/
 
 /dist-portable/
+/dist/
 /ZipNest_*.zip
+/packaging/ZipNest_*setup.exe
 
 /ZipNest_*setup.exe
+
+# Signing material — never commit private keys
+*.pfx
+*.snk
+/certs/
+
+# Win11 shell package build output (build-package.ps1 default OutDir)
+/packaging/win11-shell/out/

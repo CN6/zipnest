@@ -7815,6 +7815,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zipnest-shell"
+version = "0.3.0"
+dependencies = [
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+]
+
+[[package]]
 name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -20,9 +20,9 @@ const DESIGN_WIDTH: f32 = 900.0;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.2.10";
+const CURRENT_VERSION: &str = "0.3.0";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.2.10";
+const UPDATE_UA: &str = "ZipNest-Updater/0.3.0";
 
 #[derive(Clone, Default)]
 enum UpdateState {
