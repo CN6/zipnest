@@ -80,8 +80,10 @@ if (-not $Thumbprint) {
         Where-Object { $_.Subject -eq $Subject -and $_.HasPrivateKey } |
         Sort-Object NotAfter -Descending | Select-Object -First 1
     if (-not $cert) {
+        # Long validity so the shipped package keeps installing/updating.
         $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $Subject `
-            -CertStoreLocation Cert:\CurrentUser\My -HashAlgorithm SHA256
+            -CertStoreLocation Cert:\CurrentUser\My -HashAlgorithm SHA256 `
+            -NotAfter (Get-Date).AddYears(10)
     }
     $Thumbprint = $cert.Thumbprint
 } else {
