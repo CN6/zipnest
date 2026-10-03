@@ -1,14 +1,14 @@
-﻿; ZipNest 0.3.4 native installer (NSIS Unicode)
+﻿; ZipNest 0.3.5 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.3.4"
+!define VERSION "0.3.5"
 !define INSTDIR "$PROGRAMFILES\ZipNest"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\ZipNest"
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.3.4_x64-setup.exe"
+OutFile "ZipNest_0.3.5_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -17,6 +17,9 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
+; Offer to reopen ZipNest on the finish page (checked by default).
+!define MUI_FINISHPAGE_RUN "$INSTDIR\zipnest.exe"
+!define MUI_FINISHPAGE_RUN_TEXT "运行 ZipNest"
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
