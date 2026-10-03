@@ -9,12 +9,17 @@
 
 双击压缩包直接打开，就像系统自带的功能一样自然。底层是官方 7-Zip 引擎（`7z.dll` 运行时动态加载），ZIP / 7z / RAR / TAR / GZ / BZ2 / XZ / ISO 一个不落。**全部功能免费，没有任何功能被锁定。**
 
+## 界面预览
+
 <p align="center">
-  <img src="docs/images/preview-01.png" width="720" alt="ZipNest 界面预览 1">
+  <img src="docs/images/main-window.png" width="720" alt="ZipNest 主界面">
 </p>
+<p align="center"><sub>主界面 —— 顶部「打开压缩包 / 新建压缩包」，文件列表按名称、大小、修改时间排列</sub></p>
+
 <p align="center">
-  <img src="docs/images/preview-02.png" width="720" alt="ZipNest 界面预览 2">
+  <img src="docs/images/settings.png" width="720" alt="ZipNest 设置页">
 </p>
+<p align="center"><sub>设置 —— 默认解压目录、覆盖策略、界面缩放 100%–200%、中英双语、更新检查</sub></p>
 
 ## 你可能受够了这些
 
