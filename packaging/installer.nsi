@@ -72,7 +72,7 @@ SectionEnd
 ; Windows the manifest is harmless but the modern menu does not exist, so skip.
 Function RegisterWin11Shell
   ReadRegStr $0 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "CurrentBuildNumber"
-  IntCmpU $0 22000 do_register do_register skip_register
+  IntCmpU $0 22000 do_register skip_register do_register
 do_register:
   nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Win11Shell\install.ps1" -InstallDir "$INSTDIR" -PackageDir "$INSTDIR\Win11Shell"'
   Pop $0
@@ -82,7 +82,7 @@ FunctionEnd
 ; Remove the per-user package before its files are deleted.
 Function un.UnregisterWin11Shell
   ReadRegStr $0 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "CurrentBuildNumber"
-  IntCmpU $0 22000 do_unregister do_unregister skip_unregister
+  IntCmpU $0 22000 do_unregister skip_unregister do_unregister
 do_unregister:
   nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Win11Shell\uninstall.ps1"'
   Pop $0
@@ -104,8 +104,8 @@ Section "Uninstall"
   Delete "$INSTDIR\Win11Shell\uninstall.ps1"
   Delete "$INSTDIR\Win11Shell\Assets\*.png"
   Delete "$INSTDIR\uninstall.exe"
-  RMDir "$INSTDIR\Win11Shell\Assets"
-  RMDir "$INSTDIR\Win11Shell"
+  ; /r also clears the AppX registration metadata subfolder.
+  RMDir /r "$INSTDIR\Win11Shell"
   RMDir "$INSTDIR\engines\sfx"
   RMDir "$INSTDIR\engines"
   RMDir "$INSTDIR\licenses"
