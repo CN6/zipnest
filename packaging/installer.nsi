@@ -1,14 +1,14 @@
-﻿; ZipNest 0.3.3 native installer (NSIS Unicode)
+﻿; ZipNest 0.3.4 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.3.3"
+!define VERSION "0.3.4"
 !define INSTDIR "$PROGRAMFILES\ZipNest"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\ZipNest"
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.3.3_x64-setup.exe"
+OutFile "ZipNest_0.3.4_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -22,7 +22,38 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
+; Force-close a running ZipNest so its files are not locked while we overwrite
+; them (otherwise the user sees "cannot write file" and has to close it first).
+Function CloseRunningZipNest
+  StrCpy $1 0
+  zn_kill_again:
+    nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM zipnest.exe'
+    Pop $0
+    IntCmp $0 0 zn_kill_wait zn_kill_done zn_kill_done
+  zn_kill_wait:
+    Sleep 400
+    IntOp $1 $1 + 1
+    IntCmp $1 12 zn_kill_done zn_kill_again zn_kill_done
+  zn_kill_done:
+FunctionEnd
+
+; Same as above, for the uninstall section (which may only call un.* functions).
+Function un.CloseRunningZipNest
+  StrCpy $1 0
+  zn_ukill_again:
+    nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM zipnest.exe'
+    Pop $0
+    IntCmp $0 0 zn_ukill_wait zn_ukill_done zn_ukill_done
+  zn_ukill_wait:
+    Sleep 400
+    IntOp $1 $1 + 1
+    IntCmp $1 12 zn_ukill_done zn_ukill_again zn_ukill_done
+  zn_ukill_done:
+FunctionEnd
+
 Section "Install"
+  ; Close a running ZipNest first, or its exe/dll are locked and writes fail.
+  Call CloseRunningZipNest
   SetOutPath "$INSTDIR"
   File "..\dist-portable\ZipNest\zipnest.exe"
   SetOutPath "$INSTDIR\engines"
@@ -89,6 +120,8 @@ skip_unregister:
 FunctionEnd
 
 Section "Uninstall"
+  ; Close a running ZipNest so its exe/dll can be deleted.
+  Call un.CloseRunningZipNest
   ; Unregister the per-user package before deleting its manifest/files.
   Call un.UnregisterWin11Shell
 
