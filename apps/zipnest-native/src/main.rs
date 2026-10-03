@@ -20,9 +20,9 @@ const DESIGN_WIDTH: f32 = 900.0;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.3.1";
+const CURRENT_VERSION: &str = "0.3.2";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.3.1";
+const UPDATE_UA: &str = "ZipNest-Updater/0.3.2";
 
 #[derive(Clone, Default)]
 enum UpdateState {
@@ -123,15 +123,19 @@ struct JobState {
     eta_secs: u64,
     ok: bool,
     finished: bool,
+    error_key: Option<String>,
     title: String,
 }
 
 impl JobState {
     fn pct(&self) -> f32 {
-        if self.total_items == 0 {
-            return 0.0;
+        if self.total_bytes > 0 {
+            (self.done_bytes as f32 / self.total_bytes as f32).clamp(0.0, 1.0)
+        } else if self.total_items > 0 {
+            (self.done_items as f32 / self.total_items as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
         }
-        (self.done_items as f32 / self.total_items as f32).clamp(0.0, 1.0)
     }
 }
 
@@ -262,9 +266,14 @@ fn new(
         let ctx = cc.egui_ctx.clone();
         let jobs: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Default::default();
         let emit_jobs = Arc::clone(&jobs);
+        let repaint = cc.egui_ctx.clone();
         let svc = Arc::new(IpcService::new(
             Arc::new(move |name: &str, payload: serde_json::Value| {
                 emit_jobs.lock().unwrap().push((name.to_string(), payload));
+                // Events arrive from job worker threads. Wake the UI so progress
+                // actually advances on screen (otherwise egui stays idle until
+                // the user moves the mouse — looks like "no progress bar").
+                repaint.request_repaint();
             }),
             std::time::Duration::from_millis(100),
         ));
@@ -379,21 +388,25 @@ fn t(&self, key: &str) -> String {
                 }
                 "job_finished" => {
                     let ok = payload["ok"].as_bool().unwrap_or(false);
-                    let err_key = payload["error_key"]
-                        .as_str()
-                        .map(|s| s.to_string());
-                    let j = self.job.get_or_insert_with(JobState::default);
-                    j.ok = ok;
-                    j.finished = true;
-                    self.notice = if ok {
-                        if self.extract_skipped > 0 {
-                            Some("job.ok_skipped".into())
-                        } else {
-                            Some("job.ok".into())
-                        }
+                    let err_key = payload["error_key"].as_str().map(|s| s.to_string());
+                    let skipped = self.extract_skipped;
+                    {
+                        let j = self.job.get_or_insert_with(JobState::default);
+                        j.ok = ok;
+                        j.finished = true;
+                        j.error_key = err_key.clone();
+                    }
+                    if ok {
+                        self.notice =
+                            Some(if skipped > 0 { "job.ok_skipped" } else { "job.ok" }.into());
                     } else {
-                        err_key.map(|k| if k.starts_with("error.") { k } else { "error.engine".into() })
-                    };
+                        let key = err_key
+                            .filter(|k| k.starts_with("error."))
+                            .unwrap_or_else(|| "error.engine".into());
+                        self.notice = Some(key.clone());
+                        // Pop a dialog so a failure is never missed.
+                        self.error = Some(self.t(&key));
+                    }
                     self.extract_skipped = 0;
                 }
                 _ => {}
@@ -794,7 +807,14 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         let srcs = self.selected.clone();
         let svc = self.svc.clone();
         let t = self.t("extract.title");
-        egui::Window::new(t).collapsible(false).open(&mut open).show(ctx, |ui| {
+        let center = ctx.screen_rect().center() - egui::vec2(215.0, 110.0);
+        egui::Window::new(t)
+            .collapsible(false)
+            .default_width(430.0)
+            .default_pos(center)
+            .open(&mut open)
+            .show(ctx, |ui| {
+            theme::dialog_scale(ui);
             ui.label(self.t("extract.dest"));
             ui.text_edit_singleline(&mut self.extract_dest);
             if ui.button(self.t("extract.browse")).clicked() {
@@ -813,13 +833,23 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     title: self.t("extract.title"),
                     ..Default::default()
                 });
-                let _ = svc.extract(
+                match svc.extract(
                     arch_id,
                     srcs.iter().cloned().collect(),
                     dest,
                     overwrite,
                     None,
-                );
+                ) {
+                    Ok(jid) => {
+                        if let Some(job) = self.job.as_mut() {
+                            job.job_id = jid;
+                        }
+                    }
+                    Err(e) => {
+                        self.error = Some(self.t(&e.key));
+                        self.job = None;
+                    }
+                }
                 self.show_extract = false;
             }
             ui.separator();
@@ -967,11 +997,21 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                     title: self.t("create.title"),
                     ..Default::default()
                 });
-                let _ = svc.create_archive(
+                match svc.create_archive(
                     self.create_sources.clone(),
                     self.create_dest.clone(),
                     req,
-                );
+                ) {
+                    Ok(jid) => {
+                        if let Some(job) = self.job.as_mut() {
+                            job.job_id = jid;
+                        }
+                    }
+                    Err(e) => {
+                        self.error = Some(self.t(&e.key));
+                        self.job = None;
+                    }
+                }
                 self.show_create = false;
             }
             ui.separator();
@@ -1222,30 +1262,57 @@ UpdateState::Ready { path } => {
     }
 
     fn job_window(&mut self, ctx: &egui::Context) {
-        if let Some(j) = &self.job {
-            if j.finished {
-                self.job = None;
-                return;
-            }
-            let mut cancel = false;
-            egui::Window::new(j.title.clone())
-                .collapsible(false)
-                .show(ctx, |ui| {
-                    ui.add(egui::ProgressBar::new(j.pct()).show_percentage());
-                    let speed = format!("{} / {}", j.done_items, j.total_items);
-                    ui.label(speed);
+        let Some(j) = self.job.clone() else {
+            return;
+        };
+        let mut cancel = false;
+        let mut close = false;
+        let center = ctx.screen_rect().center() - egui::vec2(190.0, 70.0);
+        egui::Window::new(j.title.clone())
+            .id(egui::Id::new("zipnest-job-window"))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .default_pos(center)
+            .show(ctx, |ui| {
+                theme::dialog_scale(ui);
+                let bar = if j.finished { 1.0 } else { j.pct() };
+                ui.add_sized([360.0, 22.0], egui::ProgressBar::new(bar).show_percentage());
+                if j.finished {
+                    if j.ok {
+                        ui.colored_label(egui::Color32::from_rgb(40, 140, 60), self.t("job.ok"));
+                    } else {
+                        let k = j.error_key.clone().unwrap_or_else(|| "error.engine".into());
+                        ui.colored_label(egui::Color32::from_rgb(200, 60, 40), self.t(&k));
+                    }
+                    if ui.button(self.t("job.close")).clicked() {
+                        close = true;
+                    }
+                } else {
+                    let text = if j.total_bytes > 0 {
+                        format!(
+                            "{} / {}  ·  {}/s",
+                            pretty_size(j.done_bytes),
+                            pretty_size(j.total_bytes),
+                            pretty_size(j.speed_bps)
+                        )
+                    } else {
+                        format!("{} / {}", j.done_items, j.total_items)
+                    };
+                    ui.label(text);
                     if ui.button(self.t("job.canceled")).clicked() {
                         cancel = true;
                     }
-                });
-            if cancel {
-                if let Some(active) = self.job.clone() {
-                    if active.job_id != 0 {
-                        let _ = self.svc.cancel(active.job_id);
-                    }
                 }
-                self.job = None;
+            });
+        if cancel {
+            if j.job_id != 0 {
+                let _ = self.svc.cancel(j.job_id);
             }
+            self.job = None;
+        }
+        if close {
+            self.job = None;
         }
     }
 }
