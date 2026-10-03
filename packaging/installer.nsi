@@ -1,14 +1,14 @@
-﻿; ZipNest 0.2.10 native installer (NSIS Unicode)
+﻿; ZipNest 0.3.0 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.2.10"
+!define VERSION "0.3.0"
 !define INSTDIR "$PROGRAMFILES\ZipNest"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\ZipNest"
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.2.10_x64-setup.exe"
+OutFile "ZipNest_0.3.0_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -33,6 +33,18 @@ Section "Install"
   SetOutPath "$INSTDIR\licenses"
   File "..\dist-portable\ZipNest\licenses\7zip.txt"
 
+  ; Windows 11 modern context menu: per-user sparse package (no HKLM, no cert).
+  ; The DLL and the package manifest live in the install dir; the manifest is
+  ; registered with the install dir as its external location.
+  SetOutPath "$INSTDIR"
+  File "..\dist-portable\ZipNest\zipnest_shell.dll"
+  SetOutPath "$INSTDIR\Win11Shell"
+  File "..\dist-portable\ZipNest\Win11Shell\AppxManifest.xml"
+  File "..\dist-portable\ZipNest\Win11Shell\install.ps1"
+  File "..\dist-portable\ZipNest\Win11Shell\uninstall.ps1"
+  SetOutPath "$INSTDIR\Win11Shell\Assets"
+  File "..\dist-portable\ZipNest\Win11Shell\Assets\*.png"
+
   ; uninstaller
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKCU "${UNINSTKEY}" "DisplayName" "ZipNest"
@@ -51,15 +63,49 @@ Section "Install"
   CreateShortCut "$DESKTOP\ZipNest.lnk" "$INSTDIR\zipnest.exe" "" "$INSTDIR\zipnest.exe" 0
   ; Refresh the shell icon cache so the new shortcut icon shows immediately.
   System::Call "shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)"
+
+  ; Register the Windows 11 context menu (per-user; ignored on Windows 10).
+  Call RegisterWin11Shell
 SectionEnd
 
+; Run the packaged registration only on Windows 11 (build >= 22000). On older
+; Windows the manifest is harmless but the modern menu does not exist, so skip.
+Function RegisterWin11Shell
+  ReadRegStr $0 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "CurrentBuildNumber"
+  IntCmpU $0 22000 do_register do_register skip_register
+do_register:
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Win11Shell\install.ps1" -InstallDir "$INSTDIR" -PackageDir "$INSTDIR\Win11Shell"'
+  Pop $0
+skip_register:
+FunctionEnd
+
+; Remove the per-user package before its files are deleted.
+Function un.UnregisterWin11Shell
+  ReadRegStr $0 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "CurrentBuildNumber"
+  IntCmpU $0 22000 do_unregister do_unregister skip_unregister
+do_unregister:
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Win11Shell\uninstall.ps1"'
+  Pop $0
+skip_unregister:
+FunctionEnd
+
 Section "Uninstall"
+  ; Unregister the per-user package before deleting its manifest/files.
+  Call un.UnregisterWin11Shell
+
   Delete "$INSTDIR\zipnest.exe"
   Delete "$INSTDIR\engines\7z.dll"
   Delete "$INSTDIR\engines\sfx\7z.sfx"
   Delete "$INSTDIR\engines\sfx\7zCon.sfx"
   Delete "$INSTDIR\licenses\7zip.txt"
+  Delete "$INSTDIR\zipnest_shell.dll"
+  Delete "$INSTDIR\Win11Shell\AppxManifest.xml"
+  Delete "$INSTDIR\Win11Shell\install.ps1"
+  Delete "$INSTDIR\Win11Shell\uninstall.ps1"
+  Delete "$INSTDIR\Win11Shell\Assets\*.png"
   Delete "$INSTDIR\uninstall.exe"
+  RMDir "$INSTDIR\Win11Shell\Assets"
+  RMDir "$INSTDIR\Win11Shell"
   RMDir "$INSTDIR\engines\sfx"
   RMDir "$INSTDIR\engines"
   RMDir "$INSTDIR\licenses"

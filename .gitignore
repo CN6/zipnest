@@ -4,6 +4,8 @@
 /.superpowers/
 
 /dist-portable/
+/dist/
 /ZipNest_*.zip
+/packaging/ZipNest_*setup.exe
 
 /ZipNest_*setup.exe
