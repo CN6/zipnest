@@ -1,26 +1,27 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Signs a ZipNest MSIX package.
+    Signs a ZipNest MSIX package and exports the matching public certificate.
 
 .DESCRIPTION
-    Signs ZipNestShell.msix with signtool.
+    Signs ZipNestShell.msix with signtool and writes the public certificate to
+    <CerOut> so the installer can ship and trust it.
 
-    Default (development): uses a self-signed code-signing certificate whose
-    subject matches the manifest Publisher ("CN=ZipNest"). The certificate is
-    created in Cert:\CurrentUser\My and its public key is trusted in
-    Cert:\LocalMachine\TrustedPeople, so `Add-AppxPackage -Path` accepts it on
-    this machine. AppX checks the machine store, so this step needs an elevated
-    shell.
+    Default (self-signed, free): uses a code-signing certificate whose subject
+    matches the manifest Publisher ("CN=ZipNest"). It is created in
+    Cert:\CurrentUser\My and reused on subsequent builds (persistent identity).
+    The installer then imports the public .cer into LocalMachine\TrustedPeople on
+    the user's machine, so distribution needs no purchased certificate and no
+    Developer Mode. Trade-off: the publisher is not recognized by SmartScreen.
 
-    Production: pass -PfxPath/-PfxPassword or -Thumbprint with a CA-issued
-    code-signing certificate. No trust import is performed in that case.
+    Optionally pass -PfxPath/-PfxPassword or -Thumbprint to use a specific
+    certificate.
 
 .PARAMETER Msix
     Path to the .msix to sign.
 
 .PARAMETER PfxPath
-    Optional .pfx of a real code-signing certificate (production).
+    Optional .pfx with a private key (kept secret; not shipped).
 
 .PARAMETER PfxPassword
     Password for -PfxPath.
@@ -30,6 +31,9 @@
 
 .PARAMETER Subject
     Certificate subject to create/look up when none of the above is given.
+
+.PARAMETER CerOut
+    Where to write the public certificate. Default: <msix dir>\ZipNestCodesign.cer.
 #>
 [CmdletBinding()]
 param(
@@ -37,11 +41,13 @@ param(
     [string]$PfxPath,
     [string]$PfxPassword,
     [string]$Thumbprint,
-    [string]$Subject = 'CN=ZipNest'
+    [string]$Subject = 'CN=ZipNest',
+    [string]$CerOut
 )
 
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path -LiteralPath $Msix)) { throw "package not found: $Msix" }
+if (-not $CerOut) { $CerOut = Join-Path (Split-Path -Parent $Msix) 'ZipNestCodesign.cer' }
 
 function Find-SignTool {
     $root = 'C:\Program Files (x86)\Windows Kits\10\bin'
@@ -56,6 +62,8 @@ $signtool = Find-SignTool
 
 if ($PfxPath) {
     if (-not (Test-Path -LiteralPath $PfxPath)) { throw "pfx not found: $PfxPath" }
+    $x = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($PfxPath, $PfxPassword)
+    [System.IO.File]::WriteAllBytes($CerOut, $x.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
     if ($PfxPassword) {
         & $signtool sign /fd SHA256 /f $PfxPath /p $PfxPassword $Msix
     } else {
@@ -63,6 +71,7 @@ if ($PfxPath) {
     }
     if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
     Write-Host "Signed (pfx): $Msix"
+    Write-Host "Public cert: $CerOut"
     return
 }
 
@@ -75,15 +84,14 @@ if (-not $Thumbprint) {
             -CertStoreLocation Cert:\CurrentUser\My -HashAlgorithm SHA256
     }
     $Thumbprint = $cert.Thumbprint
-
-    # Trust the public cert so Add-AppxPackage -Path accepts the package. AppX
-    # checks the machine store; per-user TrustedPeople is not enough (0x800B0109),
-    # so this step needs an elevated shell.
-    $cer = Join-Path $env:TEMP 'zipnest-dev-codesign.cer'
-    Export-Certificate -Cert $cert -FilePath $cer -Force | Out-Null
-    Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+} else {
+    $cert = Get-ChildItem Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
+        Where-Object { $_.Thumbprint -eq $Thumbprint } | Select-Object -First 1
+    if (-not $cert) { throw "certificate $Thumbprint not found in Cert:\CurrentUser\My" }
 }
 
+Export-Certificate -Cert $cert -FilePath $CerOut -Force | Out-Null
 & $signtool sign /fd SHA256 /sha1 $Thumbprint $Msix
 if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
 Write-Host "Signed (thumbprint $Thumbprint): $Msix"
+Write-Host "Public cert: $CerOut"

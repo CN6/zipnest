@@ -20,7 +20,7 @@
 - [ ] exe 已内嵌图标（`ExtractAssociatedIcon` 能读出非空图标）
 - [ ] emit 便携目录 `dist-portable\ZipNest\zipnest.exe` 为最新 release exe
 - [ ] 跑 `packaging\win11-shell\stage-portable.ps1`，确认 `dist-portable\ZipNest\zipnest_shell.dll` 与 `Win11Shell\`（含签名 `ZipNestShell.msix`）为最新（NSIS 打包要用）
-  - 发布必须用**正式证书**：`stage-portable.ps1 -PfxPath <cert>.pfx -PfxPassword <pwd>`；留空则用自签名开发证书（仅本机测试）
+  - 默认用**自签名证书**（免费；安装器会把公钥 `ZipNestCodesign.cer` 导入本机信任库再安装，无需开发者模式）。如需"受信任签名"（消除 SmartScreen 未知发布者）：`stage-portable.ps1 -PfxPath <cert>.pfx -PfxPassword <pwd>`（CA 证书 / SignPath Foundation）
 
 ## 2. 关联/快捷方式（严重，历史教训）
 

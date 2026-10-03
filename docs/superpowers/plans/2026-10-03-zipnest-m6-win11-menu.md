@@ -67,16 +67,18 @@
   卸载时 `Call un.UnregisterWin11Shell` 再删文件。
   - **坑**：NSIS `IntCmpU` 的跳转参数顺序是 `(相等, 小于, 大于)`，别写反（写反会让
     Win11 被判为"不满足"从而跳过注册）。
-- 签名：`packaging/win11-shell/sign-package.ps1`；`build-package.ps1 -Sign` 与
-  `stage-portable.ps1` 会打包并签名。
-  - **开发**：默认自签名证书（Subject `CN=ZipNest`，匹配清单 `Publisher`），公钥需导入
-    **`Cert:\LocalMachine\TrustedPeople`**（AppX 查机器库；只放 CurrentUser 会报
-    `0x800B0109`），需要管理员。之后 `Add-AppxPackage -Path` 会把包**正式 staged**
-    到 WindowsApps，不再依赖开发者模式。
-  - **发布**：用 CA 签发的代码签名证书：
-    `stage-portable.ps1 -PfxPath x.pfx -PfxPassword ***`（或 `-Thumbprint`），无需导入信任库。
+- 签名与分发（**免费自签方案，已落地**）：`packaging/win11-shell/sign-package.ps1`
+  - 用一张固定的自签名证书（Subject `CN=ZipNest`，匹配清单 `Publisher`；私钥留在本机
+    `Cert:\CurrentUser\My` 并复用）给 `msix` 签名，同时导出**公钥** `ZipNestCodesign.cer`。
+  - `stage-portable.ps1`（可带 `-PfxPath`/`-Thumbprint` 换正式证书）产出
+    `dist-portable\ZipNest\Win11Shell\{ZipNestShell.msix, ZipNestCodesign.cer, install.ps1, uninstall.ps1}`。
+  - `install.ps1` 安装时把 `.cer` 导入 **`Cert:\LocalMachine\TrustedPeople`**（AppX 查机器库；
+    只放 CurrentUser 会报 `0x800B0109`；需管理员）→ `Add-AppxPackage -Path`，包被**正式 staged**
+    到 WindowsApps，**无需开发者模式、无需购买证书**。`uninstall.ps1` 反注册并移除该证书。
+  - 代价：自签身份不被 SmartScreen 识别，装 exe 时可能提示"未知发布者"；企业严格策略仍可能拦侧载。
+  - 想升级为"受信任签名"：改用 CA 证书 `-PfxPath x.pfx`，或走 SignPath Foundation（免费 OSS）。
 - `install.ps1` 优先用签名 msix（`-Path`），没有 msix 时才退回松散 `-Register`。
 
 ## 发布前
 
-- 用真实证书跑 `stage-portable.ps1 -PfxPath ...`；其余见 `docs/release-checklist.md`。
+- 跑 `stage-portable.ps1`（默认自签即可分发）；其余见 `docs/release-checklist.md`。

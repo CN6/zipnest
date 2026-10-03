@@ -49,6 +49,16 @@ $manifest = Join-Path $PackageDir 'AppxManifest.xml'
 Get-AppxPackage -Name 'ZipNest.Shell' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue
 
 if (Test-Path -LiteralPath $msix) {
+    # Trust the shipped self-signed certificate (public key only) so the signed
+    # package installs without Developer Mode. Needs an elevated shell.
+    $cer = Join-Path $PackageDir 'ZipNestCodesign.cer'
+    if (Test-Path -LiteralPath $cer) {
+        try {
+            Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+        } catch {
+            throw "Could not trust the signing certificate (administrator required): $($_.Exception.Message)"
+        }
+    }
     Add-AppxPackage -Path $msix -ExternalLocation $InstallDir
     Write-Host 'Registered ZipNest.Shell from the signed package.'
 } elseif (Test-Path -LiteralPath $manifest) {

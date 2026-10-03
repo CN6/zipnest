@@ -40,6 +40,7 @@ Section "Install"
   File "..\dist-portable\ZipNest\zipnest_shell.dll"
   SetOutPath "$INSTDIR\Win11Shell"
   File "..\dist-portable\ZipNest\Win11Shell\ZipNestShell.msix"
+  File "..\dist-portable\ZipNest\Win11Shell\ZipNestCodesign.cer"
   File "..\dist-portable\ZipNest\Win11Shell\install.ps1"
   File "..\dist-portable\ZipNest\Win11Shell\uninstall.ps1"
 
@@ -82,7 +83,7 @@ Function un.UnregisterWin11Shell
   ReadRegStr $0 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "CurrentBuildNumber"
   IntCmpU $0 22000 do_unregister skip_unregister do_unregister
 do_unregister:
-  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Win11Shell\uninstall.ps1"'
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Win11Shell\uninstall.ps1" -PackageDir "$INSTDIR\Win11Shell"'
   Pop $0
 skip_unregister:
 FunctionEnd
@@ -98,6 +99,7 @@ Section "Uninstall"
   Delete "$INSTDIR\licenses\7zip.txt"
   Delete "$INSTDIR\zipnest_shell.dll"
   Delete "$INSTDIR\Win11Shell\ZipNestShell.msix"
+  Delete "$INSTDIR\Win11Shell\ZipNestCodesign.cer"
   Delete "$INSTDIR\Win11Shell\install.ps1"
   Delete "$INSTDIR\Win11Shell\uninstall.ps1"
   Delete "$INSTDIR\uninstall.exe"
