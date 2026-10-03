@@ -17,7 +17,12 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$OutDir
+    [string]$OutDir,
+    # Sign the produced .msix (dev self-signed cert by default; see sign-package.ps1).
+    [switch]$Sign,
+    [string]$PfxPath,
+    [string]$PfxPassword,
+    [string]$Thumbprint
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,6 +63,11 @@ Remove-Item $msix -Force -ErrorAction SilentlyContinue
 $makeappx = Find-MakeAppx
 & $makeappx pack /o /nv /d $stage /p $msix
 if ($LASTEXITCODE -ne 0) { throw "makeappx failed ($LASTEXITCODE)" }
+
+if ($Sign) {
+    & (Join-Path $here 'sign-package.ps1') -Msix $msix -PfxPath $PfxPath -PfxPassword $PfxPassword -Thumbprint $Thumbprint
+    if ($LASTEXITCODE -ne 0) { throw "sign-package failed ($LASTEXITCODE)" }
+}
 
 Write-Host "Built $msix"
 Write-Host "Register with:  .\install.ps1 -InstallDir <app install dir>"

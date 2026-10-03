@@ -19,7 +19,8 @@
   - 检查：PE OptionalHeader.Subsystem == 2（GUI）
 - [ ] exe 已内嵌图标（`ExtractAssociatedIcon` 能读出非空图标）
 - [ ] emit 便携目录 `dist-portable\ZipNest\zipnest.exe` 为最新 release exe
-- [ ] 跑 `packaging\win11-shell\stage-portable.ps1`，确认 `dist-portable\ZipNest\zipnest_shell.dll` 与 `Win11Shell\` 为最新（NSIS 打包要用）
+- [ ] 跑 `packaging\win11-shell\stage-portable.ps1`，确认 `dist-portable\ZipNest\zipnest_shell.dll` 与 `Win11Shell\`（含签名 `ZipNestShell.msix`）为最新（NSIS 打包要用）
+  - 发布必须用**正式证书**：`stage-portable.ps1 -PfxPath <cert>.pfx -PfxPassword <pwd>`；留空则用自签名开发证书（仅本机测试）
 
 ## 2. 关联/快捷方式（严重，历史教训）
 
@@ -33,6 +34,7 @@
 - [ ] 用**发布 exe** 双击/命令行打开一个 `.zip` → 正常打开、无黑色命令框
 - [ ] 打开 `plain.zip` 列表正常
 - [ ] 右键文件夹 → ZipNest → 打开正常（若系统策略拒绝 `*\shell`，属已知降级，不算失败）
+- [ ] Win11：安装后重启资源管理器，**新菜单**出现「添加到压缩包…」（文件/文件夹/空白处），点击打开新建向导并预填路径；卸载后条目消失
 
 ## 4. 自动更新
 

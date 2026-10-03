@@ -33,17 +33,15 @@ Section "Install"
   SetOutPath "$INSTDIR\licenses"
   File "..\dist-portable\ZipNest\licenses\7zip.txt"
 
-  ; Windows 11 modern context menu: per-user sparse package (no HKLM, no cert).
-  ; The DLL and the package manifest live in the install dir; the manifest is
-  ; registered with the install dir as its external location.
+  ; Windows 11 modern context menu: per-user signed sparse package.
+  ; zipnest_shell.dll stays in the install dir (the package's external location);
+  ; the signed Win11Shell\ZipNestShell.msix carries the manifest + assets.
   SetOutPath "$INSTDIR"
   File "..\dist-portable\ZipNest\zipnest_shell.dll"
   SetOutPath "$INSTDIR\Win11Shell"
-  File "..\dist-portable\ZipNest\Win11Shell\AppxManifest.xml"
+  File "..\dist-portable\ZipNest\Win11Shell\ZipNestShell.msix"
   File "..\dist-portable\ZipNest\Win11Shell\install.ps1"
   File "..\dist-portable\ZipNest\Win11Shell\uninstall.ps1"
-  SetOutPath "$INSTDIR\Win11Shell\Assets"
-  File "..\dist-portable\ZipNest\Win11Shell\Assets\*.png"
 
   ; uninstaller
   WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -99,10 +97,9 @@ Section "Uninstall"
   Delete "$INSTDIR\engines\sfx\7zCon.sfx"
   Delete "$INSTDIR\licenses\7zip.txt"
   Delete "$INSTDIR\zipnest_shell.dll"
-  Delete "$INSTDIR\Win11Shell\AppxManifest.xml"
+  Delete "$INSTDIR\Win11Shell\ZipNestShell.msix"
   Delete "$INSTDIR\Win11Shell\install.ps1"
   Delete "$INSTDIR\Win11Shell\uninstall.ps1"
-  Delete "$INSTDIR\Win11Shell\Assets\*.png"
   Delete "$INSTDIR\uninstall.exe"
   ; /r also clears the AppX registration metadata subfolder.
   RMDir /r "$INSTDIR\Win11Shell"
