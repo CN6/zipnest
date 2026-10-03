@@ -7,13 +7,14 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011%20x64-0078D4)](#下载)
 [![Size](https://img.shields.io/badge/%E5%AE%89%E8%A3%85%E5%8C%85-3.6%20MB-success)](#下载)
 
-<!-- ===== 预览图占位：图片放到 docs/images/ 后，把下面整段取消注释 =====
-<p align="center">
-  <img src="docs/images/main-window.png" width="760" alt="ZipNest 主界面">
-</p>
--->
-
 双击压缩包直接打开，就像系统自带的功能一样自然。底层是官方 7-Zip 引擎（`7z.dll` 运行时动态加载），ZIP / 7z / RAR / TAR / GZ / BZ2 / XZ / ISO 一个不落。**全部功能免费，没有任何功能被锁定。**
+
+<p align="center">
+  <img src="docs/images/preview-01.png" width="720" alt="ZipNest 界面预览 1">
+</p>
+<p align="center">
+  <img src="docs/images/preview-02.png" width="720" alt="ZipNest 界面预览 2">
+</p>
 
 ## 你可能受够了这些
 
