@@ -1,0 +1,60 @@
+name: 🐞 Bug 反馈
+description: 安装、解压、右键菜单或界面出问题时用这个模板
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请尽量填完整 —— 信息越全，定位越快。
+        （如果你用的是旧版本，请先到 [最新版](https://github.com/CN6/zipnest/releases/latest) 试一次，可能已经修好了。）
+  - type: input
+    id: version
+    attributes:
+      label: ZipNest 版本
+      description: 安装包文件名或「设置」里能看到，例如 0.4.0
+      placeholder: "0.4.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: package
+    attributes:
+      label: 你用的是哪个包
+      options:
+        - 安装版（setup.exe）
+        - 便携版（portable.zip）
+        - 从源码自己编译的
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      description: 例如 Windows 11 24H2 / Windows 10 22H2
+      placeholder: "Windows 11 24H2 (26100)"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 一步一步写，越具体越好
+      placeholder: |
+        1. 右键 xxx.zip → 用 ZipNest 解压
+        2. 选择目标文件夹
+        3. 进度到 60% 时卡住不动
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 期望结果 / 实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息（可选）
+      description: 截图可以直接拖进来；压缩包是什么格式、多大也可以写一下
+    validations:
+      required: false

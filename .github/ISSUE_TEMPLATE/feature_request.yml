@@ -1,0 +1,29 @@
+name: 💡 功能建议
+description: 想要新功能，或觉得某个地方可以做得更好
+title: "[建议] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提之前可以先看下 [功能](https://github.com/CN6/zipnest#功能) 一节，确认不是已经有的功能。
+  - type: textarea
+    id: scene
+    attributes:
+      label: 你的场景 / 觉得别扭的地方
+      description: 说场景比直接说方案更有用：你现在是怎么做的？
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你希望它怎么工作（可选）
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: 你用的 ZipNest 版本（可选）
+      placeholder: "0.4.0"
+    validations:
+      required: false

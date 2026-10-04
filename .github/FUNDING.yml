@@ -1,0 +1,6 @@
+# 仓库页顶部「Sponsor」按钮的链接来源。
+#
+# 注意：GitHub Sponsors 目前无法在中国大陆收款，所以这里用 custom 指向
+# README 里的收款码章节。以后如果你有了自己的捐赠页，把下面换成新链接即可
+# （最多可以写 4 个链接）。
+custom: ["https://github.com/CN6/zipnest#支持我们"]

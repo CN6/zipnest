@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 下载最新版本
+    url: https://github.com/CN6/zipnest/releases/latest
+    about: 报问题前请先升级到最新版，旧版本的问题可能已经修好了。
+  - name: 支持开发（打赏）
+    url: https://github.com/CN6/zipnest#支持我们
+    about: 这个软件完全免费、无广告，愿意支持的话可以看这里。
