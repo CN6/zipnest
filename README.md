@@ -69,7 +69,18 @@
 
 ## 支持我们
 
-ZipNest 完全免费。如果你觉得它有用，打开软件 **设置 →「支持我们」**，扫微信 / 支付宝收款码即可。每份支持都会让我们有动力继续维护。
+ZipNest 完全免费，没有任何功能被锁，也没有广告和会员。如果它帮你省了时间，欢迎请作者喝杯咖啡 —— **完全自愿，不捐也照样能用全部功能**。
+
+<!-- 收款码与软件内「设置 → 支持我们」用的是同一对图片 -->
+<p align="center">
+  <a href="apps/zipnest-native/src/assets/donate/wechat.jpg"><img src="apps/zipnest-native/src/assets/donate/wechat.jpg" width="300" alt="微信收款码"></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="apps/zipnest-native/src/assets/donate/alipay.jpg"><img src="apps/zipnest-native/src/assets/donate/alipay.jpg" width="300" alt="支付宝收款码"></a>
+</p>
+
+<p align="center"><sub>左：微信 &nbsp;·&nbsp; 右：支付宝 &nbsp;（点图片可看大图，手机端可长按识别）</sub></p>
+
+也可以在软件里捐：打开 ZipNest → **设置 →「支持我们」**。
 
 ## 反馈
 
