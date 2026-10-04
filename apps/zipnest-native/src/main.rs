@@ -21,9 +21,9 @@ const DESIGN_WIDTH: f32 = 900.0;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.3.7";
+const CURRENT_VERSION: &str = "0.3.8";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.3.7";
+const UPDATE_UA: &str = "ZipNest-Updater/0.3.8";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
 
 #[derive(Clone, Default)]
@@ -189,20 +189,31 @@ fn main() -> Result<(), eframe::Error> {
     // Single instance. Explorer starts a new process for every double-click and
     // every context-menu command, so without this a second right-click while a
     // window is open stacks a second window instead of reusing the first one.
-    // The later process hands its request to the running window and exits.
-    // `--new-instance` opts out for callers that really want a second window.
+    //
+    // The running window is the reuse target — unless it is busy: while it is
+    // extracting, a new request opens its own window instead of queueing behind
+    // the job, so both can make progress. `--new-instance` opts out entirely.
     let force_new_instance = args.iter().any(|a| a == "--new-instance");
-    if !force_new_instance && single_instance::claim().is_none() {
-        let request = if let Some(path) = launch_open.clone() {
-            Some(single_instance::LaunchRequest::Open(path))
-        } else if launch_add.is_empty() {
-            None
+    let request = if let Some(path) = launch_open.clone() {
+        Some(single_instance::LaunchRequest::Open(path))
+    } else if launch_add.is_empty() {
+        None
+    } else {
+        Some(single_instance::LaunchRequest::Add(launch_add.clone()))
+    };
+    let mut is_primary = false;
+    if !force_new_instance {
+        if single_instance::claim().is_none() {
+            // Nothing to ask for (or the window is idle): hand it over and go.
+            // A bare second launch only raises the window, busy or not.
+            if request.is_none() || !single_instance::is_busy() {
+                let _ = single_instance::enqueue(request.as_ref());
+                single_instance::focus_existing();
+                return Ok(());
+            }
         } else {
-            Some(single_instance::LaunchRequest::Add(launch_add.clone()))
-        };
-        let _ = single_instance::enqueue(request.as_ref());
-        single_instance::focus_existing();
-        return Ok(());
+            is_primary = true;
+        }
     }
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([DESIGN_WIDTH, 620.0])
@@ -219,7 +230,7 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "ZipNest",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, launch_open, launch_add)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, launch_open, launch_add, is_primary)))),
     )
 }
 
@@ -232,6 +243,18 @@ struct App {
     /// Archive a later launch asked for while a job was running; opened once
     /// the job lets go of the archive.
     pending_open: Option<String>,
+    /// This window is the one later launches hand their requests to.
+    is_primary: bool,
+    /// Last published busy-marker state; `None` forces one write on becoming
+    /// primary so a marker left by a crash cannot make us look busy.
+    published_busy: Option<bool>,
+    /// The window exists for a shell request, so it should disappear once its
+    /// job is done instead of lingering.
+    auto_close: bool,
+    /// When to close after a finished job (short delay so the result is read).
+    close_at: Option<std::time::Instant>,
+    /// Next attempt to take the primary role once the current holder is gone.
+    primary_retry_at: std::time::Instant,
     archive: Option<zipnest_ipc::OpenArchiveResult>,
     archive_path: String,
     cwd: String,
@@ -278,12 +301,14 @@ fn new(
         cc: &eframe::CreationContext<'_>,
         launch_open: Option<String>,
         launch_add: Vec<String>,
+        is_primary: bool,
     ) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
         let mut app = Self::init(cc);
         app.launch_open = launch_open;
         app.launch_add = launch_add;
+        app.is_primary = is_primary;
         app
     }
 
@@ -346,6 +371,11 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             launch_open: None,
             launch_add: Vec::new(),
             pending_open: None,
+            is_primary: false,
+            published_busy: None,
+            auto_close: false,
+            close_at: None,
+            primary_retry_at: std::time::Instant::now(),
             archive: None,
             archive_path: String::new(),
             cwd: String::new(),
@@ -447,6 +477,7 @@ fn t(&self, key: &str) -> String {
                         j.error_key = err_key.clone();
                         j.skipped = skipped;
                     }
+                    let cancelled = !ok && err_key.as_deref() == Some("error.cancelled");
                     if ok {
                         self.notice =
                             Some(if skipped > 0 { "job.ok_skipped" } else { "job.ok" }.into());
@@ -457,6 +488,14 @@ fn t(&self, key: &str) -> String {
                         self.notice = Some(key.clone());
                         // Pop a dialog so a failure is never missed.
                         self.error = Some(self.t(&key));
+                    }
+                    // Done or cancelled: a window that was only here for the
+                    // task disappears. A real failure stays open so its dialog
+                    // can be read (and retried).
+                    if self.auto_close && (ok || cancelled) {
+                        self.close_at = Some(
+                            std::time::Instant::now() + std::time::Duration::from_secs(2),
+                        );
                     }
                     self.extract_skipped = 0;
                 }
@@ -483,6 +522,9 @@ fn t(&self, key: &str) -> String {
     /// Act on a launch request — our own command line, or one a later launch
     /// forwarded through the single-instance queue.
     fn apply_launch(&mut self, request: single_instance::LaunchRequest) {
+        // Whoever asked us to do something (Explorer, a shortcut, the command
+        // line) is not here to browse: this window should not outlive the job.
+        self.auto_close = true;
         match request {
             single_instance::LaunchRequest::Open(path) => {
                 if self.job_running() {
@@ -1496,8 +1538,37 @@ impl eframe::App for App {
 fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs();
 
+        // Take the primary role if it is free: the window that holds it is the
+        // one later launches reuse, so an existing window should pick it up
+        // after the previous holder closed instead of forcing a new window.
+        if !self.is_primary && std::time::Instant::now() >= self.primary_retry_at {
+            self.primary_retry_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            if single_instance::claim().is_some() {
+                self.is_primary = true;
+            }
+        }
+        // Publish "busy" on edges only: later launches read the marker to pick
+        // between reusing this window and opening their own.
+        if self.is_primary {
+            let busy_now = self.job_running();
+            if self.published_busy != Some(busy_now) {
+                single_instance::set_busy(busy_now);
+                self.published_busy = Some(busy_now);
+            }
+        }
+        // A window opened for a shell request leaves once its job is over, after
+        // keeping the result on screen long enough to read.
+        if let Some(at) = self.close_at {
+            if std::time::Instant::now() >= at {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+
         // Consume launch intents: our own command line plus anything a later
-        // launch forwarded through the single-instance queue.
+        // launch forwarded through the single-instance queue (only the primary
+        // window owns that queue).
         if let Some(path) = self.launch_open.take() {
             self.apply_launch(single_instance::LaunchRequest::Open(path));
         }
@@ -1505,8 +1576,10 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             let paths = std::mem::take(&mut self.launch_add);
             self.apply_launch(single_instance::LaunchRequest::Add(paths));
         }
-        for request in single_instance::take_queue() {
-            self.apply_launch(request);
+        if self.is_primary {
+            for request in single_instance::take_queue() {
+                self.apply_launch(request);
+            }
         }
         // A request that arrived while a job was running waits for it.
         if !self.job_running() {

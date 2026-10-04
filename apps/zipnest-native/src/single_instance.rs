@@ -112,6 +112,37 @@ pub fn queue_has_items() -> bool {
         .unwrap_or(false)
 }
 
+/// Marker the *primary* window writes while one of its jobs runs.
+///
+/// A later launch reads it to choose between "hand the request to the running
+/// window" and "open another window so both jobs can go at once". Only the
+/// primary publishes it, because only the primary is a reuse target.
+///
+/// Staleness after a crash is harmless: the marker is only consulted while the
+/// single-instance mutex is held, i.e. while that window is alive, and every
+/// window clears it when it takes the primary role with no job running.
+pub fn busy_path() -> PathBuf {
+    queue_path().with_file_name("busy")
+}
+
+/// Publish or clear the busy marker (best effort — never fails the caller).
+pub fn set_busy(busy: bool) {
+    let path = busy_path();
+    if busy {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, "1");
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Is the running (primary) window busy with a job?
+pub fn is_busy() -> bool {
+    busy_path().exists()
+}
+
 // ---------------------------------------------------------------------------
 // Windows: the named mutex and "raise the other window"
 // ---------------------------------------------------------------------------
@@ -241,5 +272,14 @@ mod tests {
             queue.parent(),
             zipnest_ipc::settings::default_path().parent()
         );
+    }
+
+    #[test]
+    fn the_busy_marker_sits_next_to_the_queue() {
+        // Same folder: the uninstaller removes both, and neither can be
+        // confused with the queue file itself.
+        assert_eq!(busy_path().parent(), queue_path().parent());
+        assert_eq!(busy_path().file_name().unwrap(), "busy");
+        assert_ne!(busy_path(), queue_path());
     }
 }
