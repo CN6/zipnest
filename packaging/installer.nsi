@@ -1,9 +1,9 @@
-﻿; ZipNest 0.3.6 native installer (NSIS Unicode)
+﻿; ZipNest 0.3.7 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.3.6"
+!define VERSION "0.3.7"
 ; This installer is a 32-bit process, so plain $PROGRAMFILES would resolve to
 ; "C:\Program Files (x86)" on 64-bit Windows. ZipNest ships as x64, so force
 ; the 64-bit location. InstallDirRegKey below still reads HKCU\...\ZipNest's
@@ -20,7 +20,7 @@ Unicode True
 !define ZN_WIN11_MSG_EN "Windows 11 context menu registration failed. The rest of ZipNest works normally."
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.3.6_x64-setup.exe"
+OutFile "ZipNest_0.3.7_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin

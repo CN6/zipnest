@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod i18n;
+mod single_instance;
 mod theme;
 
 #[cfg(windows)]
@@ -20,9 +21,9 @@ const DESIGN_WIDTH: f32 = 900.0;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.3.6";
+const CURRENT_VERSION: &str = "0.3.7";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.3.6";
+const UPDATE_UA: &str = "ZipNest-Updater/0.3.7";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
 
 #[derive(Clone, Default)]
@@ -185,9 +186,27 @@ fn main() -> Result<(), eframe::Error> {
             }
         }
     }
+    // Single instance. Explorer starts a new process for every double-click and
+    // every context-menu command, so without this a second right-click while a
+    // window is open stacks a second window instead of reusing the first one.
+    // The later process hands its request to the running window and exits.
+    // `--new-instance` opts out for callers that really want a second window.
+    let force_new_instance = args.iter().any(|a| a == "--new-instance");
+    if !force_new_instance && single_instance::claim().is_none() {
+        let request = if let Some(path) = launch_open.clone() {
+            Some(single_instance::LaunchRequest::Open(path))
+        } else if launch_add.is_empty() {
+            None
+        } else {
+            Some(single_instance::LaunchRequest::Add(launch_add.clone()))
+        };
+        let _ = single_instance::enqueue(request.as_ref());
+        single_instance::focus_existing();
+        return Ok(());
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([DESIGN_WIDTH, 620.0])
-        .with_title("ZipNest 解压缩");
+        .with_title(single_instance::WINDOW_TITLE);
     // Same icon embedded in the exe via build.rs: window and taskbar then match
     // the Explorer icon and shortcuts.
     if let Some(icon) = load_app_icon() {
@@ -210,6 +229,9 @@ struct App {
     settings: zipnest_ipc::Settings,
     launch_open: Option<String>,
     launch_add: Vec<String>,
+    /// Archive a later launch asked for while a job was running; opened once
+    /// the job lets go of the archive.
+    pending_open: Option<String>,
     archive: Option<zipnest_ipc::OpenArchiveResult>,
     archive_path: String,
     cwd: String,
@@ -306,12 +328,24 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
                 spawn_update_check(check);
             });
         }
+        // Wake the UI when a later launch leaves a request in the queue: egui
+        // sleeps while the window is idle, so nothing would read it otherwise.
+        {
+            let wake = cc.egui_ctx.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                if single_instance::queue_has_items() {
+                    wake.request_repaint();
+                }
+            });
+        }
         Self {
             ctx,
             svc,
             settings,
             launch_open: None,
             launch_add: Vec::new(),
+            pending_open: None,
             archive: None,
             archive_path: String::new(),
             cwd: String::new(),
@@ -427,6 +461,43 @@ fn t(&self, key: &str) -> String {
                     self.extract_skipped = 0;
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// A heavy job still owns the archive mutex, so opening another archive
+    /// while one runs would block the UI thread until it finishes.
+    fn job_running(&self) -> bool {
+        self.job.as_ref().map(|j| !j.finished).unwrap_or(false)
+    }
+
+    /// The same file reaches us with mixed separators and case depending on who
+    /// launched us (Explorer, a shortcut, the command line).
+    fn same_archive(&self, path: &str) -> bool {
+        fn norm(p: &str) -> String {
+            p.replace('/', "\\").to_lowercase()
+        }
+        !self.archive_path.is_empty() && norm(&self.archive_path) == norm(path)
+    }
+
+    /// Act on a launch request — our own command line, or one a later launch
+    /// forwarded through the single-instance queue.
+    fn apply_launch(&mut self, request: single_instance::LaunchRequest) {
+        match request {
+            single_instance::LaunchRequest::Open(path) => {
+                if self.job_running() {
+                    // Remember it and open it once the job is done.
+                    self.pending_open = Some(path);
+                } else if !self.same_archive(&path) {
+                    self.open_archive(&path);
+                }
+                // Already showing this archive: the caller only wanted the
+                // window raised, so the selection and any open dialog stay.
+            }
+            single_instance::LaunchRequest::Add(paths) => {
+                self.create_sources = paths;
+                self.create_dest = String::new();
+                self.show_create = true;
             }
         }
     }
@@ -1425,15 +1496,23 @@ impl eframe::App for App {
 fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs();
 
-        // Consume launch intents passed on the command line.
+        // Consume launch intents: our own command line plus anything a later
+        // launch forwarded through the single-instance queue.
         if let Some(path) = self.launch_open.take() {
-            self.open_archive(&path);
+            self.apply_launch(single_instance::LaunchRequest::Open(path));
         }
         if !self.launch_add.is_empty() {
-            self.create_sources = self.launch_add.clone();
-            self.create_dest = String::new();
-            self.show_create = true;
-            self.launch_add.clear();
+            let paths = std::mem::take(&mut self.launch_add);
+            self.apply_launch(single_instance::LaunchRequest::Add(paths));
+        }
+        for request in single_instance::take_queue() {
+            self.apply_launch(request);
+        }
+        // A request that arrived while a job was running waits for it.
+        if !self.job_running() {
+            if let Some(path) = self.pending_open.take() {
+                self.open_archive(&path);
+            }
         }
 
         // Drag & drop: files/folders dropped onto the window open the create
