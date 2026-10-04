@@ -1,9 +1,9 @@
-﻿; ZipNest 0.3.8 native installer (NSIS Unicode)
+﻿; ZipNest 0.3.9 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.3.8"
+!define VERSION "0.3.9"
 ; This installer is a 32-bit process, so plain $PROGRAMFILES would resolve to
 ; "C:\Program Files (x86)" on 64-bit Windows. ZipNest ships as x64, so force
 ; the 64-bit location. InstallDirRegKey below still reads HKCU\...\ZipNest's
@@ -18,9 +18,15 @@ Unicode True
 !define ZN_RUNNING_MSG_EN "ZipNest is still running. Please close it, then run setup again."
 !define ZN_WIN11_MSG "Win11 右键菜单注册失败（ZipNest 其余功能正常）。"
 !define ZN_WIN11_MSG_EN "Windows 11 context menu registration failed. The rest of ZipNest works normally."
+; Shown when a file could not be written because something still holds it. The
+; installer no longer lets NSIS pop its own per-file Abort/Retry/Ignore dialog.
+!define ZN_BUSY_MSG "有文件正被占用，没能写入（通常是 ZipNest 还在运行，或杀毒软件正在扫描）。请关闭 ZipNest 后点「重试」。"
+!define ZN_BUSY_MSG_EN "Some files could not be written because they are still in use (ZipNest running, or a virus scan). Close ZipNest, then choose Retry."
+!define ZN_BUSY_GIVEUP_MSG "仍有文件被占用，这次没能更新它们。请关闭 ZipNest（或重启电脑）后重新运行安装包。"
+!define ZN_BUSY_GIVEUP_MSG_EN "Some files are still in use and were not updated. Close ZipNest (or reboot) and run the installer again."
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.3.8_x64-setup.exe"
+OutFile "ZipNest_0.3.9_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -73,7 +79,7 @@ SetCompressor /SOLID lzma
 
   ; Phase 3: still running -- refuse to overwrite its files.
   ${label_prefix}_abort:
-    MessageBox MB_OK|MB_ICONSTOP "${ZN_RUNNING_MSG}$\r$\n$\r$\n${ZN_RUNNING_MSG_EN}"
+    MessageBox MB_OK|MB_ICONSTOP "${ZN_RUNNING_MSG}$\r$\n$\r$\n${ZN_RUNNING_MSG_EN}" /SD IDOK
     Abort
   ${label_prefix}_gone:
 !macroend
@@ -90,6 +96,49 @@ FunctionEnd
 Section "Install"
   ; Close a running ZipNest first, or its exe/dll are locked and writes fail.
   Call CloseRunningZipNest
+
+  ; Updating used to copy straight over the installed files, so any transient
+  ; lock -- the process that just exited, a virus scan, Explorer holding the
+  ; shell extension -- made NSIS show its own "cannot write file" dialog with
+  ; Abort/Retry/Ignore, and one Retry click got past it.
+  ;
+  ; Two changes remove that dialog entirely:
+  ;   1. the old files are removed first with a silent retry loop. `Delete`
+  ;      never prompts (it only sets the error flag), so a lock that clears a
+  ;      moment later is waited out.
+  ;   2. the copy uses `SetOverwrite try`, which skips a file it cannot write
+  ;      WITHOUT any dialog. A skipped file is reported once, at the end, in
+  ;      our own words with a Retry button.
+  SetOverwrite try
+  StrCpy $4 0
+  StrCpy $5 0
+zn_copy_retry:
+  ClearErrors
+  Delete "$INSTDIR\zipnest.exe"
+  Delete "$INSTDIR\zipnest_shell.dll"
+  Delete "$INSTDIR\uninstall.exe"
+  Delete "$INSTDIR\Win11Shell\ZipNestShell.msix"
+  Delete "$INSTDIR\Win11Shell\install.ps1"
+  Delete "$INSTDIR\Win11Shell\uninstall.ps1"
+  Delete "$INSTDIR\Win11Shell\ZipNestCodesign.cer"
+  Delete "$INSTDIR\engines\7z.dll"
+  ; The exe is what a running instance holds; wait for it to really go away
+  ; (taskkill returning is not the same as the file handle being closed).
+  IfFileExists "$INSTDIR\zipnest.exe" 0 zn_copy_rename_dll
+    Sleep 600
+    IntOp $4 $4 + 1
+    IntCmp $4 10 zn_copy_rename_dll zn_copy_retry zn_copy_retry
+
+zn_copy_rename_dll:
+  ; A DLL loaded into Explorer cannot be deleted, but it can be renamed; the
+  ; copy below then writes a fresh one and the leftover goes on the next boot.
+  IfFileExists "$INSTDIR\zipnest_shell.dll" 0 zn_copy_files
+    Delete /REBOOTOK "$INSTDIR\zipnest_shell.old.dll"
+    Rename "$INSTDIR\zipnest_shell.dll" "$INSTDIR\zipnest_shell.old.dll"
+    Delete /REBOOTOK "$INSTDIR\zipnest_shell.old.dll"
+
+zn_copy_files:
+  ClearErrors
   SetOutPath "$INSTDIR"
   File "..\dist-portable\ZipNest\zipnest.exe"
   SetOutPath "$INSTDIR\engines"
@@ -110,6 +159,18 @@ Section "Install"
   File "..\dist-portable\ZipNest\Win11Shell\ZipNestCodesign.cer"
   File "..\dist-portable\ZipNest\Win11Shell\install.ps1"
   File "..\dist-portable\ZipNest\Win11Shell\uninstall.ps1"
+
+  ; Back to normal overwrite behavior for the rest of the install.
+  SetOverwrite on
+  IfErrors 0 zn_copy_ok
+    IntOp $5 $5 + 1
+    IntCmp $5 3 zn_copy_giveup zn_copy_ask zn_copy_giveup
+  zn_copy_ask:
+    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "${ZN_BUSY_MSG}$\r$\n$\r$\n${ZN_BUSY_MSG_EN}" /SD IDCANCEL IDRETRY zn_copy_retry
+    Goto zn_copy_giveup
+  zn_copy_giveup:
+    MessageBox MB_OK|MB_ICONEXCLAMATION "${ZN_BUSY_GIVEUP_MSG}$\r$\n$\r$\n${ZN_BUSY_GIVEUP_MSG_EN}" /SD IDOK
+  zn_copy_ok:
 
   ; uninstaller
   WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -147,7 +208,7 @@ do_register:
   ; only the Win11 modern menu is missing.
   IntCmp $0 0 skip_register win11_register_failed skip_register
 win11_register_failed:
-  MessageBox MB_OK|MB_ICONEXCLAMATION "${ZN_WIN11_MSG}$\r$\n$\r$\n${ZN_WIN11_MSG_EN}"
+  MessageBox MB_OK|MB_ICONEXCLAMATION "${ZN_WIN11_MSG}$\r$\n$\r$\n${ZN_WIN11_MSG_EN}" /SD IDOK
 skip_register:
 FunctionEnd
 
@@ -163,7 +224,7 @@ do_unregister:
   IntCmp $0 0 skip_unregister win11_unregister_failed skip_unregister
 win11_unregister_failed:
   DetailPrint "Win11 右键菜单卸载脚本执行失败（将直接删除文件）"
-  MessageBox MB_OK|MB_ICONEXCLAMATION "${ZN_WIN11_MSG}$\r$\n$\r$\n${ZN_WIN11_MSG_EN}"
+  MessageBox MB_OK|MB_ICONEXCLAMATION "${ZN_WIN11_MSG}$\r$\n$\r$\n${ZN_WIN11_MSG_EN}" /SD IDOK
 skip_unregister:
 FunctionEnd
 
