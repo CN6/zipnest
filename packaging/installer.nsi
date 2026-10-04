@@ -1,4 +1,4 @@
-; ZipNest 0.3.6 native installer (NSIS Unicode)
+﻿; ZipNest 0.3.6 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
@@ -190,17 +190,17 @@ zn_shell_unregistered:
   ; Program files. ClearErrors/IfErrors records whether any file survived
   ; (e.g. a running instance or AV lock) so we can skip the recursive cleanup.
   ClearErrors
-  Delete "$INSTDIR\zipnest.exe" /REBOOTOK
-  Delete "$INSTDIR\uninstall.exe" /REBOOTOK
-  Delete "$INSTDIR\zipnest_shell.dll" /REBOOTOK
-  Delete "$INSTDIR\engines\7z.dll" /REBOOTOK
-  Delete "$INSTDIR\engines\sfx\7z.sfx" /REBOOTOK
-  Delete "$INSTDIR\engines\sfx\7zCon.sfx" /REBOOTOK
-  Delete "$INSTDIR\licenses\7zip.txt" /REBOOTOK
-  Delete "$INSTDIR\Win11Shell\ZipNestShell.msix" /REBOOTOK
-  Delete "$INSTDIR\Win11Shell\ZipNestCodesign.cer" /REBOOTOK
-  Delete "$INSTDIR\Win11Shell\install.ps1" /REBOOTOK
-  Delete "$INSTDIR\Win11Shell\uninstall.ps1" /REBOOTOK
+  Delete /REBOOTOK "$INSTDIR\zipnest.exe"
+  Delete /REBOOTOK "$INSTDIR\uninstall.exe"
+  Delete /REBOOTOK "$INSTDIR\zipnest_shell.dll"
+  Delete /REBOOTOK "$INSTDIR\engines\7z.dll"
+  Delete /REBOOTOK "$INSTDIR\engines\sfx\7z.sfx"
+  Delete /REBOOTOK "$INSTDIR\engines\sfx\7zCon.sfx"
+  Delete /REBOOTOK "$INSTDIR\licenses\7zip.txt"
+  Delete /REBOOTOK "$INSTDIR\Win11Shell\ZipNestShell.msix"
+  Delete /REBOOTOK "$INSTDIR\Win11Shell\ZipNestCodesign.cer"
+  Delete /REBOOTOK "$INSTDIR\Win11Shell\install.ps1"
+  Delete /REBOOTOK "$INSTDIR\Win11Shell\uninstall.ps1"
   IfErrors zn_uninstall_keep_dirs zn_uninstall_drop_dirs
 
 zn_uninstall_keep_dirs:
