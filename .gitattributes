@@ -1,12 +1,4 @@
-# 换行/字节敏感的文件：禁止 Git 做任何文本转换
-# （installer.nsi 依赖开头的 UTF-8 BOM 和 CRLF，被转换过一次就会出问题）
-*.nsi -text
-*.nsh -text
-*.bat -text
-*.cmd -text
-*.ps1 -text
-
-# 二进制文件：不做文本 diff / 合并，避免被当文本处理
+# 二进制文件：不做文本 diff / 合并，避免被当成文本处理
 *.png binary
 *.jpg binary
 *.jpeg binary
@@ -29,6 +21,6 @@
 *.gz binary
 *.xz binary
 
-# 锁文件：不参与 diff（体量大，且改它没意义）
+# 锁文件：不参与 diff（体量大，且手改没意义）
 Cargo.lock -diff
 pnpm-lock.yaml -diff
