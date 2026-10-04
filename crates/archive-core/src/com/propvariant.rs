@@ -31,8 +31,14 @@ pub const ERRFLAGS_IS_NOT_ARC: u32 = 1 << 0;
 pub const ERRFLAGS_HEADERS_ERROR: u32 = 1 << 1;
 pub const ERRFLAGS_ENCRYPTED_HEADERS_ERROR: u32 = 1 << 2;
 
-/// 100ns ticks between 1601-01-01 and 1970-01-01.
-const FILETIME_UNIX_EPOCH_DELTA: u64 = 11_644_473_600_000_000;
+/// 100ns ticks between 1601-01-01 and 1970-01-01:
+/// 11_644_473_600 seconds × 10^7 = 116_444_736_000_000_000.
+///
+/// One digit fewer (11_644_473_600_000_000) is a ten-fold difference and shifts
+/// every timestamp by ~332 years. A round-trip test cannot see that — both ends
+/// use the same constant — so the magnitude is pinned by a test below and by
+/// `mtime_is_a_sane_date` in the engine tests.
+const FILETIME_UNIX_EPOCH_DELTA: u64 = 116_444_736_000_000_000;
 
 /// Longest BSTR (in UTF-16 units) [`PropVariant::take_bstr`] is willing to
 /// believe. Anything larger is a binary payload or a corrupt prefix, not a
@@ -284,5 +290,42 @@ mod tests {
         assert_eq!(pv.vt, VT_EMPTY);
         assert_eq!(pv.data, 0);
         unsafe { pv.clear() };
+    }
+
+    /// 1970-01-01 as a FILETIME, the anchor of every timestamp conversion.
+    const UNIX_EPOCH_AS_FILETIME: u64 = 116_444_736_000_000_000;
+
+    #[test]
+    fn the_epoch_delta_has_the_right_magnitude() {
+        // A missing digit here (11_644_473_600_000_000) is only a factor of ten
+        // and every round-trip test still passes, while every real timestamp
+        // lands ~332 years in the future.
+        assert_eq!(FILETIME_UNIX_EPOCH_DELTA, UNIX_EPOCH_AS_FILETIME);
+        let seconds = FILETIME_UNIX_EPOCH_DELTA / 10_000_000;
+        assert_eq!(seconds, 11_644_473_600, "1601 -> 1970 is 11.64 billion seconds");
+    }
+
+    #[test]
+    fn filetime_converts_to_absolute_wall_clock_time() {
+        // Read side: the Unix epoch itself, and a known later instant.
+        let mut pv = PropVariant::empty();
+        pv.vt = VT_FILETIME;
+        pv.data = UNIX_EPOCH_AS_FILETIME;
+        let t = pv.as_system_time().expect("epoch converts");
+        assert_eq!(t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(), 0);
+
+        // Write side: the same instant must come back out as the same FILETIME.
+        let written = PropVariant::from_filetime(std::time::UNIX_EPOCH);
+        assert_eq!(written.vt, VT_FILETIME);
+        assert_eq!(written.data, UNIX_EPOCH_AS_FILETIME);
+
+        // And a fixed date: 2026-09-30T11:51:53Z, which is what the fixtures say.
+        let known = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_769_113);
+        let round_trip = PropVariant::from_filetime(known);
+        let back = round_trip.as_system_time().expect("converts back");
+        assert_eq!(
+            back.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            1_790_769_113
+        );
     }
 }

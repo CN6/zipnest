@@ -20,10 +20,86 @@ const DESIGN_WIDTH: f32 = 900.0;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+/// Size of the primary display, used to keep a restored window on screen.
+#[cfg(windows)]
+fn screen_size() -> (i32, i32) {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetSystemMetrics(index: i32) -> i32;
+    }
+    // SM_CXSCREEN / SM_CYSCREEN.
+    unsafe { (GetSystemMetrics(0), GetSystemMetrics(1)) }
+}
+
+#[cfg(not(windows))]
+fn screen_size() -> (i32, i32) {
+    (1920, 1080)
+}
+
+/// Format an archive timestamp (Unix ms, UTC) the way Explorer shows it:
+/// local time, minute precision. Windows does the DST-aware conversion, so no
+/// date library is needed.
+fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
+    #[cfg(windows)]
+    {
+        // FILETIME counts 100ns ticks from 1601-01-01.
+        const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
+
+        #[repr(C)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+        #[repr(C)]
+        #[derive(Default)]
+        struct SystemTime {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn FileTimeToLocalFileTime(ft: *const FileTime, out: *mut FileTime) -> i32;
+            fn FileTimeToSystemTime(ft: *const FileTime, out: *mut SystemTime) -> i32;
+        }
+
+        let ticks = ms_since_epoch
+            .checked_mul(10_000)?
+            .checked_add(EPOCH_DIFF_100NS)?;
+        let utc = FileTime {
+            low: ticks as u32,
+            high: (ticks >> 32) as u32,
+        };
+        let mut local = FileTime { low: 0, high: 0 };
+        if unsafe { FileTimeToLocalFileTime(&utc, &mut local) } == 0 {
+            return None;
+        }
+        let mut st = SystemTime::default();
+        if unsafe { FileTimeToSystemTime(&local, &mut st) } == 0 {
+            return None;
+        }
+        Some(format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}",
+            st.year, st.month, st.day, st.hour, st.minute
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = ms_since_epoch;
+        None
+    }
+}
+
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.3.9";
+const CURRENT_VERSION: &str = "0.4.0";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.3.9";
+const UPDATE_UA: &str = "ZipNest-Updater/0.4.0";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
 
 #[derive(Clone, Default)]
@@ -68,7 +144,6 @@ fn open_in_browser(url: &str) {
     // argument before the URL when the URL could be quoted.
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         let _ = std::process::Command::new("cmd")
             .args(["/C", "start", "", url])
             .creation_flags(CREATE_NO_WINDOW)
@@ -215,9 +290,36 @@ fn main() -> Result<(), eframe::Error> {
             is_primary = true;
         }
     }
+    // Read the settings once before the window exists: the saved geometry has
+    // to be applied while the viewport is created, otherwise the window would
+    // visibly jump on the first frame.
+    let saved = zipnest_ipc::SettingsStore::new(zipnest_ipc::settings::default_path())
+        .get()
+        .clone();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([DESIGN_WIDTH, 620.0])
         .with_title(single_instance::WINDOW_TITLE);
+    // Stored geometry is in physical pixels; `ViewportBuilder` wants logical
+    // points, so divide by the monitor DPI scale.
+    let dpi = system_dpi_scale();
+    if let (Some(w), Some(h)) = (saved.window_width, saved.window_height) {
+        viewport = viewport.with_inner_size([
+            physical_to_logical(w as f32, dpi),
+            physical_to_logical(h as f32, dpi),
+        ]);
+    }
+    if let (Some(x), Some(y)) = (saved.window_x, saved.window_y) {
+        // Only trust a position that still lands on a screen: a window restored
+        // off-screen looks exactly like "the app does not start".
+        let (sw, sh) = screen_size();
+        if x >= -8 && y >= -8 && x < sw - 120 && y < sh - 80 {
+            // Physical pixels, so this compares directly with the screen size.
+            viewport = viewport.with_position([
+                physical_to_logical(x as f32, dpi),
+                physical_to_logical(y as f32, dpi),
+            ]);
+        }
+    }
     // Same icon embedded in the exe via build.rs: window and taskbar then match
     // the Explorer icon and shortcuts.
     if let Some(icon) = load_app_icon() {
@@ -255,6 +357,10 @@ struct App {
     close_at: Option<std::time::Instant>,
     /// Next attempt to take the primary role once the current holder is gone.
     primary_retry_at: std::time::Instant,
+    /// Last window geometry written to settings (size + position) and when, so
+    /// dragging the window does not rewrite the settings file every frame.
+    saved_geometry: Option<((u32, u32), (i32, i32))>,
+    geometry_saved_at: Option<std::time::Instant>,
     archive: Option<zipnest_ipc::OpenArchiveResult>,
     archive_path: String,
     cwd: String,
@@ -304,7 +410,6 @@ fn new(
         is_primary: bool,
     ) -> Self {
         theme::install_fonts(&cc.egui_ctx);
-        theme::apply(&cc.egui_ctx);
         let mut app = Self::init(cc);
         app.launch_open = launch_open;
         app.launch_add = launch_add;
@@ -328,6 +433,9 @@ fn new(
             std::time::Duration::from_millis(100),
         ));
         let settings = svc.settings_get().unwrap_or_default();
+        // Theme: light, dark, or whatever the system is set to. Applied here
+        // rather than next to install_fonts because it needs the settings.
+        theme::apply_setting(&cc.egui_ctx, &settings.theme_mode);
         // Clean up a previously downloaded update installer that already ran
         // (it is only needed while the update is being applied).
         let _ = std::fs::remove_file(std::env::temp_dir().join("zipnest-update-setup.exe"));
@@ -376,6 +484,8 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             auto_close: false,
             close_at: None,
             primary_retry_at: std::time::Instant::now(),
+            saved_geometry: None,
+            geometry_saved_at: None,
             archive: None,
             archive_path: String::new(),
             cwd: String::new(),
@@ -431,14 +541,15 @@ fn t(&self, key: &str) -> String {
 
     /// Small "?" that shows a tooltip on hover (help text for wizard fields).
     fn help_hint(&mut self, ui: &mut egui::Ui, text: &str) {
+        let accent = ui.visuals().hyperlink_color;
+        let fill = ui.visuals().widgets.inactive.weak_bg_fill;
+        let stroke = ui.visuals().widgets.inactive.bg_stroke.color;
         let resp = ui.add(
-            egui::Button::new(egui::RichText::new("?")
-                .size(13.0)
-                .color(egui::Color32::from_rgb(0, 103, 192)))
-            .rounding(egui::Rounding::same(9.0))
-            .min_size(egui::vec2(18.0, 18.0))
-            .fill(egui::Color32::from_rgb(238, 242, 248))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(199, 210, 224))),
+            egui::Button::new(egui::RichText::new("?").size(13.0).color(accent))
+                .rounding(egui::Rounding::same(9.0))
+                .min_size(egui::vec2(18.0, 18.0))
+                .fill(fill)
+                .stroke(egui::Stroke::new(1.0, stroke)),
         );
         resp.on_hover_text(text);
     }
@@ -665,7 +776,9 @@ let extract_enabled = self.archive.is_some();
                     egui::RichText::new(self.t("extract.start"))
                         .color(egui::Color32::WHITE),
                 )
-                .fill(egui::Color32::from_rgb(0, 103, 192))
+                // Same accent as every other primary button, so the two blue
+                // buttons match in dark mode too.
+                .fill(ui.visuals().hyperlink_color)
                 .stroke(egui::Stroke::NONE)
                 .rounding(egui::Rounding::same(6.0));
                 if ui
@@ -687,19 +800,28 @@ let extract_enabled = self.archive.is_some();
                 }
                 ui.separator();
                 if let Some(a) = &self.archive {
+                    // The archive *name* is what the user needs to see; the
+                    // format alone ("zip") told them nothing.
+                    let name = std::path::Path::new(&self.archive_path)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| self.archive_path.clone());
                     ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(a.format.clone())
-                                .size(13.0)
-                                .color(egui::Color32::from_rgb(90, 90, 90)),
-                        ),
-                    );
+                        egui::Label::new(egui::RichText::new(name).size(13.0).strong())
+                            .truncate(),
+                    )
+                    .on_hover_text(&self.archive_path);
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(a.format.clone())
+                            .size(11.0)
+                            .color(ui.visuals().weak_text_color()),
+                    ));
                 } else {
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(self.t("browser.empty"))
                                 .size(13.0)
-                                .color(egui::Color32::from_rgb(120, 120, 120)),
+                                .color(ui.visuals().weak_text_color()),
                         ),
                     );
                 }
@@ -723,141 +845,155 @@ let extract_enabled = self.archive.is_some();
         });
     }
 
+    /// Column widths (points) shared by the table header and every row, so the
+    /// two can never drift apart — the old header laid itself out right-to-left
+    /// with ad-hoc paddings while rows used another mechanism, and the lock
+    /// icon was painted at a fixed offset from the row start.
+    const COL_SIZE: f32 = 92.0;
+    const COL_MTIME: f32 = 150.0;
+    const COL_ENC: f32 = 54.0;
+    const ROW_H: f32 = 26.0;
+
     fn browser(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::none()
-            .fill(egui::Color32::from_rgb(255, 255, 255))
-            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-            .rounding(egui::Rounding::same(8.0))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(233, 233, 233)))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(self.t("browser.columns.name"))
-                                .size(12.0)
-                                .strong(),
-                        ),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for (key, pad) in [
-                            (self.t("browser.columns.encrypted"), 0.0),
-                            (self.t("browser.columns.mtime"), 40.0),
-                            (self.t("browser.columns.size"), 20.0),
-                        ] {
-                            ui.add_space(pad);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(key).size(12.0).color(egui::Color32::from_rgb(130, 130, 130)),
+        theme::card(ui, |ui| {
+            let full_w = ui.available_width();
+            let size_x = (full_w - Self::COL_ENC - Self::COL_MTIME - Self::COL_SIZE).max(140.0);
+            let mtime_x = size_x + Self::COL_SIZE;
+            let enc_x = mtime_x + Self::COL_MTIME;
+            let weak = ui.visuals().weak_text_color();
+            let text_color = ui.visuals().text_color();
+            let hairline = ui.visuals().widgets.inactive.bg_stroke.color;
+
+            // ---- header ----
+            let (head, _) = ui.allocate_exact_size(egui::vec2(full_w, 20.0), egui::Sense::hover());
+            {
+                let p = ui.painter();
+                let f = egui::FontId::proportional(12.0);
+                p.text(
+                    egui::pos2(head.left() + 30.0, head.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    self.t("browser.columns.name"),
+                    f.clone(),
+                    weak,
+                );
+                p.text(
+                    egui::pos2(mtime_x - 10.0, head.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    self.t("browser.columns.size"),
+                    f.clone(),
+                    weak,
+                );
+                p.text(
+                    egui::pos2(mtime_x + 2.0, head.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    self.t("browser.columns.mtime"),
+                    f.clone(),
+                    weak,
+                );
+                p.text(
+                    egui::pos2(enc_x + Self::COL_ENC * 0.5, head.center().y),
+                    egui::Align2::CENTER_CENTER,
+                    self.t("browser.columns.encrypted"),
+                    f,
+                    weak,
+                );
+            }
+            let sep_y = ui.cursor().top();
+            ui.painter()
+                .hline(ui.max_rect().x_range(), sep_y, egui::Stroke::new(1.0, hairline));
+            ui.add_space(4.0);
+
+            // ---- rows ----
+            let mut click_dir: Option<String> = None;
+            let mut dbl: Option<String> = None;
+            let mut click_file: Option<String> = None;
+            let rows = self.rows.clone();
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (i, e) in rows.iter().enumerate() {
+                        let selected = self.selected.contains(&e.path);
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(full_w, Self::ROW_H),
+                            egui::Sense::click(),
+                        );
+                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                        // Selection beats hover beats the zebra stripe.
+                        let visuals = ui.visuals();
+                        let bg = if selected {
+                            visuals.selection.bg_fill
+                        } else if resp.hovered() {
+                            visuals.widgets.hovered.weak_bg_fill
+                        } else if i % 2 == 1 {
+                            visuals.faint_bg_color
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
+                        let dark = visuals.dark_mode;
+                        let painter = ui.painter().clone();
+                        painter.rect_filled(rect, egui::Rounding::same(4.0), bg);
+
+                        let icon_rect = egui::Rect::from_min_size(
+                            rect.min + egui::vec2(6.0, 3.0),
+                            egui::vec2(22.0, 20.0),
+                        );
+                        paint_entry_icon(&painter, icon_rect, e, dark);
+
+                        // Name: one line, ellipsised inside its column.
+                        let name_rect = egui::Rect::from_min_max(
+                            egui::pos2(icon_rect.right() + 8.0, rect.top()),
+                            egui::pos2(size_x - 12.0, rect.bottom()),
+                        );
+                        paint_elided(
+                            ui,
+                            name_rect,
+                            &e.name,
+                            egui::FontId::proportional(13.5),
+                            text_color,
+                            egui::Align2::LEFT_CENTER,
+                        );
+
+                        // Size: right-aligned against its column.
+                        if !e.is_dir {
+                            paint_elided(
+                                ui,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(size_x - 10.0, rect.top()),
+                                    egui::pos2(mtime_x - 8.0, rect.bottom()),
                                 ),
+                                &pretty_size(e.size),
+                                egui::FontId::proportional(12.5),
+                                weak,
+                                egui::Align2::RIGHT_CENTER,
                             );
                         }
-                    });
-                });
-                ui.add_space(4.0);
-egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    let mut click_dir: Option<String> = None;
-                    let mut dbl: Option<String> = None;
-                    let mut click_file: Option<String> = None;
-                    let rows = self.rows.clone();
-                    for e in &rows {
-                        let selected = self.selected.contains(&e.path);
-                        let size = if e.is_dir {
-                            String::new()
-                        } else {
-                            pretty_size(e.size)
-                        };
-                        // Row: painted icon + selectable name (no emoji font
-                        // dependency; emoji rendering was removed to avoid the
-                        // glyph-atlas bug, so icons are drawn directly).
-                        let resp = ui.horizontal(|ui| {
-                            let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 20.0), egui::Sense::hover());
-                            let painter = ui.painter();
-                            if e.is_dir {
-                                // amber folder
-                                painter.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        icon_rect.min + egui::vec2(3.0, 5.0),
-                                        egui::vec2(16.0, 12.0),
-                                    ),
-                                    egui::Rounding::same(2.0),
-                                    egui::Color32::from_rgb(236, 184, 70),
-                                );
-                                painter.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        icon_rect.min + egui::vec2(3.0, 3.0),
-                                        egui::vec2(6.0, 3.0),
-                                    ),
-                                    egui::Rounding::same(1.0),
-                                    egui::Color32::from_rgb(236, 184, 70),
-                                );
-                            } else {
-                                // White page with a type-colored accent: tint
-                                // by extension so exe/images/audio never look
-                                // identical. (No emoji font needed.)
-                                let ext = e
-                                    .name
-                                    .rsplit_once('.')
-                                    .map(|(_, s)| s.to_lowercase())
-                                    .unwrap_or_default();
-                                let (accent, label) = entry_accent(&ext);
-                                let page = egui::Rect::from_min_size(
-                                    icon_rect.min + egui::vec2(4.0, 2.0),
-                                    egui::vec2(14.0, 16.0),
-                                );
-                                painter.rect_filled(
-                                    page,
-                                    egui::Rounding::same(2.0),
-                                    egui::Color32::from_rgb(250, 250, 252),
-                                );
-                                painter.rect_stroke(
-                                    page,
-                                    egui::Rounding::same(2.0),
-                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(160, 160, 170)),
-                                );
-                                // colored label chip at top of the page
-                                painter.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        page.min + egui::vec2(2.0, 2.0),
-                                        egui::vec2(10.0, 4.0),
-                                    ),
-                                    egui::Rounding::same(1.0),
-                                    accent,
-                                );
-                                if let Some(txt) = label {
-                                    let f = egui::FontId::proportional(8.0);
-                                    let gc = page.center() + egui::vec2(1.0, 5.0);
-                                    painter.text(
-                                        gc,
-                                        egui::Align2::CENTER_CENTER,
-                                        txt,
-                                        f,
-                                        accent,
-                                    );
-                                }
-                            }
-                            if e.encrypted {
-                                // small red lock at the far right of the row
-                                let lock_c = icon_rect.right_center()
-                                    + egui::vec2(150.0, 0.0);
-                                painter.rect_filled(
-                                    egui::Rect::from_center_size(lock_c, egui::vec2(7.0, 6.0)),
-                                    egui::Rounding::same(1.0),
-                                    egui::Color32::from_rgb(200, 60, 60),
-                                );
-                                painter.circle_stroke(
-                                    lock_c + egui::vec2(0.0, -4.0),
-                                    3.0,
-                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(200, 60, 60)),
-                                );
-                            }
-                            ui.add_space(2.0);
-                            let label = ui.selectable_label(selected, &e.name);
-                            // size column
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(size);
-                            });
-                            label
-                        }).inner;
+
+                        // Modification time: the column existed but was never
+                        // filled in before.
+                        let mtime = e
+                            .mtime_ms
+                            .and_then(format_mtime_local)
+                            .unwrap_or_else(|| "-".to_string());
+                        paint_elided(
+                            ui,
+                            egui::Rect::from_min_max(
+                                egui::pos2(mtime_x + 2.0, rect.top()),
+                                egui::pos2(enc_x - 4.0, rect.bottom()),
+                            ),
+                            &mtime,
+                            egui::FontId::proportional(12.5),
+                            weak,
+                            egui::Align2::LEFT_CENTER,
+                        );
+
+                        if e.encrypted {
+                            paint_lock(
+                                &painter,
+                                egui::pos2(enc_x + Self::COL_ENC * 0.5, rect.center().y),
+                            );
+                        }
+
                         if resp.double_clicked() && e.is_dir {
                             dbl = Some(e.path.clone());
                         } else if resp.clicked() {
@@ -867,7 +1003,6 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                                 click_file = Some(e.path.clone());
                             }
                         }
-                        ui.end_row();
                     }
                     if let Some(d) = dbl.or(click_dir) {
                         self.navigate(&d);
@@ -878,9 +1013,58 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         self.preview_selected();
                     }
                 });
-            });
+        });
     }
 
+    /// Shown when nothing is open. The window has always accepted drops, but
+    /// nothing told the user so — this is that signpost.
+    fn empty_state(&mut self, ui: &mut egui::Ui) {
+        let avail = ui.available_size();
+        let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+        let border = egui::Rect::from_center_size(
+            rect.center(),
+            egui::vec2((rect.width() - 90.0).max(240.0), (rect.height() - 90.0).max(180.0)),
+        );
+        let accent = ui.visuals().hyperlink_color;
+        let weak = ui.visuals().weak_text_color();
+        let text = ui.visuals().text_color();
+        {
+            let painter = ui.painter().clone();
+            dashed_rect(&painter, border, ui.visuals().widgets.inactive.bg_stroke.color);
+            painter.text(
+                border.center() - egui::vec2(0.0, 30.0),
+                egui::Align2::CENTER_CENTER,
+                self.t("browser.drop_title"),
+                egui::FontId::proportional(17.0),
+                text,
+            );
+            painter.text(
+                border.center() - egui::vec2(0.0, 2.0),
+                egui::Align2::CENTER_CENTER,
+                self.t("browser.drop_hint"),
+                egui::FontId::proportional(13.0),
+                weak,
+            );
+        }
+        let button = egui::Rect::from_center_size(
+            border.center() + egui::vec2(0.0, 46.0),
+            egui::vec2(150.0, 34.0),
+        );
+        let clicked = ui
+            .put(
+                button,
+                egui::Button::new(
+                    egui::RichText::new(self.t("app.open")).color(egui::Color32::WHITE),
+                )
+                .fill(accent)
+                .rounding(egui::Rounding::same(6.0))
+                .stroke(egui::Stroke::NONE),
+            )
+            .clicked();
+        if clicked {
+            self.open_picker = true;
+        }
+    }
     fn preview_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading(self.t("preview.title"));
         match &self.preview {
@@ -912,16 +1096,23 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
     fn statusbar(&mut self, ui: &mut egui::Ui) {
         theme::status_bar(ui, |ui| {
             ui.horizontal(|ui| {
+                let status = self.notice_text().unwrap_or_else(|| {
+                    if self.archive.is_none() {
+                        return String::new();
+                    }
+                    // A bare number told the user nothing; say what it counts.
+                    if self.selected.is_empty() {
+                        self.t("browser.count")
+                            .replace("{count}", &self.rows.len().to_string())
+                    } else {
+                        self.t("browser.count_selected")
+                            .replace("{selected}", &self.selected.len().to_string())
+                            .replace("{count}", &self.rows.len().to_string())
+                    }
+                });
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(self.notice_text().unwrap_or_else(|| {
-                            if self.archive.is_some() {
-                                format!("{}", self.rows.len())
-                            } else {
-                                String::new()
-                            }
-                        }))
-                        .color(egui::Color32::from_rgb(110, 110, 110)),
+                        egui::RichText::new(status).color(ui.visuals().weak_text_color()),
                     ),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -943,6 +1134,7 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
 
     fn extract_dialog(&mut self, ctx: &egui::Context) {
         let mut open = self.show_extract;
+        let mut close = false;
         let arch_id = self.archive.as_ref().map(|a| a.id).unwrap_or(0);
         if self.archive.is_none() {
             self.show_extract = false;
@@ -982,7 +1174,12 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ));
             }
             let can = !self.extract_dest.trim().is_empty();
-            if ui.add_enabled(can, egui::Button::new(self.t("extract.start"))).clicked() {
+            let clicked = ui
+                .add_enabled(can, egui::Button::new(self.t("extract.start")))
+                .clicked();
+            // Enter confirms (that is what a dialog is expected to do).
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if clicked || (can && enter) {
                 let dest = self.extract_dest.clone();
                 let on_conflict = if ask {
                     if self.overwrite {
@@ -1019,15 +1216,20 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 self.show_extract = false;
             }
             ui.separator();
-            if ui.button(self.t("extract.cancel")).clicked() {
-                self.show_extract = false;
+            if ui.button(self.t("extract.cancel")).clicked()
+                || ui.input(|i| i.key_pressed(egui::Key::Escape))
+            {
+                close = true;
             }
         });
-        self.show_extract = open && self.job.is_none();
+        // Cancel used to set `show_extract` inside the closure, which the line
+        // below then overwrote — the button did nothing at all.
+        self.show_extract = open && !close && self.job.is_none();
     }
 
     fn create_dialog(&mut self, ctx: &egui::Context) {
         let mut open = self.show_create;
+        let mut close = false;
         let svc = self.svc.clone();
         let t = self.t("create.title");
         egui::Window::new(t).collapsible(false).open(&mut open).show(ctx, |ui| {
@@ -1136,7 +1338,11 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
             }
             ui.separator();
             let can = !self.create_sources.is_empty() && !self.create_dest.trim().is_empty();
-            if ui.add_enabled(can, egui::Button::new(self.t("create.start"))).clicked() {
+            let clicked = ui
+                .add_enabled(can, egui::Button::new(self.t("create.start")))
+                .clicked();
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if clicked || (can && enter) {
                 let volume_bytes = match self.create_volume.as_str() {
                     "off" => None,
                     "10m" => Some(10 * 1024 * 1024),
@@ -1181,121 +1387,178 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                 self.show_create = false;
             }
             ui.separator();
-            if ui.button(self.t("extract.cancel")).clicked() {
-                self.show_create = false;
+            if ui.button(self.t("extract.cancel")).clicked()
+                || ui.input(|i| i.key_pressed(egui::Key::Escape))
+            {
+                close = true;
             }
         });
-        self.show_create = open && self.job.is_none();
+        // Same overwrite-the-flag bug as the extract dialog: Cancel did nothing.
+        self.show_create = open && !close && self.job.is_none();
     }
 
     fn settings_dialog(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
         let svc = self.svc.clone();
+        let mut save = false;
+        let mut close = false;
         egui::Window::new(self.t("settings.title"))
             .collapsible(false)
+            .resizable(false)
+            .default_width(470.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label(self.t("settings.language"));
-                ui.horizontal(|ui| {
-                    for (v, k) in [("system", "settings.language.system"), ("zh-CN", "settings.language.zh"), ("en-US", "settings.language.en")] {
-                        let sel = self.settings.language == v;
-                        if ui.selectable_label(sel, self.t(k)).clicked() {
-                            self.settings.language = v.to_string();
-                        }
-                    }
-                });
-                ui.label(self.t("settings.default_dir"));
-                ui.text_edit_singleline(&mut self.settings.default_extract_dir);
-                if ui.button(self.t("extract.browse")).clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        self.settings.default_extract_dir = dir.to_str().unwrap_or("").to_string();
-                    }
-                }
-                ui.label(self.t("settings.overwrite"));
-                ui.horizontal(|ui| {
-                    // 带语境：明确这是"文件已存在时"的处理方式
-                    ui.label(self.t("settings.overwrite.hint"));
-                    for (v, k) in [("ask", "settings.overwrite.ask"), ("overwrite", "settings.overwrite.overwrite"), ("skip", "settings.overwrite.skip"), ("rename", "settings.overwrite.rename")] {
-                        let sel = self.settings.overwrite_policy == v;
-                        if ui.selectable_label(sel, self.t(k)).clicked() {
-                            self.settings.overwrite_policy = v.to_string();
-                        }
-                    }
-                });
-                ui.label(self.t("settings.ui_zoom"));
-                ui.horizontal(|ui| {
-                    for z in [100u32, 125, 150, 175, 200] {
-                        let sel = self.settings.ui_zoom == z;
-                        if ui.selectable_label(sel, self.t("settings.ui_zoom.percent").replace("{percent}", &z.to_string())).clicked() {
-                            self.settings.ui_zoom = z;
-                            ctx.set_zoom_factor(z as f32 / 100.0);
-                        }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(self.t("settings.max_extract"));
-                    let hint = self.t("settings.max_extract.hint");
-                    self.help_hint(ui, &hint);
-                    let mut mb = self.settings.max_extract_bytes / (1024 * 1024);
-                    if ui.add(egui::DragValue::new(&mut mb).speed(256.0)).changed() {
-                        // Real clamping happens in Settings::apply on the way out.
-                        self.settings.max_extract_bytes = mb.max(1).saturating_mul(1024 * 1024);
-                    }
-                    ui.label("MB");
-                });
-                let update_lbl = self.t("settings.auto_update");
-                ui.checkbox(&mut self.settings.auto_check_update, update_lbl);
-                ui.label(self.t("settings.version"));
-                ui.horizontal(|ui| {
-                    ui.label("v".to_string() + CURRENT_VERSION);
-                });
-                ui.label(self.t("settings.shell.associate"));
-                ui.checkbox(&mut self.settings.associate, "");
-                ui.weak(self.t("settings.shell.assoc_hint"));
-                ui.label(self.t("settings.shell.context_menu"));
-                ui.checkbox(&mut self.settings.context_menu, "");
-                ui.separator();
-                let can = ui.button(self.t("settings.save")).clicked();
-                if can {
-                    let assoc = self.settings.associate;
-                    let menu = self.settings.context_menu;
-                    let exe = std::env::current_exe().unwrap_or_default();
-                    match svc.shell_register(
-                        &exe,
-                        ShellOptions { associate: assoc, context_menu: menu },
-                        &zipnest_ipc::shell::WindowsRegistry,
-                    ) {
-                        Ok(r) => {
-                            // Reflect what the OS actually accepted: a hardened
-                            // machine can deny one menu target and allow the
-                            // others, so the checkboxes must not claim more than
-                            // the registry holds.
-                            self.settings.associate = r.associate;
-                            self.settings.context_menu = r.context_menu;
-                            self.notice = r.warnings.first().cloned();
-                        }
-                        Err(_) => self.notice = Some("error.io".into()),
-                    }
-                    let _ = svc.settings_set(SettingsPatch {
-                        language: Some(self.settings.language.clone()),
-                        default_extract_dir: Some(self.settings.default_extract_dir.clone()),
-                        overwrite_policy: Some(self.settings.overwrite_policy.clone()),
-                        preview_max_bytes: Some(self.settings.preview_max_bytes),
-                        max_extract_bytes: Some(self.settings.max_extract_bytes),
-                        ui_zoom: Some(self.settings.ui_zoom),
-                        auto_check_update: Some(self.settings.auto_check_update),
-                        ..Default::default()
+                theme::dialog_scale(ui);
+                // The body scrolls and the buttons stay put, so adding a setting
+                // can never push them off the bottom edge of the dialog.
+                egui::ScrollArea::vertical()
+                    .max_height(420.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        theme::section(ui, &self.t("settings.section.general"));
+                        ui.horizontal(|ui| {
+                            ui.label(self.t("settings.language"));
+                            for (v, k) in [("system", "settings.language.system"), ("zh-CN", "settings.language.zh"), ("en-US", "settings.language.en")] {
+                                let sel = self.settings.language == v;
+                                if ui.selectable_label(sel, self.t(k)).clicked() {
+                                    self.settings.language = v.to_string();
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(self.t("settings.theme"));
+                            for (v, k) in [("system", "settings.theme.system"), ("light", "settings.theme.light"), ("dark", "settings.theme.dark")] {
+                                let sel = self.settings.theme_mode == v;
+                                if ui.selectable_label(sel, self.t(k)).clicked() {
+                                    self.settings.theme_mode = v.to_string();
+                                    // Apply at once so the choice is visible.
+                                    theme::apply_setting(ctx, v);
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(self.t("settings.ui_zoom"));
+                            for z in [100u32, 125, 150, 175, 200] {
+                                let sel = self.settings.ui_zoom == z;
+                                if ui.selectable_label(sel, self.t("settings.ui_zoom.percent").replace("{percent}", &z.to_string())).clicked() {
+                                    self.settings.ui_zoom = z;
+                                    ctx.set_zoom_factor(z as f32 / 100.0);
+                                }
+                            }
+                        });
+
+                        theme::section(ui, &self.t("settings.section.extract"));
+                        ui.label(self.t("settings.default_dir"));
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.default_extract_dir)
+                                    .desired_width(250.0),
+                            );
+                            if ui.button(self.t("extract.browse")).clicked() {
+                                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                    self.settings.default_extract_dir =
+                                        dir.to_str().unwrap_or("").to_string();
+                                }
+                            }
+                        });
+                        theme::hint(ui, &self.t("settings.default_dir.hint"));
+                        ui.horizontal(|ui| {
+                            // 带语境：明确这是"文件已存在时"的处理方式
+                            ui.label(self.t("settings.overwrite.hint"));
+                            for (v, k) in [("ask", "settings.overwrite.ask"), ("overwrite", "settings.overwrite.overwrite"), ("skip", "settings.overwrite.skip"), ("rename", "settings.overwrite.rename")] {
+                                let sel = self.settings.overwrite_policy == v;
+                                if ui.selectable_label(sel, self.t(k)).clicked() {
+                                    self.settings.overwrite_policy = v.to_string();
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(self.t("settings.max_extract"));
+                            let hint = self.t("settings.max_extract.hint");
+                            self.help_hint(ui, &hint);
+                            let mut mb = self.settings.max_extract_bytes / (1024 * 1024);
+                            if ui.add(egui::DragValue::new(&mut mb).speed(256.0)).changed() {
+                                // Real clamping happens in Settings::apply on the way out.
+                                self.settings.max_extract_bytes = mb.max(1).saturating_mul(1024 * 1024);
+                            }
+                            ui.label("MB");
+                        });
+
+                        theme::section(ui, &self.t("settings.section.integration"));
+                        // The label belongs *in* the checkbox: an empty label left
+                        // a stray ✓ floating above its own text.
+                        let associate_label = self.t("settings.shell.associate");
+                        ui.checkbox(&mut self.settings.associate, associate_label);
+                        theme::hint(ui, &self.t("settings.shell.assoc_hint"));
+                        let menu_label = self.t("settings.shell.context_menu");
+                        ui.checkbox(&mut self.settings.context_menu, menu_label);
+
+                        theme::section(ui, &self.t("settings.section.about"));
+                        let update_label = self.t("settings.auto_update");
+                        ui.checkbox(&mut self.settings.auto_check_update, update_label);
+                        ui.horizontal(|ui| {
+                            ui.label(self.t("settings.version"));
+                            ui.label(egui::RichText::new(format!("v{CURRENT_VERSION}")).strong());
+                        });
                     });
-                    if self.settings.language != "system" {
-                        self.lang = self.settings.language.clone();
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button(self.t("settings.save")).clicked() {
+                        save = true;
                     }
-                    self.show_settings = false;
+                    if ui.button(self.t("extract.cancel")).clicked() {
+                        close = true;
+                    }
+                });
+                // Enter saves, Escape closes — what a dialog is expected to do.
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    save = true;
                 }
-                if ui.button(self.t("extract.cancel")).clicked() {
-                    self.show_settings = false;
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
                 }
             });
-        self.show_settings = open;
+        if close {
+            self.show_settings = false;
+        }
+        if save {
+            let assoc = self.settings.associate;
+            let menu = self.settings.context_menu;
+            let exe = std::env::current_exe().unwrap_or_default();
+            match svc.shell_register(
+                &exe,
+                ShellOptions { associate: assoc, context_menu: menu },
+                &zipnest_ipc::shell::WindowsRegistry,
+            ) {
+                Ok(r) => {
+                    // Reflect what the OS actually accepted: a hardened
+                    // machine can deny one menu target and allow the
+                    // others, so the checkboxes must not claim more than
+                    // the registry holds.
+                    self.settings.associate = r.associate;
+                    self.settings.context_menu = r.context_menu;
+                    self.notice = r.warnings.first().cloned();
+                }
+                Err(_) => self.notice = Some("error.io".into()),
+            }
+            let _ = svc.settings_set(SettingsPatch {
+                language: Some(self.settings.language.clone()),
+                default_extract_dir: Some(self.settings.default_extract_dir.clone()),
+                overwrite_policy: Some(self.settings.overwrite_policy.clone()),
+                preview_max_bytes: Some(self.settings.preview_max_bytes),
+                max_extract_bytes: Some(self.settings.max_extract_bytes),
+                theme_mode: Some(self.settings.theme_mode.clone()),
+                ui_zoom: Some(self.settings.ui_zoom),
+                auto_check_update: Some(self.settings.auto_check_update),
+                ..Default::default()
+            });
+            if self.settings.language != "system" {
+                self.lang = self.settings.language.clone();
+            }
+            self.show_settings = false;
+        } else {
+            self.show_settings = open;
+        }
     }
 
     fn donate_dialog(&mut self, ctx: &egui::Context) {
@@ -1393,7 +1656,7 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                 .collapsible(false)
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    ui.colored_label(egui::Color32::from_rgb(200, 60, 40), err);
+                    ui.colored_label(error_color(ui), err);
                     if ui.button(self.t("extract.cancel")).clicked() {
                         self.error = None;
                     }
@@ -1424,12 +1687,12 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                 if j.finished {
                     if j.ok {
                         ui.colored_label(
-                            egui::Color32::from_rgb(40, 140, 60),
+                            ok_color(ui),
                             self.notice_text().unwrap_or_else(|| self.t("job.ok")),
                         );
                     } else {
                         let k = j.error_key.clone().unwrap_or_else(|| "error.engine".into());
-                        ui.colored_label(egui::Color32::from_rgb(200, 60, 40), self.t(&k));
+                        ui.colored_label(error_color(ui), self.t(&k));
                     }
                     if ui.button(self.t("job.close")).clicked() {
                         close = true;
@@ -1538,6 +1801,38 @@ impl eframe::App for App {
 fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs();
 
+        // Remember the window geometry so the next launch opens where the user
+        // left it. Debounced: dragging fires this every frame, and a maximised
+        // window keeps the last normal size instead of overwriting it.
+        let viewport = ctx.input(|i| i.viewport().clone());
+        if viewport.maximized != Some(true) {
+            if let Some(rect) = viewport.inner_rect {
+                let ppp = ctx.pixels_per_point();
+                let (size, fallback_pos) = physical_geometry(rect, rect.min, ppp);
+                let pos = viewport
+                    .outer_rect
+                    .map(|r| physical_geometry(rect, r.min, ppp).1)
+                    .unwrap_or(fallback_pos);
+                {
+                    let due = self
+                        .geometry_saved_at
+                        .map(|t| t.elapsed().as_secs() >= 2)
+                        .unwrap_or(true);
+                    if self.saved_geometry != Some((size, pos)) && due {
+                        self.saved_geometry = Some((size, pos));
+                        self.geometry_saved_at = Some(std::time::Instant::now());
+                        let _ = self.svc.settings_set(SettingsPatch {
+                            window_width: Some(size.0),
+                            window_height: Some(size.1),
+                            window_x: Some(pos.0),
+                            window_y: Some(pos.1),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+
         // Take the primary role if it is free: the window that holds it is the
         // one later launches reuse, so an existing window should pick it up
         // after the previous holder closed instead of forcing a new window.
@@ -1628,7 +1923,16 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
 egui::CentralPanel::default().show(ctx, |ui| {
             // Browser only — the preview side panel was removed (it showed
             // raw hex/text that users found noisy; not worth the space).
-            self.browser(ui);
+            if self.archive.is_none() {
+                self.empty_state(ui);
+            } else if self.rows.is_empty() {
+                theme::card(ui, |ui| {
+                    ui.add_space(20.0);
+                    ui.vertical_centered(|ui| theme::hint(ui, &self.t("browser.empty_dir")));
+                });
+            } else {
+                self.browser(ui);
+            }
         });
 
         if self.open_picker {
@@ -1660,3 +1964,264 @@ egui::CentralPanel::default().show(ctx, |ui| {
 
 
 
+
+
+// ---------------------------------------------------------------------------
+// Table painting helpers
+// ---------------------------------------------------------------------------
+
+/// Paints the folder / file badge for one row.
+fn paint_entry_icon(p: &egui::Painter, icon_rect: egui::Rect, e: &EntryDto, dark: bool) {
+    if e.is_dir {
+        let amber = egui::Color32::from_rgb(236, 184, 70);
+        p.rect_filled(
+            egui::Rect::from_min_size(icon_rect.min + egui::vec2(3.0, 5.0), egui::vec2(16.0, 12.0)),
+            egui::Rounding::same(2.0),
+            amber,
+        );
+        p.rect_filled(
+            egui::Rect::from_min_size(icon_rect.min + egui::vec2(3.0, 3.0), egui::vec2(6.0, 3.0)),
+            egui::Rounding::same(1.0),
+            amber,
+        );
+        return;
+    }
+    let ext = e
+        .name
+        .rsplit_once('.')
+        .map(|(_, s)| s.to_lowercase())
+        .unwrap_or_default();
+    let (accent, label) = entry_accent(&ext);
+    let page = egui::Rect::from_min_size(icon_rect.min + egui::vec2(4.0, 2.0), egui::vec2(14.0, 16.0));
+    let (fill, outline) = if dark {
+        (
+            egui::Color32::from_rgb(226, 228, 234),
+            egui::Color32::from_rgb(120, 124, 132),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(250, 250, 252),
+            egui::Color32::from_rgb(160, 160, 170),
+        )
+    };
+    p.rect_filled(page, egui::Rounding::same(2.0), fill);
+    p.rect_stroke(page, egui::Rounding::same(2.0), egui::Stroke::new(1.0, outline));
+    p.rect_filled(
+        egui::Rect::from_min_size(page.min + egui::vec2(2.0, 2.0), egui::vec2(10.0, 4.0)),
+        egui::Rounding::same(1.0),
+        accent,
+    );
+    if let Some(txt) = label {
+        p.text(
+            page.center() + egui::vec2(1.0, 5.0),
+            egui::Align2::CENTER_CENTER,
+            txt,
+            egui::FontId::proportional(8.0),
+            accent,
+        );
+    }
+}
+
+/// The little red padlock for encrypted entries, centred in its column.
+fn paint_lock(p: &egui::Painter, center: egui::Pos2) {
+    let red = egui::Color32::from_rgb(200, 60, 60);
+    p.rect_filled(
+        egui::Rect::from_center_size(center, egui::vec2(7.0, 6.0)),
+        egui::Rounding::same(1.0),
+        red,
+    );
+    p.circle_stroke(center + egui::vec2(0.0, -4.0), 3.0, egui::Stroke::new(1.5, red));
+}
+
+/// One line of text inside `rect`, ellipsised when it does not fit.
+fn paint_elided(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    align: egui::Align2,
+) {
+    if text.is_empty() || rect.width() <= 2.0 {
+        return;
+    }
+    let job = egui::text::LayoutJob {
+        text: text.to_string(),
+        sections: vec![egui::text::LayoutSection {
+            leading_space: 0.0,
+            byte_range: 0..text.len(),
+            format: egui::TextFormat {
+                font_id: font,
+                color,
+                ..Default::default()
+            },
+        }],
+        wrap: egui::text::TextWrapping {
+            max_width: rect.width(),
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        },
+        ..Default::default()
+    };
+    let galley = ui.fonts(|f| f.layout_job(job));
+    // `anchor_size` anchors around a point, so pick the point the alignment
+    // refers to (left edge, right edge or centre of the cell).
+    let anchor = if align == egui::Align2::LEFT_CENTER {
+        rect.left_center()
+    } else if align == egui::Align2::RIGHT_CENTER {
+        rect.right_center()
+    } else {
+        rect.center()
+    };
+    let pos = align.anchor_size(anchor, galley.size()).min;
+    ui.painter().galley(pos, galley, color);
+}
+
+/// A dashed rectangle: egui has no dashed stroke, so the edges are drawn as
+/// short segments.
+fn dashed_rect(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.5, color);
+    let (dash, gap) = (7.0_f32, 5.0_f32);
+    for (from, to) in [
+        (rect.left_top(), rect.right_top()),
+        (rect.right_top(), rect.right_bottom()),
+        (rect.right_bottom(), rect.left_bottom()),
+        (rect.left_bottom(), rect.left_top()),
+    ] {
+        let len = (to - from).length();
+        if len <= 0.0 {
+            continue;
+        }
+        let dir = (to - from) / len;
+        let mut t = 0.0;
+        while t < len {
+            let end = (t + dash).min(len);
+            p.line_segment([from + dir * t, from + dir * end], stroke);
+            t = end + gap;
+        }
+    }
+}
+
+/// "Done" green — brightened for dark mode so it stays readable.
+fn ok_color(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(94, 200, 126)
+    } else {
+        egui::Color32::from_rgb(40, 140, 60)
+    }
+}
+
+/// Error red — brightened for dark mode for the same reason.
+fn error_color(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(255, 122, 102)
+    } else {
+        egui::Color32::from_rgb(200, 60, 40)
+    }
+}
+
+/// Window geometry in **physical pixels** — the one unit with no ambiguity.
+///
+/// egui reports points; multiplying by its pixels-per-point gives pixels, which
+/// is also what the OS (`GetSystemMetrics`, `GetWindowRect`) uses. Persisting
+/// points instead made the value depend on the UI zoom: at 125% every launch
+/// stored a window a fifth smaller than reality, and the window shrank on each
+/// start until it hit the minimum size.
+fn physical_geometry(
+    inner: egui::Rect,
+    outer_min: egui::Pos2,
+    pixels_per_point: f32,
+) -> ((u32, u32), (i32, i32)) {
+    let ppp = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    let size = (
+        (inner.width() * ppp).round().max(1.0) as u32,
+        (inner.height() * ppp).round().max(1.0) as u32,
+    );
+    let pos = (
+        (outer_min.x * ppp).round() as i32,
+        (outer_min.y * ppp).round() as i32,
+    );
+    (size, pos)
+}
+
+/// Stored physical pixels -> the logical points `ViewportBuilder` wants,
+/// using the monitor DPI scale.
+fn physical_to_logical(physical: f32, dpi_scale: f32) -> f32 {
+    let scale = if dpi_scale.is_finite() && dpi_scale > 0.0 {
+        dpi_scale
+    } else {
+        1.0
+    };
+    physical / scale
+}
+
+/// DPI scale of the primary monitor, read straight from Windows so the window
+/// can be created at the right size on the very first frame (no visible jump).
+#[cfg(windows)]
+fn system_dpi_scale() -> f32 {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetDpiForSystem() -> u32;
+    }
+    let dpi = unsafe { GetDpiForSystem() };
+    if dpi == 0 {
+        1.0
+    } else {
+        dpi as f32 / 96.0
+    }
+}
+
+#[cfg(not(windows))]
+fn system_dpi_scale() -> f32 {
+    1.0
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::{physical_geometry, physical_to_logical};
+
+    #[test]
+    fn egui_points_become_physical_pixels() {
+        // Measured on a 125%-zoom, 100%-DPI setup: egui reports 720x608 points
+        // while the window really is 900x760 pixels.
+        let inner = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 608.0));
+        let (size, _) = physical_geometry(inner, egui::Pos2::ZERO, 1.25);
+        assert_eq!(size, (900, 760));
+    }
+
+    #[test]
+    fn unzoomed_geometry_is_unchanged() {
+        let inner = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 650.0));
+        let (size, pos) = physical_geometry(inner, egui::pos2(120.0, 80.0), 1.0);
+        assert_eq!(size, (900, 650));
+        assert_eq!(pos, (120, 80));
+    }
+
+    #[test]
+    fn a_broken_scale_does_not_corrupt_the_geometry() {
+        let inner = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        for ppp in [0.0, -1.0, f32::NAN] {
+            assert_eq!(physical_geometry(inner, egui::Pos2::ZERO, ppp).0, (800, 600));
+        }
+        assert_eq!(physical_to_logical(900.0, 1.25), 720.0);
+        for scale in [0.0, -1.0, f32::NAN] {
+            assert_eq!(physical_to_logical(900.0, scale), 900.0);
+        }
+    }
+
+    #[test]
+    fn a_saved_size_round_trips_through_both_conversions() {
+        let inner = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 608.0));
+        let (size, _) = physical_geometry(inner, egui::Pos2::ZERO, 1.25);
+        let logical = (
+            physical_to_logical(size.0 as f32, 1.0),
+            physical_to_logical(size.1 as f32, 1.0),
+        );
+        assert_eq!((logical.0 as u32, logical.1 as u32), size);
+    }
+}

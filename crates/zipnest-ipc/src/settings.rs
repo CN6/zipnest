@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 const LANGUAGES: [&str; 3] = ["system", "zh-CN", "en-US"];
 const OVERWRITE: [&str; 4] = ["ask", "overwrite", "skip", "rename"];
+const THEMES: [&str; 3] = ["system", "light", "dark"];
 
 /// Accepted range for [`Settings::preview_max_bytes`]: 1 KiB ..= 512 MiB.
 const PREVIEW_MAX_BYTES: (u64, u64) = (1024, 512 * 1024 * 1024);
@@ -24,6 +25,12 @@ const EXTRACT_MAX_BYTES: (u64, u64) = (1024 * 1024, 16 * 1024 * 1024 * 1024 * 10
 const DEFAULT_MAX_EXTRACT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// Accepted range for [`Settings::ui_zoom`].
 const UI_ZOOM: (u32, u32) = (100, 200);
+/// Accepted window size in logical points: small enough to stay usable, large
+/// enough for a maximised 4K window.
+const WINDOW_SIZE: (u32, u32) = (760, 20_000);
+/// Accepted window position. Generous because multi-monitor setups legitimately
+/// place windows at negative coordinates.
+const WINDOW_POS: i32 = 32_000;
 
 /// Persisted preferences. Missing fields fall back to [`Default`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +55,14 @@ pub struct Settings {
     pub auto_check_update: bool,
     /// Total uncompressed bytes allowed for a single extract (zip-bomb guard).
     pub max_extract_bytes: u64,
+    /// `"system" | "light" | "dark"`.
+    pub theme_mode: String,
+    /// Last window size in logical points; `None` on the first run.
+    pub window_width: Option<u32>,
+    pub window_height: Option<u32>,
+    /// Last window position; `None` lets the OS place the window.
+    pub window_x: Option<i32>,
+    pub window_y: Option<i32>,
 }
 
 impl Default for Settings {
@@ -62,6 +77,11 @@ impl Default for Settings {
             ui_zoom: 100,
             auto_check_update: true,
             max_extract_bytes: DEFAULT_MAX_EXTRACT_BYTES,
+            theme_mode: "system".into(),
+            window_width: None,
+            window_height: None,
+            window_x: None,
+            window_y: None,
         }
     }
 }
@@ -78,6 +98,11 @@ pub struct SettingsPatch {
     pub ui_zoom: Option<u32>,
     pub auto_check_update: Option<bool>,
     pub max_extract_bytes: Option<u64>,
+    pub theme_mode: Option<String>,
+    pub window_width: Option<u32>,
+    pub window_height: Option<u32>,
+    pub window_x: Option<i32>,
+    pub window_y: Option<i32>,
 }
 
 fn invalid() -> IpcError {
@@ -121,6 +146,24 @@ impl Settings {
         if let Some(v) = patch.max_extract_bytes {
             self.max_extract_bytes = v.clamp(EXTRACT_MAX_BYTES.0, EXTRACT_MAX_BYTES.1);
         }
+        if let Some(v) = patch.theme_mode {
+            if !THEMES.contains(&v.as_str()) {
+                return Err(invalid());
+            }
+            self.theme_mode = v;
+        }
+        if let Some(v) = patch.window_width {
+            self.window_width = Some(v.clamp(WINDOW_SIZE.0, WINDOW_SIZE.1));
+        }
+        if let Some(v) = patch.window_height {
+            self.window_height = Some(v.clamp(WINDOW_SIZE.0, WINDOW_SIZE.1));
+        }
+        if let Some(v) = patch.window_x {
+            self.window_x = Some(v.clamp(-WINDOW_POS, WINDOW_POS));
+        }
+        if let Some(v) = patch.window_y {
+            self.window_y = Some(v.clamp(-WINDOW_POS, WINDOW_POS));
+        }
         Ok(())
     }
 
@@ -133,11 +176,22 @@ impl Settings {
         if !OVERWRITE.contains(&self.overwrite_policy.as_str()) {
             self.overwrite_policy = "ask".into();
         }
+        if !THEMES.contains(&self.theme_mode.as_str()) {
+            self.theme_mode = "system".into();
+        }
         self.preview_max_bytes =
             self.preview_max_bytes.clamp(PREVIEW_MAX_BYTES.0, PREVIEW_MAX_BYTES.1);
         self.ui_zoom = self.ui_zoom.clamp(UI_ZOOM.0, UI_ZOOM.1);
         self.max_extract_bytes =
             self.max_extract_bytes.clamp(EXTRACT_MAX_BYTES.0, EXTRACT_MAX_BYTES.1);
+        self.window_width = self
+            .window_width
+            .map(|v| v.clamp(WINDOW_SIZE.0, WINDOW_SIZE.1));
+        self.window_height = self
+            .window_height
+            .map(|v| v.clamp(WINDOW_SIZE.0, WINDOW_SIZE.1));
+        self.window_x = self.window_x.map(|v| v.clamp(-WINDOW_POS, WINDOW_POS));
+        self.window_y = self.window_y.map(|v| v.clamp(-WINDOW_POS, WINDOW_POS));
     }
 }
 
@@ -446,5 +500,45 @@ mod tests {
         assert_eq!(store.get().language, "zh-CN");
         assert_eq!(store.get().ui_zoom, 120);
         assert_eq!(store.get().max_extract_bytes, Settings::default().max_extract_bytes);
+    }
+
+    #[test]
+    fn theme_and_window_geometry_are_validated() {
+        let mut store = SettingsStore::new(tmp_path());
+        assert_eq!(store.get().theme_mode, "system");
+        assert!(store.get().window_width.is_none());
+        // An unknown theme is rejected outright, like an unknown language.
+        assert!(store
+            .set(SettingsPatch {
+                theme_mode: Some("neon".into()),
+                ..Default::default()
+            })
+            .is_err());
+        store
+            .set(SettingsPatch {
+                theme_mode: Some("dark".into()),
+                window_width: Some(50),       // below the minimum
+                window_height: Some(1200),
+                window_x: Some(-999_999),     // out of range
+                window_y: Some(40),
+                ..Default::default()
+            })
+            .unwrap();
+        let s = store.get();
+        assert_eq!(s.theme_mode, "dark");
+        assert_eq!(s.window_width, Some(WINDOW_SIZE.0));
+        assert_eq!(s.window_height, Some(1200));
+        assert_eq!(s.window_x, Some(-WINDOW_POS));
+        assert_eq!(s.window_y, Some(40));
+    }
+
+    #[test]
+    fn a_dirty_theme_in_the_file_is_repaired() {
+        let path = tmp_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"theme_mode":"klingon","window_width":5}"#).unwrap();
+        let s = SettingsStore::new(path);
+        assert_eq!(s.get().theme_mode, "system");
+        assert_eq!(s.get().window_width, Some(WINDOW_SIZE.0));
     }
 }

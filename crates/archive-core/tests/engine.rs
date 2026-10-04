@@ -522,3 +522,28 @@ fn enumerates_5000_entries_within_budget() {
     let _ = std::fs::remove_dir_all(&work);
     let _ = std::fs::remove_file(&zip);
 }
+/// Timestamps must be a real wall-clock date, not merely internally consistent.
+///
+/// The FILETIME epoch delta once lost a digit, which pushed every timestamp
+/// ~332 years into the future. A round-trip assertion cannot see that (both
+/// ends share the constant), so the absolute value is pinned here. The
+/// 2020..2035 window is timezone-independent — the fixtures were built in 2026.
+#[test]
+fn mtime_is_a_sane_date() {
+    let arc = Archive::open(&fx("plain.zip"), ArchiveOpenOptions::default()).unwrap();
+    let e = arc
+        .entries()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.path == "a.txt")
+        .unwrap();
+    let t = e.mtime.expect("fixture must carry an mtime");
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("post-1970")
+        .as_secs();
+    assert!(
+        (1_577_836_800..1_893_456_000).contains(&secs),
+        "mtime {secs} is not a plausible 2020s date"
+    );
+}
