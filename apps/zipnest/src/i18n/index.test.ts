@@ -17,6 +17,7 @@ const RUST_ERROR_KEYS = [
   "error.quota_exceeded",
   "error.io",
   "error.settings.invalid",
+  "error.shell.dev_path",
   "error.shell.associate",
   "error.shell.file_menu",
   "error.shell.directory_menu",

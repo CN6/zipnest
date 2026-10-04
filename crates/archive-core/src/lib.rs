@@ -22,5 +22,5 @@ pub use error::{map_hresult, ZipnestError};
 pub use types::{
     ArchiveEntry, ArchiveOpenOptions, CompressionLevel, CompressionMethod, CreateFormat,
     CreateOptions, CreateProgress, CreateSource, CreateStats, ExtractOptions, ExtractProgress,
-    ExtractStats, SfxKind,
+    ExtractStats, OnConflict, SfxKind,
 };

@@ -1,4 +1,4 @@
-﻿//! `IArchiveOpenCallback` + `ICryptoGetTextPassword` pair passed to
+//! `IArchiveOpenCallback` + `ICryptoGetTextPassword` pair passed to
 //! `IInArchive::Open`.
 //!
 //! Two independently refcounted objects share one `Arc<OpenState>` because
@@ -33,6 +33,23 @@ pub struct OpenState {
     /// File name of the first volume (e.g. `vol.7z.001`), reported through
     /// `IArchiveOpenVolumeCallback::GetProperty(kpidName)`.
     pub volume_name: String,
+    /// First *real* I/O failure seen while resolving a sibling volume (sharing
+    /// violation, ACL denial, unreadable file — anything but "not found").
+    /// `GetStream` reports those as `E_FAIL`; the open path turns this into the
+    /// user-visible error instead of opening a silently short archive.
+    pub io_error: std::sync::Mutex<Option<std::io::Error>>,
+}
+
+/// Remember the first I/O failure of a volume lookup; later ones are reported
+/// with the same `E_FAIL` but do not overwrite the original cause.
+fn record_volume_io_error(state: &OpenState, e: std::io::Error) {
+    let mut slot = match state.io_error.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if slot.is_none() {
+        *slot = Some(e);
+    }
 }
 
 #[repr(C)]
@@ -276,8 +293,14 @@ unsafe extern "system" fn volume_get_property(
     }
 }
 
-/// Open a sibling volume by name in the first volume's directory. A missing
-/// file yields `S_FALSE`, which tells the `Split` handler the sequence ended.
+/// Open a sibling volume by name in the first volume's directory.
+///
+/// Only a volume that does *not exist* yields `S_FALSE` (the `Split` handler
+/// reads that as "the sequence ends here"). Every other failure — sharing
+/// violation, ACL denial, unreadable file — is recorded in `OpenState::io_error`
+/// and reported as `E_FAIL`: answering `S_FALSE` there would let the handler
+/// treat a truncated concatenation as a complete archive and open a short
+/// archive without any error.
 unsafe extern "system" fn volume_get_stream(
     this: *mut c_void,
     name: *const u16,
@@ -286,18 +309,28 @@ unsafe extern "system" fn volume_get_stream(
     if name.is_null() || in_stream.is_null() {
         return E_FAIL;
     }
+    *in_stream = std::ptr::null_mut();
     let obj: &VolumeCallback = &*(this as *mut VolumeCallback);
+    // The engine hands us a NUL-terminated string, but the scan is bounded so a
+    // malformed pointer can never walk off the end of the process.
+    const MAX_NAME_UNITS: usize = 32768;
     let mut len = 0usize;
-    while *name.add(len) != 0 {
+    while len < MAX_NAME_UNITS && *name.add(len) != 0 {
         len += 1;
+    }
+    if len == MAX_NAME_UNITS {
+        return E_FAIL;
     }
     let file_name = String::from_utf16_lossy(std::slice::from_raw_parts(name, len));
     let path = obj.state.volume_dir.join(file_name);
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
-        Err(_) => {
-            *in_stream = std::ptr::null_mut();
-            return S_FALSE;
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return S_FALSE;
+            }
+            record_volume_io_error(&obj.state, e);
+            return E_FAIL;
         }
     };
     match FileStreamOwner::new(file) {
@@ -306,9 +339,11 @@ unsafe extern "system" fn volume_get_stream(
             *in_stream = owner.into_raw();
             S_OK
         }
-        Err(_) => {
-            *in_stream = std::ptr::null_mut();
-            S_FALSE
+        Err(e) => {
+            // Unreachable today (the constructor cannot fail), but a local
+            // failure is not "volume missing" either.
+            record_volume_io_error(&obj.state, e);
+            E_FAIL
         }
     }
 }
@@ -419,6 +454,7 @@ pub(crate) fn crypto_new(password: Option<String>) -> *mut CryptoPair {
         asked: std::sync::atomic::AtomicU8::new(0),
         volume_dir: PathBuf::new(),
         volume_name: String::new(),
+        io_error: std::sync::Mutex::new(None),
     });
     let v1 = Box::into_raw(Box::new(CryptoCallback {
         obj: ComObject { vt: &CRYPTO_VT },
@@ -503,6 +539,7 @@ impl OpenCallbackOwner {
             asked: std::sync::atomic::AtomicU8::new(0),
             volume_dir,
             volume_name,
+            io_error: std::sync::Mutex::new(None),
         });
         let crypto = Box::new(CryptoCallback {
             obj: ComObject { vt: &CRYPTO_VT },
@@ -570,6 +607,98 @@ impl Drop for OpenCallbackOwner {
                 (VOLUME_VT.release)(self.volume as *mut c_void);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::com::vtables::InStreamVt;
+
+    fn name_units(name: &str) -> Vec<u16> {
+        name.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Ask the open callback for its volume interface and call `GetStream` on
+    /// it, exactly like the engine's `Split` handler does.
+    unsafe fn volume_get_stream_via_qi(
+        owner: &OpenCallbackOwner,
+        name: &[u16],
+    ) -> (Hresult, *mut c_void) {
+        let open = owner.as_void();
+        let mut volume: *mut c_void = std::ptr::null_mut();
+        let open_vt = &**(open as *const *const ArchiveOpenCallbackVt);
+        let hr = (open_vt.query_interface)(open, &IID_IARCHIVE_OPEN_VOLUME_CALLBACK, &mut volume);
+        assert_eq!(hr, S_OK);
+        let vol_vt = &**(volume as *const *const OpenVolumeCallbackVt);
+        let mut stream: *mut c_void = std::ptr::null_mut();
+        let hr = (vol_vt.get_stream)(volume, name.as_ptr(), &mut stream);
+        (vol_vt.release)(volume);
+        (hr, stream)
+    }
+
+    unsafe fn release_stream(stream: *mut c_void) {
+        let vt = &**(stream as *const *const InStreamVt);
+        (vt.release)(stream);
+    }
+
+    #[test]
+    fn volume_get_stream_reports_s_false_only_for_a_missing_volume() {
+        let dir = std::env::temp_dir().join(format!("zn-callbacks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vol.7z.002"), b"second volume").unwrap();
+
+        let owner = OpenCallbackOwner::new(None, dir.clone(), "vol.7z.001".to_string(), true);
+        unsafe {
+            // An existing sibling volume yields a live stream.
+            let (hr, stream) = volume_get_stream_via_qi(&owner, &name_units("vol.7z.002"));
+            assert_eq!(hr, S_OK);
+            assert!(!stream.is_null());
+            release_stream(stream);
+
+            // An absent volume is the one case that means "sequence ends here".
+            let (hr, stream) = volume_get_stream_via_qi(&owner, &name_units("vol.7z.003"));
+            assert_eq!(hr, S_FALSE);
+            assert!(stream.is_null());
+        }
+        assert!(
+            owner.state().io_error.lock().unwrap().is_none(),
+            "a missing volume is not an I/O failure"
+        );
+
+        unsafe {
+            // Present but unreadable (opening a directory fails on Windows)
+            // must be reported as a real error and recorded, never as S_FALSE:
+            // S_FALSE would truncate the archive silently.
+            let (hr, stream) = volume_get_stream_via_qi(&owner, &name_units("."));
+            assert_eq!(hr, E_FAIL);
+            assert!(stream.is_null());
+        }
+        assert!(owner.state().io_error.lock().unwrap().is_some());
+
+        drop(owner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn volume_get_stream_rejects_an_unterminated_engine_name() {
+        let dir = std::env::temp_dir().join(format!("zn-callbacks-long-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let owner = OpenCallbackOwner::new(None, dir.clone(), "vol.7z.001".to_string(), true);
+        // No NUL terminator anywhere: the bounded scan must give up instead of
+        // reading past the end of the buffer.
+        let name = vec![b'x' as u16; 32768];
+        unsafe {
+            let (hr, stream) = volume_get_stream_via_qi(&owner, &name);
+            assert_eq!(hr, E_FAIL);
+            assert!(stream.is_null());
+        }
+
+        drop(owner);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

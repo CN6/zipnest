@@ -34,6 +34,11 @@ pub const ERRFLAGS_ENCRYPTED_HEADERS_ERROR: u32 = 1 << 2;
 /// 100ns ticks between 1601-01-01 and 1970-01-01.
 const FILETIME_UNIX_EPOCH_DELTA: u64 = 11_644_473_600_000_000;
 
+/// Longest BSTR (in UTF-16 units) [`PropVariant::take_bstr`] is willing to
+/// believe. Anything larger is a binary payload or a corrupt prefix, not a
+/// property string.
+const MAX_BSTR_UNITS: usize = 65536;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PropVariant {
@@ -88,6 +93,14 @@ impl PropVariant {
     }
 
     /// VT_BSTR → owned UTF-16 string, freeing the engine-allocated BSTR.
+    ///
+    /// The BSTR length prefix is not trusted: 7-Zip also passes binary payloads
+    /// through `VT_BSTR` (`kClassID` / `kSignature` in
+    /// `vendor/7zip-sdk/Archive/IArchive.h`), so a zero or absurd prefix means
+    /// the pointer must not be sliced and must never reach `SysFreeString`.
+    /// Such a value is dropped unread (the engine's allocation leaks rather than
+    /// risking the heap) and the variant is left `VT_EMPTY`, which keeps
+    /// [`PropVariant::clear`] a no-op on the way out.
     pub unsafe fn take_bstr(&mut self) -> Option<String> {
         if self.vt != VT_BSTR || self.data == 0 {
             return None;
@@ -96,6 +109,11 @@ impl PropVariant {
         // BSTR length prefix lives at ptr-4 (byte length); use it, then NUL-terminate fallback.
         let byte_len = *(ptr.wrapping_sub(2) as *const u32) as usize;
         let n_units = byte_len / 2;
+        if n_units == 0 || n_units > MAX_BSTR_UNITS {
+            self.vt = VT_EMPTY;
+            self.data = 0;
+            return None;
+        }
         let slice = std::slice::from_raw_parts(ptr, n_units);
         let s = String::from_utf16_lossy(slice);
         sys_free_string(ptr);
@@ -215,3 +233,56 @@ fn sys_alloc_string(wide: &[u16]) -> *mut u16 {
 
 /// `VariantClear` equivalent for a `*mut c_void` payload we no longer need.
 pub fn _unused(_: *mut c_void) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fake `VT_BSTR` whose length prefix claims `claimed_units` UTF-16
+    /// units while the allocation only holds `payload`. The prefix lives in the
+    /// same allocation at `ptr - 2`, exactly like a real BSTR.
+    ///
+    /// Only the rejection paths may be exercised this way: they must not call
+    /// `SysFreeString`, and the test would crash if they did.
+    fn fake_bstr(payload: usize, claimed_units: usize) -> (Vec<u16>, PropVariant) {
+        let mut buf: Vec<u16> = vec![0u16; payload.max(1) + 2];
+        let ptr = unsafe { buf.as_mut_ptr().add(2) };
+        unsafe { *(ptr.wrapping_sub(2) as *mut u32) = (claimed_units * 2) as u32 };
+        let pv = PropVariant {
+            vt: VT_BSTR,
+            data: ptr as u64,
+            ..PropVariant::empty()
+        };
+        (buf, pv)
+    }
+
+    #[test]
+    fn take_bstr_ignores_a_non_bstr_variant() {
+        let mut pv = PropVariant::from_u64(7);
+        assert!(unsafe { pv.take_bstr() }.is_none());
+        assert_eq!(pv.vt, VT_UI8);
+        assert!(unsafe { PropVariant::empty().take_bstr() }.is_none());
+    }
+
+    #[test]
+    fn take_bstr_rejects_a_zero_length_prefix() {
+        let (_buf, mut pv) = fake_bstr(4, 0);
+        assert!(unsafe { pv.take_bstr() }.is_none());
+        assert_eq!(pv.vt, VT_EMPTY);
+        assert_eq!(pv.data, 0);
+        // `clear()` must stay a no-op: no second free of the untrusted pointer.
+        unsafe { pv.clear() };
+    }
+
+    #[test]
+    fn take_bstr_rejects_an_oversized_length_prefix() {
+        let (_buf, mut pv) = fake_bstr(4, MAX_BSTR_UNITS + 1);
+        assert!(
+            unsafe { pv.take_bstr() }.is_none(),
+            "an absurd prefix must not be sliced"
+        );
+        assert_eq!(pv.vt, VT_EMPTY);
+        assert_eq!(pv.data, 0);
+        unsafe { pv.clear() };
+    }
+}

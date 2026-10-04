@@ -166,6 +166,41 @@ fn children_of<'a>(entries: &'a [ArchiveEntry], dir: &str) -> Vec<&'a ArchiveEnt
         .collect()
 }
 
+/// Expand the UI's selection into the engine's index list.
+///
+/// A selected directory contributes its subtree *and* the directory entry
+/// itself, so empty folders land on disk. An empty selection means "the whole
+/// archive". Directory membership is looked up in a set instead of rescanning
+/// every entry once per selection (that inner scan made selecting a big
+/// archive quadratic in the entry count). The result is sorted and deduped.
+fn select_entries(entries: &[ArchiveEntry], paths: &[String]) -> Vec<u32> {
+    fn norm(s: &str) -> String {
+        s.replace('\\', "/").trim_end_matches('/').to_string()
+    }
+    let selection: Vec<String> = paths.iter().map(|p| norm(p)).collect();
+    let mut wanted: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    if selection.is_empty() || selection.iter().any(|s| s.is_empty()) {
+        wanted.extend(entries.iter().map(|e| e.index));
+        return wanted.into_iter().collect();
+    }
+    let dirs: std::collections::HashSet<String> = entries
+        .iter()
+        .filter(|e| e.is_dir)
+        .map(|e| norm(&e.path))
+        .collect();
+    let selected: std::collections::HashSet<&str> = selection.iter().map(|s| s.as_str()).collect();
+    for e in entries {
+        let path = norm(&e.path);
+        let inside_selected_dir = selected.iter().any(|sel| {
+            dirs.contains(*sel) && path.strip_prefix(sel).is_some_and(|rest| rest.starts_with('/'))
+        });
+        if selected.contains(path.as_str()) || inside_selected_dir {
+            wanted.insert(e.index);
+        }
+    }
+    wanted.into_iter().collect()
+}
+
 /// `emit(event_name, json_payload)` — thread-safe callback the glue layer
 /// wires to Tauri events (tests wire a recorder).
 pub type Emit = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
@@ -369,12 +404,17 @@ impl IpcService {
     /// The runner holds the archive's mutex for the whole extraction —
     /// other commands on the same archive wait (single-archive-at-a-time
     /// is the M2 model; the UI only ever has one heavy job running).
+    ///
+    /// `on_conflict` carries the user's conflict policy (`"overwrite" | "skip" |
+    /// "rename"`); `"ask"` is resolved by the UI before calling and unknown
+    /// values fall back to overwriting. The zip-bomb guard is read from
+    /// settings here because the job closure runs on a worker thread.
     pub fn extract(
         &self,
         id: u64,
         paths: Vec<String>,
         dest: String,
-        overwrite: bool,
+        on_conflict: Option<String>,
         password: Option<String>,
     ) -> Result<u64, IpcError> {
         if dest.trim().is_empty() {
@@ -385,67 +425,46 @@ impl IpcService {
         // open time (session-scoped, memory only).
         let password = password.or_else(|| self.registry.password(id));
         let emit = Arc::clone(&self.emit);
+        let max_total_bytes = match self.settings.lock() {
+            Ok(s) => s.get().max_extract_bytes,
+            Err(p) => p.into_inner().get().max_extract_bytes,
+        };
+        let on_conflict = archive_core::OnConflict::from_policy(on_conflict.as_deref());
 
         let job_id = self.jobs.submit("extract", Box::new(move |ctx| {
             let guard = shared.lock().map_err(|_| "error.engine".to_string())?;
             let entries = guard.0.entries().map_err(|e| e.error_key().to_string())?;
 
-            // Expand the selection: directories contribute all nested files.
-            // An empty selection means "extract the whole archive".
-            let sel_norm: Vec<String> = paths.iter().map(|p| p.replace('\\', "/")).collect();
-            let mut wanted: Vec<u32> = Vec::new();
-            let whole_archive = sel_norm.is_empty()
-                || sel_norm.iter().any(|s| s.trim_end_matches('/').is_empty());
-            for e in &entries {
-                if whole_archive {
-                    if !e.is_dir && !wanted.contains(&e.index) {
-                        wanted.push(e.index);
-                    }
-                    continue;
-                }
-                for sel in &sel_norm {
-                    let sel = sel.trim_end_matches('/');
-                    let is_dir = entries
-                        .iter()
-                        .any(|e| e.path.replace('\\', "/").trim_end_matches('/') == sel && e.is_dir);
-                    let p = e.path.replace('\\', "/");
-                    let p = p.trim_end_matches('/');
-                    let hit = if is_dir {
-                        p.starts_with(&format!("{sel}/"))
-                    } else {
-                        p == sel
-                    };
-                    if hit && !e.is_dir && !wanted.contains(&e.index) {
-                        wanted.push(e.index);
-                    }
-                }
-            }
+            // Expand the selection: a directory contributes its subtree *and*
+            // the directory entry itself (so empty folders survive). An empty
+            // selection means "extract the whole archive".
+            let wanted = select_entries(&entries, &paths);
             if wanted.is_empty() {
                 return Err("error.not_an_archive".into());
             }
+            let wanted_set: std::collections::HashSet<u32> = wanted.iter().copied().collect();
             // Encrypted entries with no password anywhere (argument or
             // open-time): fail with a re-promptable key instead of letting
             // the engine surface an opaque data error.
             let needs_password = entries
                 .iter()
-                .filter(|e| wanted.contains(&e.index))
-                .any(|e| e.encrypted);
+                .any(|e| wanted_set.contains(&e.index) && e.encrypted);
             if needs_password && password.is_none() {
                 return Err("error.password_required".into());
             }
             let total_items = wanted.len() as u64;
             let total_bytes: u64 = entries
                 .iter()
-                .filter(|e| wanted.contains(&e.index))
+                .filter(|e| wanted_set.contains(&e.index))
                 .map(|e| e.size)
                 .sum();
 
             let opts = archive_core::ExtractOptions {
                 dest: std::path::PathBuf::from(&dest),
                 entries: wanted,
-                // No quota in M2; the security layer still sanitizes paths.
-                max_total_bytes: u64::MAX,
-                overwrite,
+                // Zip-bomb guard: writes are bounded by the user's limit.
+                max_total_bytes,
+                on_conflict,
             };
             let mut seen_paths = std::collections::HashSet::new();
             let result = guard.0.extract(&opts, password.as_deref(), &mut |d| {
@@ -575,9 +594,9 @@ mod tests {
     impl ShellApplier for PartialFail {
         fn run(&self, ops: &[RegOp]) -> std::io::Result<()> {
             let blocked = ops.iter().any(|o| match o {
-                RegOp::SetValue { key, .. } | RegOp::DeleteKey { key } => {
-                    key.contains(r"\*\shell")
-                }
+                RegOp::SetValue { key, .. }
+                | RegOp::DeleteKey { key }
+                | RegOp::DeleteValueIfEquals { key, .. } => key.contains(r"\*\shell"),
                 RegOp::DeleteValue { .. } => false,
             });
             if blocked {
@@ -623,7 +642,12 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .all(|o| matches!(o, RegOp::DeleteKey { .. } | RegOp::DeleteValue { .. })));
+            .all(|o| matches!(
+                o,
+                RegOp::DeleteKey { .. }
+                    | RegOp::DeleteValue { .. }
+                    | RegOp::DeleteValueIfEquals { .. }
+            )));
     }
 
     #[test]

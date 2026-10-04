@@ -36,12 +36,12 @@
 
 ## 下载
 
-到 [Releases 页面](https://github.com/CN6/zipnest/releases/latest) 下载最新版（当前 **v0.3.5**）：
+到 [Releases 页面](https://github.com/CN6/zipnest/releases/latest) 下载最新版（当前 **v0.3.6**）：
 
 | 版本 | 文件 | 大小 | 说明 |
 | --- | --- | --- | --- |
-| **安装版（推荐）** | `ZipNest_0.3.5_x64-setup.exe` | 3.6 MB | 双击安装，自动创建快捷方式、注册右键菜单 |
-| 便携版 | `ZipNest_0.3.5_x64_portable.zip` | 4.5 MB | 解压即用、免安装，放 U 盘带走也行 |
+| **安装版（推荐）** | `ZipNest_0.3.6_x64-setup.exe` | 3.6 MB | 双击安装，自动创建快捷方式、注册右键菜单 |
+| 便携版 | `ZipNest_0.3.6_x64_portable.zip` | 4.5 MB | 解压即用、免安装，放 U 盘带走也行 |
 
 > 仅支持 **Windows 10 / 11（x64）**。完整改动记录见 [CHANGELOG](CHANGELOG.md)。
 

@@ -1,4 +1,4 @@
-﻿//! Extraction paths: `read_entry` (in-memory) and `extract_to_disk`.
+//! Extraction paths: `read_entry` (in-memory) and `extract_to_disk`.
 //!
 //! Both drive `IInArchive::Extract` with our own
 //! `IArchiveExtractCallback` implementations.
@@ -18,12 +18,12 @@ use crate::com::{
     IID_IARCHIVE_EXTRACT_CALLBACK, IID_IPROGRESS, IID_ISEQ_OUT_STREAM, IID_IUNKNOWN,
 };
 use crate::error::ZipnestError;
-use crate::types::{ArchiveEntry, ExtractOptions, ExtractProgress, ExtractStats};
+use crate::types::{ArchiveEntry, ExtractOptions, ExtractProgress, ExtractStats, OnConflict};
 use archive_security::{sanitize_entry_path, ExtractQuota};
 use std::ffi::c_void;
 use std::os::raw::c_void as RawCVoid;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// `NExtract::NOperationResult` values we care about.
@@ -45,6 +45,10 @@ const BLOCK_QUOTA: u8 = 2;
 struct SinkState {
     buf: Mutex<Vec<u8>>,
     limit: u64,
+    /// Set once the cap above was hit. `mem_set_completed` turns this into
+    /// `E_ABORT` so the handler stops decompressing instead of running the
+    /// rest of a (possibly huge) entry into a discarded buffer.
+    truncated: AtomicBool,
 }
 
 #[repr(C)]
@@ -107,6 +111,9 @@ unsafe extern "system" fn sink_write(
     if size == 0 {
         return S_OK;
     }
+    if data.is_null() {
+        return E_FAIL;
+    }
     let this = this as *mut MemOutStream;
     let state = &(*this).state;
     let chunk = std::slice::from_raw_parts(data as *const u8, size as usize);
@@ -117,6 +124,12 @@ unsafe extern "system" fn sink_write(
     let remaining = state.limit.saturating_sub(buf.len() as u64) as usize;
     let take = chunk.len().min(remaining);
     buf.extend_from_slice(&chunk[..take]);
+    if take < chunk.len() {
+        // Cap reached: keep what we have and let the next progress tick stop
+        // the handler (see `mem_set_completed`). Reporting full consumption
+        // here is what makes the handler wind down cleanly instead of erroring.
+        state.truncated.store(true, Ordering::Relaxed);
+    }
     *processed = size; // engine sees full consumption; overflow is dropped
     S_OK
 }
@@ -147,7 +160,7 @@ static MEM_CB_VT: ArchiveExtractCallbackVt = ArchiveExtractCallbackVt {
     add_ref: cb_add_ref,
     release: cb_release,
     set_total: noop_set_total,
-    set_completed: noop_set_completed,
+    set_completed: mem_set_completed,
     get_stream: mem_get_stream,
     prepare_operation: noop_prepare,
     set_operation_result: cb_op_result,
@@ -196,8 +209,17 @@ unsafe extern "system" fn noop_set_total(_this: *mut c_void, _total: u64) -> Hre
     S_OK
 }
 
-unsafe extern "system" fn noop_set_completed(_this: *mut c_void, _complete: *const u64) -> Hresult {
-    S_OK
+/// Stop the handler once the sink cap is hit: without this the engine would
+/// decompress the whole entry and throw the overflow away (a bomb entry would
+/// pin a CPU core and churn the disk for minutes on a preview).
+unsafe extern "system" fn mem_set_completed(this: *mut c_void, _complete: *const u64) -> Hresult {
+    let this = this as *mut MemExtractCallback;
+    let state = &(*this).state;
+    if state.truncated.load(Ordering::Relaxed) {
+        E_ABORT
+    } else {
+        S_OK
+    }
 }
 
 unsafe extern "system" fn noop_prepare(_this: *mut c_void, _ask: i32) -> Hresult {
@@ -244,6 +266,11 @@ fn map_op_res(op_res: i32, password_provided: bool) -> ZipnestError {
     }
 }
 
+/// Extract one entry into memory.
+///
+/// `max_bytes` caps the payload: once the cap is reached the handler is asked
+/// to stop and the bytes collected so far are returned. Callers that care about
+/// truncation compare the byte count against `ArchiveEntry::size`.
 pub(crate) fn read_entry(
     arc: &Archive,
     index: u32,
@@ -254,6 +281,7 @@ pub(crate) fn read_entry(
     let state = Arc::new(SinkState {
         buf: Mutex::new(Vec::new()),
         limit,
+        truncated: AtomicBool::new(false),
     });
     let sink = Box::into_raw(Box::new(MemOutStream {
         vt: &MEM_OUT_VT,
@@ -282,7 +310,15 @@ pub(crate) fn read_entry(
         (MEM_CB_VT.release)(cb as *mut c_void);
     }
 
-    if hr != S_OK {
+    // Truncated at the caller's cap: the handler was aborted deliberately (see
+    // `mem_set_completed`), so the partial payload is the answer, not an error.
+    if state.truncated.load(Ordering::Relaxed) {
+        let buf = state.buf.lock().map_err(|_| ZipnestError::Engine(E_FAIL))?;
+        return Ok(buf.clone());
+    }
+    // COM success is `hr >= 0`: S_FALSE means "some items failed", and the
+    // per-item result below is the precise answer for that case.
+    if hr < 0 {
         // map_hresult: E_ABORT -> Cancelled, everything else -> Engine.
         return Err(crate::error::map_hresult(hr));
     }
@@ -307,6 +343,7 @@ struct EntryMeta {
     index: u32,
     raw_path: String,
     is_dir: bool,
+    mtime: Option<std::time::SystemTime>,
 }
 
 /// Progress closure slot. Invoked only while the `Mutex` is held, which
@@ -324,16 +361,22 @@ struct ProgressCell {
 }
 
 fn call_progress(raw: *mut c_void, p: &ExtractProgress) -> bool {
-    unsafe {
+    // The closure is arbitrary caller code. A panic escaping it would unwind
+    // through the `extern "system"` progress callback that called us, and Rust
+    // aborts the process at that boundary — the user would just see the app
+    // vanish mid-extraction. Treat a panic as "stop", which the callers map to
+    // `E_ABORT`/`Cancelled`.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         let slot = raw as *mut &mut dyn FnMut(&ExtractProgress) -> bool;
         let f = &mut *slot;
         (**f)(p)
-    }
+    }))
+    .unwrap_or(false)
 }
 
 struct DiskState {
     dest: PathBuf,
-    overwrite: bool,
+    on_conflict: OnConflict,
     entries: Vec<EntryMeta>, // sorted by index
     quota: Mutex<ExtractQuota>,
     blocked: AtomicU8,    // BLOCK_*
@@ -342,8 +385,20 @@ struct DiskState {
     io_error: Mutex<Option<std::io::Error>>,
     first_op_res: AtomicI32,
     done_bytes: AtomicU64,
-    files_created: AtomicU32,
+    /// The file the handler is writing right now. It lives in a temp sibling
+    /// and only replaces its destination once the handler reports the entry as
+    /// finished, so a failed/cancelled run never truncates an existing file.
+    pending: Mutex<Option<PendingWrite>>,
+    files_committed: AtomicU32,
+    bytes_committed: AtomicU64,
     progress: Mutex<ProgressCell>,
+}
+
+/// Temp file backing the entry being extracted right now.
+struct PendingWrite {
+    tmp: PathBuf,
+    dest: PathBuf,
+    mtime: Option<std::time::SystemTime>,
 }
 
 impl DiskState {
@@ -354,10 +409,23 @@ impl DiskState {
             .map(|i| &self.entries[i])
     }
 
-    /// Record an entry we refused to write (path escape / hostile name).
+    /// Record an entry that was not written: unsafe/escaping name, an existing
+    /// destination under the `skip` policy, or a destination we could not
+    /// create. Reported to the user so nothing looks silently lost.
     fn record_skip(&self, raw: &str) {
         if let Ok(mut s) = self.skipped.lock() {
             s.push(raw.to_string());
+        }
+    }
+
+    /// Record a fatal write error (disk full, device failure, …). Only the
+    /// first one is kept; per-entry open failures stay non-fatal and go to
+    /// `skipped` instead.
+    fn record_io_error(&self, e: &std::io::Error) {
+        if let Ok(mut slot) = self.io_error.lock() {
+            if slot.is_none() {
+                *slot = Some(std::io::Error::new(e.kind(), e.to_string()));
+            }
         }
     }
 
@@ -442,6 +510,9 @@ unsafe extern "system" fn fos_write(
     *processed = 0;
     if size == 0 {
         return S_OK;
+    }
+    if data.is_null() {
+        return E_FAIL;
     }
     let this = this as *mut FileOutStream;
     let st = &(*this).state;
@@ -574,6 +645,73 @@ unsafe fn disk_progress_gate(cb: *mut DiskExtractCallback) -> Hresult {
     S_OK
 }
 
+// ===========================================================================
+// Atomic per-entry writes
+// ===========================================================================
+//
+// Every entry is written to `<name>.zipnest-part-<pid>` next to its target and
+// only renamed into place once the handler reports the entry as successful.
+// That is what makes these guarantees hold:
+//   * a cancelled, quota-blocked or failed run can never truncate a file that
+//     was already there (`File::create` on the real path used to do just that);
+//   * a half-written file never appears under the entry's real name.
+
+/// Temp sibling for `dest`: same directory, so the final rename stays on one
+/// volume and is atomic. Unique per process so a leftover from a crashed run
+/// is never mistaken for the real file.
+fn temp_sibling(dest: &std::path::Path) -> Option<PathBuf> {
+    let name = dest.file_name()?.to_str()?;
+    Some(dest.with_file_name(format!(
+        "{name}.zipnest-part-{}",
+        std::process::id()
+    )))
+}
+
+/// First free `name (n).ext` next to `dest`; used by [`OnConflict::Rename`].
+fn unique_dest(dest: &std::path::Path) -> PathBuf {
+    let parent = dest.parent().map(PathBuf::from).unwrap_or_default();
+    let stem = dest
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let ext = dest
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    for n in 2..10_000u32 {
+        let cand = parent.join(format!("{stem} ({n}){ext}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    dest.to_path_buf()
+}
+
+/// Move a finished temp file over its destination and restore the archived
+/// modification time. Returns the number of bytes committed.
+#[allow(clippy::permissions_set_readonly_false)]
+fn commit_pending(pw: &PendingWrite) -> std::io::Result<u64> {
+    // A read-only destination makes the replace fail; clear the flag first so
+    // one read-only file cannot abort the whole extraction.
+    if let Ok(md) = std::fs::metadata(&pw.dest) {
+        let mut perm = md.permissions();
+        if perm.readonly() {
+            perm.set_readonly(false);
+            let _ = std::fs::set_permissions(&pw.dest, perm);
+        }
+    }
+    let len = std::fs::metadata(&pw.tmp).map(|m| m.len()).unwrap_or(0);
+    std::fs::rename(&pw.tmp, &pw.dest)?;
+    if let Some(mtime) = pw.mtime {
+        if let Ok(f) = std::fs::File::options().write(true).open(&pw.dest) {
+            let _ = f.set_modified(mtime);
+        }
+    }
+    Ok(len)
+}
+
 unsafe extern "system" fn disk_get_stream(
     this: *mut c_void,
     index: u32,
@@ -634,48 +772,66 @@ unsafe extern "system" fn disk_get_stream(
     }
 
     if meta.is_dir {
-        if let Err(e) = std::fs::create_dir_all(&full) {
-            let mut slot = match st.io_error.lock() {
-                Ok(s) => s,
-                Err(_) => return E_FAIL,
-            };
-            if slot.is_none() {
-                *slot = Some(e);
-            }
-            return E_FAIL;
+        // Directories are idempotent and never conflict. One we cannot create
+        // is reported like any other skipped entry instead of aborting the run.
+        if std::fs::create_dir_all(&full).is_err() {
+            st.record_skip(&meta.raw_path);
         }
         return S_OK;
     }
 
-    if full.exists() && !st.overwrite {
-        return S_OK; // keep existing file, hand out no stream
-    }
-    if let Some(parent) = full.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            let mut slot = match st.io_error.lock() {
-                Ok(s) => s,
-                Err(_) => return E_FAIL,
-            };
-            if slot.is_none() {
-                *slot = Some(e);
+    // Existing destination: apply the conflict policy.
+    let target = if full.exists() {
+        match st.on_conflict {
+            OnConflict::Skip => {
+                st.record_skip(&meta.raw_path);
+                return S_OK; // null stream → the engine leaves the file alone
             }
-            return E_FAIL;
+            OnConflict::Rename => unique_dest(&full),
+            OnConflict::Overwrite => full.clone(),
+        }
+    } else {
+        full.clone()
+    };
+
+    // Per-entry failures below stay non-fatal: one unwritable path must not
+    // throw away every other file in the archive. They land in `stats.skipped`
+    // so the UI can say how many entries did not make it.
+    if let Some(parent) = target.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            st.record_skip(&meta.raw_path);
+            return S_OK;
         }
     }
-    let file = match std::fs::File::create(&full) {
+    let Some(tmp) = temp_sibling(&target) else {
+        st.record_skip(&meta.raw_path);
+        return S_OK;
+    };
+    let file = match std::fs::File::create(&tmp) {
         Ok(f) => f,
-        Err(e) => {
-            let mut slot = match st.io_error.lock() {
-                Ok(s) => s,
-                Err(_) => return E_FAIL,
-            };
-            if slot.is_none() {
-                *slot = Some(e);
-            }
-            return E_FAIL;
+        Err(_) => {
+            st.record_skip(&meta.raw_path);
+            return S_OK;
         }
     };
-    st.files_created.fetch_add(1, Ordering::Relaxed);
+    {
+        // The handler serializes GetStream/SetOperationResult, so at most one
+        // entry is in flight and a single slot is enough.
+        let mut slot = match st.pending.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        // Defensive: a handler that opened a second stream for the same entry
+        // must not leak the first temp file.
+        if let Some(old) = slot.take() {
+            let _ = std::fs::remove_file(&old.tmp);
+        }
+        *slot = Some(PendingWrite {
+            tmp,
+            dest: target,
+            mtime: meta.mtime,
+        });
+    }
 
     let stream = Box::into_raw(Box::new(FileOutStream {
         vt: &FILE_OUT_VT,
@@ -695,6 +851,35 @@ unsafe extern "system" fn disk_op_result(this: *mut c_void, op_res: i32) -> Hres
     if op_res != OP_OK {
         let _ = st.first_op_res.compare_exchange(0, op_res, Ordering::SeqCst, Ordering::SeqCst);
     }
+
+    // Finalize the entry that was just written. A complete entry that was not
+    // cancelled or quota-blocked replaces its destination; anything else is
+    // thrown away, leaving whatever the destination held before untouched.
+    let pending = match st.pending.lock() {
+        Ok(mut p) => p.take(),
+        Err(p) => p.into_inner().take(),
+    };
+    if let Some(pw) = pending {
+        let complete = op_res == OP_OK
+            && st.cancelled.load(Ordering::SeqCst) == 0
+            && st.blocked.load(Ordering::SeqCst) == BLOCK_NONE;
+        if complete {
+            match commit_pending(&pw) {
+                Ok(len) => {
+                    st.files_committed.fetch_add(1, Ordering::Relaxed);
+                    st.bytes_committed.fetch_add(len, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&pw.tmp);
+                    st.record_io_error(&e);
+                    return E_FAIL;
+                }
+            }
+        } else {
+            let _ = std::fs::remove_file(&pw.tmp);
+        }
+    }
+
     // Per-item cancel opportunity.
     if !st.tick() {
         return E_ABORT;
@@ -734,12 +919,13 @@ pub(crate) fn extract_to_disk(
             index: e.index,
             raw_path: e.path.clone(),
             is_dir: e.is_dir,
+            mtime: e.mtime,
         })
         .collect();
 
     let state = Arc::new(DiskState {
         dest: opts.dest.clone(),
-        overwrite: opts.overwrite,
+        on_conflict: opts.on_conflict,
         entries,
         quota: Mutex::new(ExtractQuota::new(opts.max_total_bytes)),
         blocked: AtomicU8::new(BLOCK_NONE),
@@ -748,7 +934,9 @@ pub(crate) fn extract_to_disk(
         io_error: Mutex::new(None),
         first_op_res: AtomicI32::new(0),
         done_bytes: AtomicU64::new(0),
-        files_created: AtomicU32::new(0),
+        pending: Mutex::new(None),
+        files_committed: AtomicU32::new(0),
+        bytes_committed: AtomicU64::new(0),
         progress: Mutex::new(ProgressCell {
             cell: Box::into_raw(Box::new(progress)) as *mut c_void,
             call: call_progress,
@@ -786,6 +974,17 @@ pub(crate) fn extract_to_disk(
             ));
         }
     }
+    // Defensive: if the handler bailed out without a final SetOperationResult,
+    // the temp file of that entry must not survive.
+    {
+        let leftover = match state.pending.lock() {
+            Ok(mut p) => p.take(),
+            Err(p) => p.into_inner().take(),
+        };
+        if let Some(pw) = leftover {
+            let _ = std::fs::remove_file(&pw.tmp);
+        }
+    }
 
     // Post-check order matters: local flags win over whatever HRESULT the
     // handler chose to return (some handlers swallow our E_ABORT, and an
@@ -806,7 +1005,7 @@ pub(crate) fn extract_to_disk(
     if op_res != 0 {
         return Err(map_op_res(op_res, password.is_some()));
     }
-    if hr != S_OK {
+    if hr < 0 {
         return Err(crate::error::map_hresult(hr));
     }
 
@@ -816,8 +1015,8 @@ pub(crate) fn extract_to_disk(
         .map(|mut s| std::mem::take(&mut *s))
         .unwrap_or_default();
     Ok(ExtractStats {
-        files: state.files_created.load(Ordering::Relaxed),
-        bytes: state.done_bytes.load(Ordering::Relaxed),
+        files: state.files_committed.load(Ordering::Relaxed),
+        bytes: state.bytes_committed.load(Ordering::Relaxed),
         skipped,
     })
 }

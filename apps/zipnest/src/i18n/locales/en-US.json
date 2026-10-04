@@ -90,6 +90,7 @@
   "error.quota_exceeded": "Extraction exceeds the size limit",
   "error.io": "File I/O failed",
     "error.settings.invalid": "Invalid settings value",
+  "error.shell.dev_path": "Development build path detected; registration skipped",
   "error.shell.associate": "File association registration was denied by the system",
   "error.shell.file_menu": "The all-files context menu was denied by the system",
   "error.shell.directory_menu": "The folder context menu was denied by the system",

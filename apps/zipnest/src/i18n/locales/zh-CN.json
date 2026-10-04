@@ -90,6 +90,7 @@
   "error.quota_exceeded": "解压内容超出大小限制",
   "error.io": "文件读写失败",
     "error.settings.invalid": "设置项取值无效",
+  "error.shell.dev_path": "检测到开发版路径，已跳过注册",
   "error.shell.associate": "系统拒绝了文件关联注册",
   "error.shell.file_menu": "系统拒绝了“所有文件”右键菜单",
   "error.shell.directory_menu": "系统拒绝了文件夹右键菜单",

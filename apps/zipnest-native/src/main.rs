@@ -1,4 +1,4 @@
-﻿//! ZipNest native UI (egui). Same-process calls into `zipnest-ipc`; no webview.
+//! ZipNest native UI (egui). Same-process calls into `zipnest-ipc`; no webview.
 //! Windows GUI subsystem: no console window pops up during normal use.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -20,9 +20,9 @@ const DESIGN_WIDTH: f32 = 900.0;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.3.5";
+const CURRENT_VERSION: &str = "0.3.6";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.3.5";
+const UPDATE_UA: &str = "ZipNest-Updater/0.3.6";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
 
 #[derive(Clone, Default)]
@@ -104,6 +104,9 @@ struct JobState {
     ok: bool,
     finished: bool,
     error_key: Option<String>,
+    /// Entries the last job could not write (unsafe name, skipped conflict,
+    /// destination not creatable).
+    skipped: u64,
     title: String,
 }
 
@@ -143,6 +146,24 @@ fn main() -> Result<(), eframe::Error> {
     //   zipnest.exe <archive>        → open that archive
     //   zipnest.exe --add <path>...  → open the create wizard pre-filled
     let args: Vec<String> = std::env::args().collect();
+    // `--unregister-shell` is what the uninstaller runs before deleting files:
+    // it drops every HKCU integration this app ever wrote (context menus,
+    // ProgIDs and the extension defaults we pointed at them) without starting
+    // the UI. A failure is reported through the exit code.
+    if args.iter().skip(1).any(|a| a == "--unregister-shell") {
+        let mut ops = zipnest_ipc::shell::context_menu_removals();
+        ops.extend(zipnest_ipc::shell::assoc_removals());
+        return match zipnest_ipc::shell::ShellApplier::run(
+            &zipnest_ipc::shell::WindowsRegistry,
+            &ops,
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("ZipNest: shell cleanup failed: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
     let mut launch_open: Option<String> = None;
     let mut launch_add: Vec<String> = Vec::new();
     {
@@ -203,6 +224,8 @@ struct App {
     job: Option<JobState>,
     preview: PreviewKind,
     preview_for: String,
+    /// The preview we are showing is only the head of a larger entry.
+    preview_truncated: bool,
     // dialogs
     show_extract: bool,
     extract_dest: String,
@@ -302,6 +325,7 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             job: None,
             preview: PreviewKind::None,
             preview_for: String::new(),
+            preview_truncated: false,
             show_extract: false,
             extract_dest: String::new(),
             extract_skipped: 0,
@@ -327,6 +351,18 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
 
 fn t(&self, key: &str) -> String {
         i18n::tr(&self.lang, key)
+    }
+
+    /// Status text for the last job. `job.ok_skipped` carries the count as
+    /// `{count}`; native i18n has no interpolator, so it is substituted here.
+    fn notice_text(&self) -> Option<String> {
+        let key = self.notice.as_deref()?;
+        let mut text = self.t(key);
+        if key == "job.ok_skipped" {
+            let n = self.job.as_ref().map(|j| j.skipped).unwrap_or(0);
+            text = text.replace("{count}", &n.to_string());
+        }
+        Some(text)
     }
 
     /// Small "?" that shows a tooltip on hover (help text for wizard fields).
@@ -375,6 +411,7 @@ fn t(&self, key: &str) -> String {
                         j.ok = ok;
                         j.finished = true;
                         j.error_key = err_key.clone();
+                        j.skipped = skipped;
                     }
                     if ok {
                         self.notice =
@@ -429,8 +466,15 @@ fn t(&self, key: &str) -> String {
 
     /// Default extract location: a subfolder named after the archive, so files
     /// don't scatter into the archive's own folder (matches WinRAR/7-Zip).
+    /// `settings.default_extract_dir` replaces "next to the archive" as the
+    /// parent folder when the user configured one.
     fn default_extract_dest(&self) -> String {
-        let dir = self.current_archive_dir();
+        let custom = self.settings.default_extract_dir.trim();
+        let dir = if custom.is_empty() {
+            self.current_archive_dir()
+        } else {
+            custom.trim_end_matches(['/', '\\']).to_string()
+        };
         let stem = std::path::Path::new(&self.archive_path)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -456,17 +500,23 @@ fn t(&self, key: &str) -> String {
         let id = self.archive.as_ref().map(|a| a.id).unwrap_or(0);
         let Some(entry) = self.selected_one().cloned() else {
             self.preview = PreviewKind::None;
+            self.preview_truncated = false;
             return;
         };
         if entry.is_dir {
             self.preview = PreviewKind::None;
+            self.preview_truncated = false;
             return;
         }
         let max_bytes = self.settings.preview_max_bytes.max(1);
-        let bytes = self
-            .svc
-            .read_entry_bytes(id, entry.path.clone(), max_bytes)
-            .unwrap_or_default();
+        let read = self.svc.read_entry_bytes(id, entry.path.clone(), max_bytes);
+        // The reader stops at the cap; say so instead of presenting the head of
+        // an entry as if it were the whole thing.
+        self.preview_truncated = read
+            .as_ref()
+            .map(|b| entry.size > b.len() as u64)
+            .unwrap_or(false);
+        let bytes = read.unwrap_or_default();
         let name_lower = entry.name.to_lowercase();
         if name_lower.ends_with(".png") || name_lower.ends_with(".jpg") || name_lower.ends_with(".jpeg") {
             if let Some(img) = i18n::load_image(&bytes) {
@@ -515,6 +565,9 @@ let extract_enabled = self.archive.is_some();
                     .clicked()
                 {
                     self.extract_dest = self.default_extract_dest();
+                    // The dialog checkbox mirrors the saved policy; "ask" starts
+                    // from "do not overwrite", the safe default.
+                    self.overwrite = self.settings.overwrite_policy == "overwrite";
                     // No selection → extract the whole archive (empty paths
                     // tells the engine to unpack everything).
                     self.show_extract = true;
@@ -738,6 +791,9 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.weak(self.t("preview.no_preview"));
             }
         }
+        if self.preview_truncated && !matches!(self.preview, PreviewKind::None) {
+            ui.weak(self.t("preview.truncated"));
+        }
     }
 
     fn statusbar(&mut self, ui: &mut egui::Ui) {
@@ -745,18 +801,13 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            self.notice
-                                .as_ref()
-                                .map(|n| self.t(n))
-                                .unwrap_or_else(|| {
-                                    if self.archive.is_some() {
-                                        format!("{}", self.rows.len())
-                                    } else {
-                                        String::new()
-                                    }
-                                }),
-                        )
+                        egui::RichText::new(self.notice_text().unwrap_or_else(|| {
+                            if self.archive.is_some() {
+                                format!("{}", self.rows.len())
+                            } else {
+                                String::new()
+                            }
+                        }))
                         .color(egui::Color32::from_rgb(110, 110, 110)),
                     ),
                 );
@@ -802,12 +853,34 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     self.extract_dest = dir.to_str().unwrap_or("").to_string();
                 }
             }
-            let overwrite_label = self.t("extract.overwrite");
-            ui.checkbox(&mut self.overwrite, overwrite_label);
+            // The saved conflict policy decides what this dialog offers: "ask"
+            // shows the checkbox, the other three are shown as a fixed setting
+            // so a saved policy is never silently ignored.
+            let policy = self.settings.overwrite_policy.clone();
+            let ask = policy == "ask";
+            if ask {
+                let overwrite_label = self.t("extract.overwrite");
+                ui.checkbox(&mut self.overwrite, overwrite_label);
+            } else {
+                ui.label(format!(
+                    "{}: {}",
+                    self.t("settings.overwrite"),
+                    self.t(&format!("settings.overwrite.{policy}"))
+                ));
+            }
             let can = !self.extract_dest.trim().is_empty();
             if ui.add_enabled(can, egui::Button::new(self.t("extract.start"))).clicked() {
                 let dest = self.extract_dest.clone();
-                let overwrite = self.overwrite;
+                let on_conflict = if ask {
+                    if self.overwrite {
+                        "overwrite"
+                    } else {
+                        "skip"
+                    }
+                } else {
+                    policy.as_str()
+                }
+                .to_string();
                 self.job = Some(JobState {
                     job_id: 0,
                     title: self.t("extract.title"),
@@ -817,7 +890,7 @@ egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     arch_id,
                     srcs.iter().cloned().collect(),
                     dest,
-                    overwrite,
+                    Some(on_conflict),
                     None,
                 ) {
                     Ok(jid) => {
@@ -1046,6 +1119,17 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                         }
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label(self.t("settings.max_extract"));
+                    let hint = self.t("settings.max_extract.hint");
+                    self.help_hint(ui, &hint);
+                    let mut mb = self.settings.max_extract_bytes / (1024 * 1024);
+                    if ui.add(egui::DragValue::new(&mut mb).speed(256.0)).changed() {
+                        // Real clamping happens in Settings::apply on the way out.
+                        self.settings.max_extract_bytes = mb.max(1).saturating_mul(1024 * 1024);
+                    }
+                    ui.label("MB");
+                });
                 let update_lbl = self.t("settings.auto_update");
                 ui.checkbox(&mut self.settings.auto_check_update, update_lbl);
                 ui.label(self.t("settings.version"));
@@ -1054,6 +1138,7 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                 });
                 ui.label(self.t("settings.shell.associate"));
                 ui.checkbox(&mut self.settings.associate, "");
+                ui.weak(self.t("settings.shell.assoc_hint"));
                 ui.label(self.t("settings.shell.context_menu"));
                 ui.checkbox(&mut self.settings.context_menu, "");
                 ui.separator();
@@ -1062,12 +1147,28 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                     let assoc = self.settings.associate;
                     let menu = self.settings.context_menu;
                     let exe = std::env::current_exe().unwrap_or_default();
-                    let _ = svc.shell_register(&exe, ShellOptions { associate: assoc, context_menu: menu }, &zipnest_ipc::shell::WindowsRegistry);
-let _ = svc.settings_set(SettingsPatch {
+                    match svc.shell_register(
+                        &exe,
+                        ShellOptions { associate: assoc, context_menu: menu },
+                        &zipnest_ipc::shell::WindowsRegistry,
+                    ) {
+                        Ok(r) => {
+                            // Reflect what the OS actually accepted: a hardened
+                            // machine can deny one menu target and allow the
+                            // others, so the checkboxes must not claim more than
+                            // the registry holds.
+                            self.settings.associate = r.associate;
+                            self.settings.context_menu = r.context_menu;
+                            self.notice = r.warnings.first().cloned();
+                        }
+                        Err(_) => self.notice = Some("error.io".into()),
+                    }
+                    let _ = svc.settings_set(SettingsPatch {
                         language: Some(self.settings.language.clone()),
                         default_extract_dir: Some(self.settings.default_extract_dir.clone()),
                         overwrite_policy: Some(self.settings.overwrite_policy.clone()),
                         preview_max_bytes: Some(self.settings.preview_max_bytes),
+                        max_extract_bytes: Some(self.settings.max_extract_bytes),
                         ui_zoom: Some(self.settings.ui_zoom),
                         auto_check_update: Some(self.settings.auto_check_update),
                         ..Default::default()
@@ -1209,7 +1310,10 @@ let _ = svc.settings_set(SettingsPatch {
                 ui.add_sized([360.0, 22.0], egui::ProgressBar::new(bar).show_percentage());
                 if j.finished {
                     if j.ok {
-                        ui.colored_label(egui::Color32::from_rgb(40, 140, 60), self.t("job.ok"));
+                        ui.colored_label(
+                            egui::Color32::from_rgb(40, 140, 60),
+                            self.notice_text().unwrap_or_else(|| self.t("job.ok")),
+                        );
                     } else {
                         let k = j.error_key.clone().unwrap_or_else(|| "error.engine".into());
                         ui.colored_label(egui::Color32::from_rgb(200, 60, 40), self.t(&k));

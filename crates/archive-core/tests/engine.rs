@@ -1,4 +1,4 @@
-﻿use archive_core::{Archive, ArchiveOpenOptions};
+use archive_core::{Archive, ArchiveOpenOptions};
 use std::path::PathBuf;
 
 fn fx(name: &str) -> PathBuf {
@@ -78,7 +78,7 @@ fn read_entry_respects_max_bytes() {
 }
 // ---- Task 8: secure extraction / progress / cancel ----
 
-use archive_core::ExtractOptions;
+use archive_core::{ExtractOptions, OnConflict};
 
 fn tmpdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("zn-{tag}-{}", std::process::id()));
@@ -94,7 +94,7 @@ fn extracts_plain_zip_to_disk() {
         dest: dest.clone(),
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
-        overwrite: true,
+        on_conflict: OnConflict::Overwrite,
     };
     let mut ticks = 0;
     let stats = arc
@@ -121,6 +121,171 @@ fn extracts_plain_zip_to_disk() {
     let _ = std::fs::remove_dir_all(&dest);
 }
 
+/// Any `<name>.zipnest-part-<pid>` temp files under `dir`, recursively.
+fn temp_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(".zipnest-part-"))
+            {
+                found.push(p);
+            }
+        }
+    }
+    found
+}
+
+/// Regression: the destination used to be truncated with `File::create` before
+/// the entry's bytes were known to be complete. A failure mid-entry must leave
+/// the file that was already there byte-for-byte intact and leave no temp file.
+#[test]
+fn failed_extract_keeps_the_existing_file_intact() {
+    let arc = Archive::open(&fx("plain.zip"), ArchiveOpenOptions::default()).unwrap();
+    let dest = tmpdir("keepold");
+    std::fs::create_dir_all(&dest).unwrap();
+    let existing = dest.join("a.txt");
+    std::fs::write(&existing, "ORIGINAL CONTENT").unwrap();
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: 4, // trips the zip-bomb guard on the first chunk
+        on_conflict: OnConflict::Overwrite,
+    };
+    let err = arc.extract(&opts, None, &mut |_p| true).expect_err("quota must trip");
+    assert_eq!(err.error_key(), "error.quota_exceeded");
+    assert_eq!(
+        std::fs::read_to_string(&existing).unwrap(),
+        "ORIGINAL CONTENT",
+        "a failed extraction must not truncate the pre-existing file"
+    );
+    assert!(
+        temp_files(&dest).is_empty(),
+        "temp files left behind: {:?}",
+        temp_files(&dest)
+    );
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn cancel_leaves_no_temp_files_behind() {
+    let arc = Archive::open(&fx("plain.zip"), ArchiveOpenOptions::default()).unwrap();
+    let dest = tmpdir("canceltmp");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        on_conflict: OnConflict::Overwrite,
+    };
+    // Cancel after the second tick so at least one entry has started.
+    let mut ticks = 0;
+    let err = arc
+        .extract(&opts, None, &mut |_p| {
+            ticks += 1;
+            ticks < 2
+        })
+        .expect_err("must cancel");
+    assert_eq!(err.error_key(), "error.cancelled");
+    assert!(
+        temp_files(&dest).is_empty(),
+        "temp files left behind: {:?}",
+        temp_files(&dest)
+    );
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn skip_policy_keeps_the_existing_file_and_reports_it() {
+    let arc = Archive::open(&fx("plain.zip"), ArchiveOpenOptions::default()).unwrap();
+    let dest = tmpdir("skipold");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("a.txt"), "ORIGINAL CONTENT").unwrap();
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        on_conflict: OnConflict::Skip,
+    };
+    let stats = arc.extract(&opts, None, &mut |_p| true).expect("extract");
+    assert_eq!(
+        std::fs::read_to_string(dest.join("a.txt")).unwrap(),
+        "ORIGINAL CONTENT"
+    );
+    assert!(
+        stats.skipped.iter().any(|p| p == "a.txt"),
+        "a skipped entry must be reported, got {:?}",
+        stats.skipped
+    );
+    // Entries without a conflict still land.
+    assert!(dest.join("c.txt").exists(), "unrelated files must still extract");
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn rename_policy_writes_beside_the_existing_file() {
+    let arc = Archive::open(&fx("plain.zip"), ArchiveOpenOptions::default()).unwrap();
+    let dest = tmpdir("renameold");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("a.txt"), "ORIGINAL CONTENT").unwrap();
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        on_conflict: OnConflict::Rename,
+    };
+    arc.extract(&opts, None, &mut |_p| true).expect("extract");
+    assert_eq!(
+        std::fs::read_to_string(dest.join("a.txt")).unwrap(),
+        "ORIGINAL CONTENT"
+    );
+    let renamed = dest.join("a (2).txt");
+    assert!(renamed.exists(), "expected {}", renamed.display());
+    assert!(std::fs::read_to_string(&renamed).unwrap().contains("hello zipnest"));
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn extracted_files_keep_their_archived_mtime() {
+    let arc = Archive::open(&fx("plain.zip"), ArchiveOpenOptions::default()).unwrap();
+    let archived = arc
+        .entries()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.path == "a.txt")
+        .and_then(|e| e.mtime);
+    let dest = tmpdir("mtime");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        on_conflict: OnConflict::Overwrite,
+    };
+    arc.extract(&opts, None, &mut |_p| true).expect("extract");
+    let written = std::fs::metadata(dest.join("a.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let Some(expected) = archived else {
+        panic!("fixture entry must carry an mtime");
+    };
+    let delta = written
+        .duration_since(expected)
+        .or_else(|_| expected.duration_since(written))
+        .unwrap_or_default();
+    assert!(
+        delta < std::time::Duration::from_secs(2),
+        "archived mtime not restored (off by {delta:?})"
+    );
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
 #[test]
 fn extract_cancel_returns_cancelled() {
     let arc = Archive::open(&fx("nested.zip"), ArchiveOpenOptions::default()).unwrap();
@@ -129,7 +294,7 @@ fn extract_cancel_returns_cancelled() {
         dest: dest.clone(),
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
-        overwrite: true,
+        on_conflict: OnConflict::Overwrite,
     };
     let err = arc.extract(&opts, None, &mut |_p| false).expect_err("must cancel");
     assert_eq!(err.error_key(), "error.cancelled");
@@ -144,7 +309,7 @@ fn extract_quota_enforced() {
         dest: dest.clone(),
         entries: (0..arc.len()).collect(),
         max_total_bytes: 10,
-        overwrite: true,
+        on_conflict: OnConflict::Overwrite,
     };
     let err = arc.extract(&opts, None, &mut |_p| true).expect_err("quota must trip");
     assert_eq!(err.error_key(), "error.quota_exceeded");
@@ -171,7 +336,7 @@ fn zip_slip_entry_is_skipped_and_other_files_extract() {
         dest: dest.clone(),
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
-        overwrite: true,
+        on_conflict: OnConflict::Overwrite,
     };
     let stats = arc
         .extract(&opts, None, &mut |_p| true)
@@ -210,7 +375,7 @@ fn reserved_name_is_skipped_and_others_still_extract() {
         dest: dest.clone(),
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
-        overwrite: true,
+        on_conflict: OnConflict::Overwrite,
     };
     let stats = arc
         .extract(&opts, None, &mut |_p| true)
@@ -257,7 +422,7 @@ fn encrypted_7z_with_password_opens_and_extracts() {
         dest: dest.clone(),
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
-        overwrite: true,
+        on_conflict: OnConflict::Overwrite,
     };
     arc.extract(&opts, Some("secret"), &mut |_p| true)
         .expect("extract");
@@ -273,7 +438,7 @@ fn encrypted_zip_wrong_password_on_extract() {
         dest: dest.clone(),
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
-        overwrite: true,
+        on_conflict: OnConflict::Overwrite,
     };
     let err = arc
         .extract(&opts, Some("wrong"), &mut |_p| true)
@@ -290,7 +455,7 @@ fn encrypted_zip_extract_with_password_succeeds() {
         dest: dest.clone(),
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
-        overwrite: true,
+        on_conflict: OnConflict::Overwrite,
     };
     arc.extract(&opts, Some("secret"), &mut |_p| true)
         .expect("extract with correct pw");

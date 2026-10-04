@@ -1,8 +1,11 @@
-﻿//! `Archive`: open/list entries through the 7z.dll `IInArchive` COM object.
+//! `Archive`: open/list entries through the 7z.dll `IInArchive` COM object.
 
 use crate::com::callbacks::OpenCallbackOwner;
 use crate::com::instream::{self, FileStreamOwner};
-use crate::com::propvariant::PropVariant;
+use crate::com::propvariant::{
+    PropVariant, ERRFLAGS_ENCRYPTED_HEADERS_ERROR, ERRFLAGS_IS_NOT_ARC, KPID_CRC, KPID_ENCRYPTED,
+    KPID_ERROR_FLAGS, KPID_IS_DIR, KPID_MTIME, KPID_PATH, KPID_SIZE, VT_BOOL, VT_UI4, VT_UI8,
+};
 use crate::com::vtables::{InArchiveGetStreamVt, InArchiveVt, InStreamVt};
 use crate::com::{
     CLSID_FORMAT_7Z, CLSID_FORMAT_BZIP2, CLSID_FORMAT_GZIP, CLSID_FORMAT_ISO, CLSID_FORMAT_RAR,
@@ -10,10 +13,15 @@ use crate::com::{
     Guid, IID_IIN_ARCHIVE_GET_STREAM, S_OK,
 };
 use crate::dll;
-use crate::error::ZipnestError;
+use crate::error::{hr_failed, ZipnestError};
 use crate::types::{ArchiveEntry, ArchiveOpenOptions, ExtractOptions, ExtractProgress, ExtractStats};
 use std::ffi::c_void;
 use std::path::Path;
+
+/// Cap on the initial `Vec` capacity used by [`Archive::entries`]: the item
+/// count comes from the archive header and must never drive an allocation
+/// proportional to a hostile number.
+const MAX_PREALLOC_ENTRIES: u32 = 4096;
 
 pub struct Archive {
     raw: *mut c_void,   // IInArchive (owned)
@@ -115,7 +123,7 @@ impl Archive {
                     &mut raw,
                 )
             };
-            if hr != S_OK || raw.is_null() {
+            if hr_failed(hr) || raw.is_null() {
                 unsafe { stream.release_own() };
                 last_err = crate::error::map_hresult(hr);
                 continue;
@@ -134,6 +142,11 @@ impl Archive {
             };
             unsafe { cb.release_own() };
 
+            // `Open` is the one method where S_FALSE is *not* a soft success:
+            // 7-Zip's handlers return it for "this is not my format" (cf.
+            // `OpenForSize`: "S_FALSE - is not archive", IArchive.h), which is
+            // what makes the RAR5 -> legacy-RAR fallback work. Accepting
+            // S_FALSE here would return an Archive for a corrupt file.
             if hr == S_OK {
                 return Ok(Archive {
                     raw,
@@ -141,14 +154,17 @@ impl Archive {
                     _not_send: std::ptr::null_mut(),
                 });
             }
-            // Failed: drop both objects, remember error, try next candidate.
+            // Failed: read the engine's error flags while the object is still
+            // alive (they carry the real reason), then drop both objects,
+            // remember the error, try next candidate.
+            let error_flags = unsafe { archive_error_flags(raw) };
             unsafe {
                 let vt = &**(raw as *const *const InArchiveVt);
                 (vt.close)(raw);
                 (vt.release)(raw);
                 stream.release_own();
             }
-            last_err = map_open_error(hr, &state);
+            last_err = map_open_error(hr, &state, error_flags);
         }
         Err(last_err)
     }
@@ -176,14 +192,21 @@ impl Archive {
         let hr = unsafe {
             dll.create_object(&CLSID_FORMAT_SPLIT, &crate::com::IID_IIN_ARCHIVE, &mut split_raw)
         };
-        if hr != S_OK || split_raw.is_null() {
+        if hr_failed(hr) || split_raw.is_null() {
             unsafe { stream.release_own() };
             return Err(crate::error::map_hresult(hr));
         }
         let cb = OpenCallbackOwner::new(opts.password.clone(), dir.clone(), file_name.clone(), true);
+        let state = std::sync::Arc::clone(cb.state());
         let hr = unsafe {
             let vt = &**(split_raw as *const *const InArchiveVt);
             (vt.open)(split_raw, stream.as_void(), std::ptr::null(), cb.as_void())
+        };
+        // Same S_FALSE rule as above, so only read the flags on a failure.
+        let error_flags = if hr == S_OK {
+            0
+        } else {
+            unsafe { archive_error_flags(split_raw) }
         };
         unsafe {
             cb.release_own();
@@ -196,7 +219,9 @@ impl Archive {
         };
         if hr != S_OK {
             close_split(split_raw);
-            return Err(ZipnestError::NotAnArchive);
+            // This is where a volume that exists but cannot be read (locked,
+            // ACL-denied) surfaces: the callback recorded the real cause.
+            return Err(map_open_error(hr, &state, error_flags));
         }
 
         // --- Stage 2: fetch the combined, seekable stream. ---
@@ -206,6 +231,8 @@ impl Archive {
             let mut gs_iface: *mut c_void = std::ptr::null_mut();
             let qhr =
                 (qi_vt.query_interface)(split_raw, &IID_IIN_ARCHIVE_GET_STREAM, &mut gs_iface);
+            // QueryInterface must answer S_OK or an error (`S_FALSE` is not a
+            // success for it), so the strict test is deliberate here.
             if qhr != S_OK || gs_iface.is_null() {
                 (qi_vt.close)(split_raw);
                 (qi_vt.release)(split_raw);
@@ -218,7 +245,7 @@ impl Archive {
             (qi_vt.release)(split_raw);
             ghr
         };
-        if hr != S_OK || combined.is_null() {
+        if hr_failed(hr) || combined.is_null() {
             return Err(ZipnestError::NotAnArchive);
         }
 
@@ -232,7 +259,7 @@ impl Archive {
             }
             let mut raw: *mut c_void = std::ptr::null_mut();
             let hr = unsafe { dll.create_object(clsid, &crate::com::IID_IIN_ARCHIVE, &mut raw) };
-            if hr != S_OK || raw.is_null() {
+            if hr_failed(hr) || raw.is_null() {
                 last_err = crate::error::map_hresult(hr);
                 continue;
             }
@@ -255,22 +282,27 @@ impl Archive {
                     _not_send: std::ptr::null_mut(),
                 });
             }
+            let error_flags = unsafe { archive_error_flags(raw) };
             unsafe {
                 let vt = &**(raw as *const *const InArchiveVt);
                 (vt.close)(raw);
                 (vt.release)(raw);
             }
-            last_err = map_open_error(hr, &state);
+            last_err = map_open_error(hr, &state, error_flags);
         }
         unsafe { instream::release_raw(combined) };
         Err(last_err)
     }
 
+    /// Item count as reported by the handler, or `0` when the handler fails to
+    /// report one. This is a display helper (`len`/`is_empty`/`Debug`); it has
+    /// no error channel, so callers that need the count to be truthful must use
+    /// [`Self::entries`], which re-reads it and surfaces the engine's error.
     pub fn len(&self) -> u32 {
         unsafe {
             let vt = &**(self.raw as *const *const InArchiveVt);
             let mut n: u32 = 0;
-            if (vt.get_number_of_items)(self.raw, &mut n) != S_OK {
+            if hr_failed((vt.get_number_of_items)(self.raw, &mut n)) {
                 0
             } else {
                 n
@@ -283,46 +315,63 @@ impl Archive {
     }
 
     /// Enumerate all entries with metadata (Task 6).
+    ///
+    /// A property read the engine reports as failed becomes an error: turning it
+    /// into an empty path / `size = 0` / "no timestamp" would hand the caller a
+    /// list that quietly lies about the archive.
     pub fn entries(&self) -> Result<Vec<ArchiveEntry>, ZipnestError> {
-        let count = self.len();
-        let mut out = Vec::with_capacity(count as usize);
+        let count = unsafe {
+            let vt = &**(self.raw as *const *const InArchiveVt);
+            let mut n: u32 = 0;
+            let hr = (vt.get_number_of_items)(self.raw, &mut n);
+            if hr_failed(hr) {
+                return Err(crate::error::map_hresult(hr));
+            }
+            n
+        };
+        if count == 0 {
+            // A handler with a weak signature check can report "opened" for a
+            // foreign file; its own error flags decide. This mirrors what
+            // 7-Zip's client does with `kpidErrorFlags` after `Open`.
+            let flags = unsafe { archive_error_flags(self.raw) };
+            if let Some(e) = error_flags_error(flags, false) {
+                return Err(e);
+            }
+        }
+        // The item count is attacker-controlled: a header claiming 4 billion
+        // entries must not turn into a 4-billion-element allocation. Grow on
+        // demand past the cap instead.
+        let mut out = Vec::with_capacity(count.min(MAX_PREALLOC_ENTRIES) as usize);
         for index in 0..count {
-            let mut pv = PropVariant::empty();
             unsafe {
                 let vt = &**(self.raw as *const *const InArchiveVt);
                 // kpidPath
-                (vt.get_property)(self.raw, index, crate::com::propvariant::KPID_PATH, &mut pv);
-                let path = pv.take_bstr().unwrap_or_default();
-                pv.clear();
+                let mut path_pv = read_property(vt, self.raw, index, KPID_PATH)?;
+                let path = path_pv.take_bstr().unwrap_or_default();
+                path_pv.clear();
                 // kpidIsDir
-                (vt.get_property)(self.raw, index, crate::com::propvariant::KPID_IS_DIR, &mut pv);
-                let is_dir = pv.vt == crate::com::propvariant::VT_BOOL && pv.as_bool();
-                pv.clear();
+                let dir_pv = read_property(vt, self.raw, index, KPID_IS_DIR)?;
+                let is_dir = dir_pv.vt == VT_BOOL && dir_pv.as_bool();
                 // kpidSize
-                (vt.get_property)(self.raw, index, crate::com::propvariant::KPID_SIZE, &mut pv);
-                let size = if pv.vt == crate::com::propvariant::VT_UI8 { pv.as_u64() } else { 0 };
-                pv.clear();
+                let size_pv = read_property(vt, self.raw, index, KPID_SIZE)?;
+                let size = if size_pv.vt == VT_UI8 {
+                    size_pv.as_u64()
+                } else {
+                    0
+                };
                 // kpidCRC
-                (vt.get_property)(self.raw, index, crate::com::propvariant::KPID_CRC, &mut pv);
-                let crc = if pv.vt == crate::com::propvariant::VT_UI4 {
-                    Some(pv.as_u64() as u32)
+                let crc_pv = read_property(vt, self.raw, index, KPID_CRC)?;
+                let crc = if crc_pv.vt == VT_UI4 {
+                    Some(crc_pv.as_u64() as u32)
                 } else {
                     None
                 };
-                pv.clear();
                 // kpidMTime
-                (vt.get_property)(self.raw, index, crate::com::propvariant::KPID_MTIME, &mut pv);
-                let mtime = pv.as_system_time();
-                pv.clear();
+                let mtime_pv = read_property(vt, self.raw, index, KPID_MTIME)?;
+                let mtime = mtime_pv.as_system_time();
                 // kpidEncrypted
-                (vt.get_property)(
-                    self.raw,
-                    index,
-                    crate::com::propvariant::KPID_ENCRYPTED,
-                    &mut pv,
-                );
-                let encrypted = pv.vt == crate::com::propvariant::VT_BOOL && pv.as_bool();
-                pv.clear();
+                let enc_pv = read_property(vt, self.raw, index, KPID_ENCRYPTED)?;
+                let encrypted = enc_pv.vt == VT_BOOL && enc_pv.as_bool();
                 out.push(ArchiveEntry {
                     index,
                     path,
@@ -362,10 +411,76 @@ impl Archive {
     }
 }
 
-fn map_open_error(hr: i32, state: &crate::com::callbacks::OpenState) -> ZipnestError {
+/// Read one `IInArchive::GetProperty` value, or the engine's error.
+///
+/// `hr < 0` is reported instead of being turned into a default value; `hr >= 0`
+/// with `VT_EMPTY` is the engine's way of saying "that property is not set".
+unsafe fn read_property(
+    vt: &InArchiveVt,
+    raw: *mut c_void,
+    index: u32,
+    prop_id: u32,
+) -> Result<PropVariant, ZipnestError> {
+    let mut pv = PropVariant::empty();
+    let hr = (vt.get_property)(raw, index, prop_id, &mut pv);
+    if hr_failed(hr) {
+        pv.clear();
+        return Err(crate::error::map_hresult(hr));
+    }
+    Ok(pv)
+}
+
+/// `IInArchive::GetArchiveProperty(kpidErrorFlags)` → its `VT_UI4` bits, or `0`
+/// when the handler does not report them.
+unsafe fn archive_error_flags(raw: *mut c_void) -> u32 {
+    let vt = &**(raw as *const *const InArchiveVt);
+    let mut pv = PropVariant::empty();
+    let hr = (vt.get_archive_property)(raw, KPID_ERROR_FLAGS, &mut pv);
+    let flags = if !hr_failed(hr) && pv.vt == VT_UI4 {
+        pv.as_u64() as u32
+    } else {
+        0
+    };
+    pv.clear();
+    flags
+}
+
+/// Map the hard bits of `kpidErrorFlags` onto the errors the UI knows.
+///
+/// Only the two unambiguous cases are mapped; the other bits (header warnings,
+/// `UnexpectedEnd`, CRC, …) leave the archive usable, exactly as 7-Zip's own
+/// client treats them after `Open`.
+fn error_flags_error(flags: u32, password_supplied: bool) -> Option<ZipnestError> {
+    if flags & ERRFLAGS_ENCRYPTED_HEADERS_ERROR != 0 {
+        return Some(if password_supplied {
+            ZipnestError::PasswordIncorrect
+        } else {
+            ZipnestError::PasswordRequired
+        });
+    }
+    if flags & ERRFLAGS_IS_NOT_ARC != 0 {
+        return Some(ZipnestError::NotAnArchive);
+    }
+    None
+}
+
+fn map_open_error(
+    hr: i32,
+    state: &crate::com::callbacks::OpenState,
+    error_flags: u32,
+) -> ZipnestError {
     // E_ABORT and friends go through the single mapping table first.
     if !matches!(crate::error::map_hresult(hr), ZipnestError::Engine(_)) {
         return crate::error::map_hresult(hr);
+    }
+    // A callback-level I/O failure (a volume that exists but could not be
+    // opened) is the actionable cause: report it rather than "not an archive".
+    let volume_io_error = match state.io_error.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(p) => p.into_inner().take(),
+    };
+    if let Some(e) = volume_io_error {
+        return ZipnestError::Io(e);
     }
     // The engine asked for a password during Open:
     //  - none supplied  -> password required
@@ -379,6 +494,12 @@ fn map_open_error(hr: i32, state: &crate::com::callbacks::OpenState) -> ZipnestE
         } else {
             ZipnestError::PasswordRequired
         };
+    }
+    // Handlers that never ask still report encrypted headers through
+    // `kpidErrorFlags`; without the flags that case is indistinguishable from
+    // "not an archive".
+    if let Some(e) = error_flags_error(error_flags, state.password.is_some()) {
+        return e;
     }
     ZipnestError::NotAnArchive
 }

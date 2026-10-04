@@ -10,6 +10,7 @@ use super::{
     qi_matches, Guid, Hresult, ComObject, E_FAIL, IID_IOUT_STREAM, IID_ISEQ_OUT_STREAM,
     IID_IUNKNOWN, S_OK,
 };
+use crate::error::{seek_target_checked, E_NEGATIVE_SEEK};
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::raw::c_void;
@@ -83,6 +84,11 @@ unsafe extern "system" fn write(
     if size == 0 {
         return S_OK;
     }
+    if data.is_null() {
+        // Writing `size > 0` bytes out of a null buffer is UB; the engine never
+        // asks for that, so a failure here means an ABI/layout mismatch.
+        return E_FAIL;
+    }
     let this = this as *mut FileOutStream;
     let buf = std::slice::from_raw_parts(data as *const u8, size as usize);
     let mut file = match (*this).file.lock() {
@@ -106,17 +112,30 @@ unsafe extern "system" fn seek(
     new_position: *mut u64,
 ) -> Hresult {
     let this = this as *mut FileOutStream;
-    let whence = match origin {
-        0 => SeekFrom::Start(offset as u64),
-        1 => SeekFrom::Current(offset),
-        2 => SeekFrom::End(offset),
-        _ => return E_FAIL,
-    };
     let mut file = match (*this).file.lock() {
         Ok(g) => g,
         Err(_) => return E_FAIL,
     };
-    match file.seek(whence) {
+    // Same rule as the input stream: resolve the origin here, so a negative
+    // offset cannot wrap into a huge forward seek reported as S_OK
+    // (vendor/7zip-sdk/IStream.h requires an error before the stream start).
+    let base: u64 = match origin {
+        0 => 0,
+        1 => match file.stream_position() {
+            Ok(pos) => pos,
+            Err(_) => return E_FAIL,
+        },
+        2 => match file.metadata() {
+            Ok(meta) => meta.len(),
+            Err(_) => return E_FAIL,
+        },
+        _ => return E_FAIL,
+    };
+    let target = match seek_target_checked(base, offset) {
+        Some(t) => t,
+        None => return E_NEGATIVE_SEEK,
+    };
+    match file.seek(SeekFrom::Start(target)) {
         Ok(pos) => {
             if !new_position.is_null() {
                 *new_position = pos;
@@ -392,6 +411,10 @@ unsafe extern "system" fn vol_write(
     if size == 0 {
         return S_OK;
     }
+    if data.is_null() {
+        // See `write`: a non-zero write from a null buffer is UB.
+        return E_FAIL;
+    }
     let this = this as *mut VolumeOutStream;
     let buf = std::slice::from_raw_parts(data as *const u8, size as usize);
     let mut state = match (*this).state.lock() {
@@ -525,11 +548,74 @@ pub unsafe fn finalize_volumes(p: *mut c_void) -> Option<u64> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn extending_past_end_creates_and_sizes_gap_volumes() {
-        let dir = std::env::temp_dir().join(format!("zn-volstream-{}", std::process::id()));
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("zn-outstream-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn plain_seek_rejects_a_position_before_the_start_of_the_stream() {
+        let dir = temp_dir("neg");
+        let p = new(&dir.join("out.bin")).unwrap();
+        let mut processed = 0u32;
+        let body = [1u8, 2, 3, 4];
+        unsafe {
+            assert_eq!(
+                write(p, body.as_ptr() as *const c_void, 4, &mut processed),
+                S_OK
+            );
+            assert_eq!(processed, 4);
+            assert_eq!(seek(p, -1, 0, std::ptr::null_mut()), E_NEGATIVE_SEEK);
+            assert_eq!(seek(p, -5, 1, std::ptr::null_mut()), E_NEGATIVE_SEEK);
+            assert_eq!(seek(p, -5, 2, std::ptr::null_mut()), E_NEGATIVE_SEEK);
+            let mut pos = u64::MAX;
+            assert_eq!(seek(p, -2, 1, &mut pos), S_OK);
+            assert_eq!(pos, 2);
+            assert_eq!(seek(p, 0, 0, &mut pos), S_OK);
+            assert_eq!(pos, 0);
+            assert_eq!(seek(p, -4, 2, &mut pos), S_OK);
+            assert_eq!(pos, 0);
+            assert_eq!(seek(p, 0, 9, std::ptr::null_mut()), E_FAIL);
+            release_void(p);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_rejects_a_null_buffer_but_allows_a_zero_size_write() {
+        let dir = temp_dir("null");
+        let p = new(&dir.join("out.bin")).unwrap();
+        let mut processed = 9u32;
+        unsafe {
+            assert_eq!(write(p, std::ptr::null(), 4, &mut processed), E_FAIL);
+            assert_eq!(processed, 0);
+            // A zero-size write from a null buffer is legal.
+            assert_eq!(write(p, std::ptr::null(), 0, &mut processed), S_OK);
+            assert_eq!(processed, 0);
+            release_void(p);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn volume_write_rejects_a_null_buffer_but_allows_a_zero_size_write() {
+        let dir = temp_dir("volnull");
+        let p = new_volumes(&dir.join("out.7z"), 100).unwrap();
+        let mut processed = 9u32;
+        unsafe {
+            assert_eq!(vol_write(p, std::ptr::null(), 4, &mut processed), E_FAIL);
+            assert_eq!(processed, 0);
+            assert_eq!(vol_write(p, std::ptr::null(), 0, &mut processed), S_OK);
+            release_void_volumes(p);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extending_past_end_creates_and_sizes_gap_volumes() {
+        let dir = temp_dir("volstream");
         let dest = dir.join("out.7z");
 
         let p = new_volumes(&dest, 100).unwrap();

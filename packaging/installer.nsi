@@ -1,14 +1,26 @@
-﻿; ZipNest 0.3.5 native installer (NSIS Unicode)
+; ZipNest 0.3.6 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.3.5"
-!define INSTDIR "$PROGRAMFILES\ZipNest"
+!define VERSION "0.3.6"
+; This installer is a 32-bit process, so plain $PROGRAMFILES would resolve to
+; "C:\Program Files (x86)" on 64-bit Windows. ZipNest ships as x64, so force
+; the 64-bit location. InstallDirRegKey below still reads HKCU\...\ZipNest's
+; InstallLocation, which is written from this same (now 64-bit) path.
+!define INSTDIR "$PROGRAMFILES64\ZipNest"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\ZipNest"
 
+; User-facing failures. Kept as defines so every site stays in sync. The text is
+; plain: NSIS stores !define text verbatim, so a "$\r$\n" in here would show up
+; in the message literally. Line breaks therefore live at the MessageBox calls.
+!define ZN_RUNNING_MSG "ZipNest 仍在运行，请先关闭它再继续。"
+!define ZN_RUNNING_MSG_EN "ZipNest is still running. Please close it, then run setup again."
+!define ZN_WIN11_MSG "Win11 右键菜单注册失败（ZipNest 其余功能正常）。"
+!define ZN_WIN11_MSG_EN "Windows 11 context menu registration failed. The rest of ZipNest works normally."
+
 Name "${APPNAME}"
-OutFile "ZipNest_0.3.5_x64-setup.exe"
+OutFile "ZipNest_0.3.6_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -25,33 +37,54 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
-; Force-close a running ZipNest so its files are not locked while we overwrite
-; them (otherwise the user sees "cannot write file" and has to close it first).
-Function CloseRunningZipNest
-  StrCpy $1 0
-  zn_kill_again:
+; Close a running ZipNest so its exe/dll are not locked while we overwrite
+; them. Never force-kills first: ZipNest may be mid-extraction/mid-archive, so
+; we ask it to close, wait, and only escalate to /F if it really will not go.
+; On failure we tell the user and Abort instead of overwriting locked files.
+;
+; $0 = taskkill exit code (0 = a request was delivered / a kill succeeded;
+;      128 = process not found, i.e. it is gone), $1/$2 = gentle retries,
+;      $3 = forced-kill retries (allowed to wrap: we only care about parity).
+!macro ZN_TRY_CLOSE_RUNNING pid_var label_prefix
+  StrCpy ${pid_var} 0
+  StrCpy $2 0
+  StrCpy $3 0
+
+  ; Phase 1: polite close request (no /F); N attempts, ~1s apart.
+  ${label_prefix}_gentle:
+    nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM zipnest.exe'
+    Pop $0
+    IntCmp $0 0 ${label_prefix}_gentle_more ${label_prefix}_gentle_more ${label_prefix}_gone
+  ${label_prefix}_gentle_more:
+    Sleep 1000
+    IntOp $2 $2 + 1
+    IntCmp $2 10 ${label_prefix}_forced ${label_prefix}_gentle ${label_prefix}_gentle
+
+  ; Phase 2: the app refused to close; force it, then re-check that it is gone.
+  ${label_prefix}_forced:
     nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM zipnest.exe'
     Pop $0
-    IntCmp $0 0 zn_kill_wait zn_kill_done zn_kill_done
-  zn_kill_wait:
-    Sleep 400
-    IntOp $1 $1 + 1
-    IntCmp $1 12 zn_kill_done zn_kill_again zn_kill_done
-  zn_kill_done:
+    ; 0 = killed, 128 = already gone, both mean we can carry on.
+    IntCmp $0 0 ${label_prefix}_gone ${label_prefix}_force_more ${label_prefix}_force_more
+  ${label_prefix}_force_more:
+    Sleep 500
+    IntOp $3 $3 + 1
+    IntCmp $3 12 ${label_prefix}_abort ${label_prefix}_forced ${label_prefix}_forced
+
+  ; Phase 3: still running -- refuse to overwrite its files.
+  ${label_prefix}_abort:
+    MessageBox MB_OK|MB_ICONSTOP "${ZN_RUNNING_MSG}$\r$\n$\r$\n${ZN_RUNNING_MSG_EN}"
+    Abort
+  ${label_prefix}_gone:
+!macroend
+
+Function CloseRunningZipNest
+  !insertmacro ZN_TRY_CLOSE_RUNNING $1 zn_kill
 FunctionEnd
 
 ; Same as above, for the uninstall section (which may only call un.* functions).
 Function un.CloseRunningZipNest
-  StrCpy $1 0
-  zn_ukill_again:
-    nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM zipnest.exe'
-    Pop $0
-    IntCmp $0 0 zn_ukill_wait zn_ukill_done zn_ukill_done
-  zn_ukill_wait:
-    Sleep 400
-    IntOp $1 $1 + 1
-    IntCmp $1 12 zn_ukill_done zn_ukill_again zn_ukill_done
-  zn_ukill_done:
+  !insertmacro ZN_TRY_CLOSE_RUNNING $1 zn_ukill
 FunctionEnd
 
 Section "Install"
@@ -109,6 +142,12 @@ Function RegisterWin11Shell
 do_register:
   nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Win11Shell\install.ps1" -InstallDir "$INSTDIR" -PackageDir "$INSTDIR\Win11Shell"'
   Pop $0
+  ; Certificate import / Add-AppxPackage failures used to be swallowed, so the
+  ; user saw "installed" but had no context menu. Report, but do not abort:
+  ; only the Win11 modern menu is missing.
+  IntCmp $0 0 skip_register win11_register_failed skip_register
+win11_register_failed:
+  MessageBox MB_OK|MB_ICONEXCLAMATION "${ZN_WIN11_MSG}$\r$\n$\r$\n${ZN_WIN11_MSG_EN}"
 skip_register:
 FunctionEnd
 
@@ -119,6 +158,12 @@ Function un.UnregisterWin11Shell
 do_unregister:
   nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Win11Shell\uninstall.ps1" -PackageDir "$INSTDIR\Win11Shell"'
   Pop $0
+  ; Common on upgrades from an older release: uninstall.ps1 was never shipped,
+  ; so the script cannot run. Files are still removed below, so just report it.
+  IntCmp $0 0 skip_unregister win11_unregister_failed skip_unregister
+win11_unregister_failed:
+  DetailPrint "Win11 右键菜单卸载脚本执行失败（将直接删除文件）"
+  MessageBox MB_OK|MB_ICONEXCLAMATION "${ZN_WIN11_MSG}$\r$\n$\r$\n${ZN_WIN11_MSG_EN}"
 skip_unregister:
 FunctionEnd
 
@@ -128,23 +173,57 @@ Section "Uninstall"
   ; Unregister the per-user package before deleting its manifest/files.
   Call un.UnregisterWin11Shell
 
-  Delete "$INSTDIR\zipnest.exe"
-  Delete "$INSTDIR\engines\7z.dll"
-  Delete "$INSTDIR\engines\sfx\7z.sfx"
-  Delete "$INSTDIR\engines\sfx\7zCon.sfx"
-  Delete "$INSTDIR\licenses\7zip.txt"
-  Delete "$INSTDIR\zipnest_shell.dll"
-  Delete "$INSTDIR\Win11Shell\ZipNestShell.msix"
-  Delete "$INSTDIR\Win11Shell\ZipNestCodesign.cer"
-  Delete "$INSTDIR\Win11Shell\install.ps1"
-  Delete "$INSTDIR\Win11Shell\uninstall.ps1"
-  Delete "$INSTDIR\uninstall.exe"
-  ; /r also clears the AppX registration metadata subfolder.
-  RMDir /r "$INSTDIR\Win11Shell"
-  RMDir "$INSTDIR\engines\sfx"
-  RMDir "$INSTDIR\engines"
-  RMDir "$INSTDIR\licenses"
+  ; Drop the per-user shell integration while zipnest.exe still exists on disk.
+  ; The app writes HKCU\Software\Classes\ZipNest.<ext> (9 extensions),
+  ; HKCU\Software\Classes\*\shell\ZipNest, ...\Directory\shell\ZipNest,
+  ; ...\Directory\Background\shell\ZipNest and the extensions' default values;
+  ; --unregister-shell removes exactly those. HKCU\Software\Classes is not
+  ; WOW64-redirected, so the 32-bit installer needs no SetRegView here.
+  nsExec::ExecToLog '"$INSTDIR\zipnest.exe" --unregister-shell'
+  Pop $0
+  IntCmp $0 0 zn_shell_unregistered zn_shell_unregister_failed zn_shell_unregister_failed
+zn_shell_unregister_failed:
+  ; Never abort the uninstall over this: the files below are still removed.
+  DetailPrint "右键菜单/文件关联清理失败（将记录残留项）"
+zn_shell_unregistered:
+
+  ; Program files. ClearErrors/IfErrors records whether any file survived
+  ; (e.g. a running instance or AV lock) so we can skip the recursive cleanup.
+  ClearErrors
+  Delete "$INSTDIR\zipnest.exe" /REBOOTOK
+  Delete "$INSTDIR\uninstall.exe" /REBOOTOK
+  Delete "$INSTDIR\zipnest_shell.dll" /REBOOTOK
+  Delete "$INSTDIR\engines\7z.dll" /REBOOTOK
+  Delete "$INSTDIR\engines\sfx\7z.sfx" /REBOOTOK
+  Delete "$INSTDIR\engines\sfx\7zCon.sfx" /REBOOTOK
+  Delete "$INSTDIR\licenses\7zip.txt" /REBOOTOK
+  Delete "$INSTDIR\Win11Shell\ZipNestShell.msix" /REBOOTOK
+  Delete "$INSTDIR\Win11Shell\ZipNestCodesign.cer" /REBOOTOK
+  Delete "$INSTDIR\Win11Shell\install.ps1" /REBOOTOK
+  Delete "$INSTDIR\Win11Shell\uninstall.ps1" /REBOOTOK
+  IfErrors zn_uninstall_keep_dirs zn_uninstall_drop_dirs
+
+zn_uninstall_keep_dirs:
+  ; A file is still there (locked / pending reboot). Keep every directory so
+  ; the leftover file is not orphaned in a deleted tree.
+  Goto zn_uninstall_dirs_done
+
+zn_uninstall_drop_dirs:
+  ; Only the program's own subfolders are removed recursively: the app lets the
+  ; user drop their own files next to these, and the recursive form is scoped to
+  ; these directories, never to $INSTDIR itself.
+  RMDir /r "$INSTDIR\Win11Shell"   ; includes the AppX registration metadata
+  RMDir /r "$INSTDIR\engines"
+  RMDir /r "$INSTDIR\licenses"
+  ; $INSTDIR itself is removed only when nothing but the app's own files is
+  ; left in it, so a user's own file dropped in the install root survives.
   RMDir "$INSTDIR"
+zn_uninstall_dirs_done:
+
+  ; Runtime state owned by the app: settings.json (and any other per-user file
+  ; the app created under that folder).
+  RMDir /r "$APPDATA\ZipNest"
+
   Delete "$SMPROGRAMS\ZipNest\ZipNest.lnk"
   Delete "$SMPROGRAMS\ZipNest\卸载 ZipNest.lnk"
   RMDir "$SMPROGRAMS\ZipNest"

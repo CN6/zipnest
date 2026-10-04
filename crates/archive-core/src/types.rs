@@ -32,13 +32,45 @@ pub struct ArchiveEntry {
     pub encrypted: bool,
 }
 
+/// What to do when the destination already holds a file with the entry's name.
+///
+/// The user-facing `"ask"` policy is resolved by the UI (it is the dialog
+/// itself) into one of these before the engine is called: the engine never
+/// prompts. Parsing lives in [`OnConflict::from_policy`] so the wire strings
+/// stay in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnConflict {
+    /// Replace the existing file. The replacement only happens after the new
+    /// entry has been written completely, so a failed or cancelled run cannot
+    /// truncate the file that was there before.
+    #[default]
+    Overwrite,
+    /// Leave the existing file untouched; the entry is reported as skipped.
+    Skip,
+    /// Write next to the existing file as `name (2).ext`, `name (3).ext`, …
+    Rename,
+}
+
+impl OnConflict {
+    /// Map a settings/IPC policy string (`"overwrite" | "skip" | "rename"`,
+    /// `"ask"`, `None`, or anything unknown) onto engine behavior. Unknown
+    /// values fall back to the safe default rather than failing the call.
+    pub fn from_policy(policy: Option<&str>) -> Self {
+        match policy.map(|p| p.trim().to_ascii_lowercase()) {
+            Some(ref p) if p == "skip" => OnConflict::Skip,
+            Some(ref p) if p == "rename" => OnConflict::Rename,
+            _ => OnConflict::Overwrite,
+        }
+    }
+}
+
 /// Extraction request (see Task 8).
 #[derive(Debug, Clone)]
 pub struct ExtractOptions {
     pub dest: PathBuf,
     pub entries: Vec<u32>,
     pub max_total_bytes: u64,
-    pub overwrite: bool,
+    pub on_conflict: OnConflict,
 }
 
 /// Progress snapshot handed to the extract callback.
@@ -54,9 +86,11 @@ pub struct ExtractProgress {
 pub struct ExtractStats {
     pub files: u32,
     pub bytes: u64,
-    /// Archive paths that were skipped because they could not be written safely
-    /// (path escape, Windows reserved name, …). Everything safe still extracts;
-    /// the caller surfaces these so nothing looks silently lost.
+    /// Archive paths that were not written: unsafe names (path escape, Windows
+    /// reserved name, …), entries whose destination already existed under the
+    /// `skip` policy, and entries whose destination could not be created.
+    /// Everything else still extracts; the caller surfaces these so nothing
+    /// looks silently lost.
     pub skipped: Vec<String>,
 }
 

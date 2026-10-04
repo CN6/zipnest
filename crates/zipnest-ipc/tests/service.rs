@@ -1,4 +1,4 @@
-﻿use std::path::PathBuf;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 fn fx(name: &str) -> PathBuf {
@@ -98,7 +98,7 @@ fn extract_emits_progress_and_finished_ok() {
         .unwrap();
     let dest = std::env::temp_dir().join(format!("zipnest-t4-{}", std::process::id()));
     let job = svc
-        .extract(r.id, vec!["a.txt".into()], dest.to_string_lossy().into(), true, None)
+        .extract(r.id, vec!["a.txt".into()], dest.to_string_lossy().into(), Some("overwrite".into()), None)
         .unwrap();
     wait_events(&events, 5000, |v| v.iter().any(|(n, _)| n == "job_finished"));
     let v = events.lock().unwrap();
@@ -122,7 +122,7 @@ fn extract_empty_selection_unpacks_whole_archive() {
         .unwrap();
     let dest = std::env::temp_dir().join(format!("zipnest-tall-{}", std::process::id()));
     let job = svc
-        .extract(r.id, vec![], dest.to_string_lossy().into(), true, None)
+        .extract(r.id, vec![], dest.to_string_lossy().into(), Some("overwrite".into()), None)
         .unwrap();
     wait_events(&_events, 5000, |v| v.iter().any(|(n, _)| n == "job_finished"));
     assert!(dest.join("a.txt").exists(), "whole archive should include a.txt");
@@ -148,7 +148,7 @@ fn extract_deflated_entry_writes_full_bytes() {
     let dest = std::env::temp_dir().join(format!("zipnest-t4c-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dest);
     let job = svc
-        .extract(r.id, vec!["c.txt".into()], dest.to_string_lossy().into(), true, None)
+        .extract(r.id, vec!["c.txt".into()], dest.to_string_lossy().into(), Some("overwrite".into()), None)
         .unwrap();
     wait_events(&events, 5000, |v| v.iter().any(|(n, _)| n == "job_finished"));
     let v = events.lock().unwrap();
@@ -180,7 +180,7 @@ fn extract_ui_selection_subset_writes_full_bytes() {
             r.id,
             vec!["sub".into(), "a.txt".into(), "c.txt".into()],
             dest.to_string_lossy().into(),
-            true,
+            Some("overwrite".into()),
             None,
         )
         .unwrap();
@@ -206,7 +206,7 @@ fn extract_wrong_password_reports_key() {
         .unwrap();
     let dest = std::env::temp_dir().join(format!("zipnest-t4b-{}", std::process::id()));
     let job = svc
-        .extract(r.id, vec!["a.txt".into()], dest.to_string_lossy().into(), true, Some("wrong".into()))
+        .extract(r.id, vec!["a.txt".into()], dest.to_string_lossy().into(), Some("overwrite".into()), Some("wrong".into()))
         .unwrap();
     wait_events(&events, 5000, |v| v.iter().any(|(n, _)| n == "job_finished"));
     let v = events.lock().unwrap();
@@ -228,7 +228,7 @@ fn open_with_password_then_extract_without_it_reuses_open_password() {
     let dest = std::env::temp_dir().join(format!("zipnest-t4e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dest);
     let job = svc
-        .extract(r.id, vec!["a.txt".into()], dest.to_string_lossy().into(), true, None)
+        .extract(r.id, vec!["a.txt".into()], dest.to_string_lossy().into(), Some("overwrite".into()), None)
         .unwrap();
     wait_events(&events, 5000, |v| v.iter().any(|(n, _)| n == "job_finished"));
     {
@@ -325,7 +325,7 @@ fn extract_encrypted_without_any_password_prompts() {
     let dest = std::env::temp_dir().join(format!("zipnest-t4f-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dest);
     let job = svc
-        .extract(r.id, vec!["a.txt".into()], dest.to_string_lossy().into(), true, None)
+        .extract(r.id, vec!["a.txt".into()], dest.to_string_lossy().into(), Some("overwrite".into()), None)
         .unwrap();
     wait_events(&events, 5000, |v| v.iter().any(|(n, _)| n == "job_finished"));
     {

@@ -1,4 +1,4 @@
-﻿//! Per-user Explorer integration (HKCU only).
+//! Per-user Explorer integration (HKCU only).
 //!
 //! Everything here is **HKCU** on purpose: machine-wide `HKLM` registration
 //! needs elevation, which the product never requests (spec §10). The registry
@@ -43,6 +43,14 @@ pub enum RegOp {
     DeleteValue {
         key: String,
         name: String,
+    },
+    /// Remove a value only while it still holds `expect`. Unregistering must
+    /// never clobber a handler the user picked after we wrote ours.
+    DeleteValueIfEquals {
+        key: String,
+        /// `None` targets the key's default value.
+        name: Option<String>,
+        expect: String,
     },
 }
 
@@ -108,13 +116,24 @@ pub fn assoc_ops(exe: &std::path::Path) -> Vec<RegOp> {
     ops
 }
 
-/// Undo [`assoc_ops`]: drop each ProgID tree and its OpenWithProgids entry.
-/// The extension's default value is left untouched (restoring the previous
-/// opener is the user's call — Windows keeps the old handler in UserChoice).
+/// Undo [`assoc_ops`]: drop each ProgID tree, its `OpenWithProgids` entry, and
+/// the "we are the default handler" value we wrote.
+///
+/// The extension's default value is only cleared while it still points at our
+/// ProgID: leaving it behind would point the extension at a handler that no
+/// longer exists (double-click breaks, icon goes blank), and clearing someone
+/// else's value would be worse. Clearing ours hands the extension back to the
+/// next registration in the chain (an `HKLM` handler, `OpenWithProgids`, or the
+/// user's `UserChoice`).
 pub fn assoc_removals() -> Vec<RegOp> {
     let mut ops = Vec::new();
     for ext in SUPPORTED_EXTENSIONS {
         let pid = prog_id(ext);
+        ops.push(RegOp::DeleteValueIfEquals {
+            key: format!(r"{CLASSES}\.{ext}"),
+            name: None,
+            expect: pid.clone(),
+        });
         ops.push(RegOp::DeleteKey { key: format!(r"{CLASSES}\{pid}") });
         ops.push(RegOp::DeleteValue {
             key: format!(r"{CLASSES}\.{ext}\OpenWithProgids"),
@@ -222,6 +241,7 @@ mod win32 {
     const ERROR_MORE_DATA: i32 = 234;
     const KEY_SET_VALUE: u32 = 0x0002;
     const KEY_CREATE_SUB_KEY: u32 = 0x0004;
+    const KEY_QUERY_VALUE: u32 = 0x0001;
     const KEY_WOW64_64KEY: u32 = 0x0100;
     const REG_SZ: u32 = 1;
     const REG_EXPAND_SZ: u32 = 2;
@@ -250,6 +270,21 @@ mod win32 {
         ) -> i32;
         fn RegDeleteTreeW(hkey: isize, subkey: *const u16) -> i32;
         fn RegDeleteValueW(hkey: isize, name: *const u16) -> i32;
+        fn RegOpenKeyExW(
+            hkey: isize,
+            subkey: *const u16,
+            options: u32,
+            sam: u32,
+            result: *mut isize,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hkey: isize,
+            name: *const u16,
+            reserved: *mut u32,
+            kind: *mut u32,
+            data: *mut u8,
+            len: *mut u32,
+        ) -> i32;
         fn RegCloseKey(hkey: isize) -> i32;
     }
 
@@ -328,6 +363,77 @@ mod win32 {
         rc
     }
 
+    /// Read a `REG_SZ` value; `None` when the key/value is missing or holds a
+    /// different type. Used by [`RegOp::DeleteValueIfEquals`].
+    fn read_value(key: &str, name: Option<&str>) -> Option<String> {
+        let (root, sub) = split(key);
+        let mut sub_w = wide(&sub);
+        sub_w.push(0);
+        let mut hkey = 0isize;
+        let rc = unsafe {
+            RegOpenKeyExW(
+                root,
+                sub_w.as_ptr(),
+                0,
+                KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                &mut hkey,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return None;
+        }
+        let name_w: Vec<u16> = match name {
+            Some(n) => {
+                let mut v = wide(n);
+                v.push(0);
+                v
+            }
+            None => vec![0],
+        };
+        let mut kind = 0u32;
+        let mut len = 0u32;
+        let rc = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name_w.as_ptr(),
+                std::ptr::null_mut(),
+                &mut kind,
+                std::ptr::null_mut(),
+                &mut len,
+            )
+        };
+        if rc != ERROR_SUCCESS || kind != REG_SZ || len == 0 {
+            unsafe {
+                RegCloseKey(hkey);
+            }
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        let rc = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name_w.as_ptr(),
+                std::ptr::null_mut(),
+                &mut kind,
+                buf.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        unsafe {
+            RegCloseKey(hkey);
+        }
+        if rc != ERROR_SUCCESS {
+            return None;
+        }
+        let units: Vec<u16> = buf
+            .chunks(2)
+            .filter(|c| c.len() == 2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+        Some(String::from_utf16_lossy(&units[..end]))
+    }
+
     fn delete_key(key: &str) -> i32 {
         let (root, sub) = split(key);
         let mut sub_w = wide(&sub); sub_w.push(0);
@@ -372,6 +478,16 @@ mod win32 {
                 RegOp::SetValue { key, name, value, kind } => set_value(key, name.as_deref(), value, *kind),
                 RegOp::DeleteKey { key } => delete_key(key),
                 RegOp::DeleteValue { key, name } => delete_value(key, name),
+                RegOp::DeleteValueIfEquals { key, name, expect } => {
+                    match read_value(key, name.as_deref()) {
+                        Some(current) if current.eq_ignore_ascii_case(expect) => {
+                            delete_value(key, name.as_deref().unwrap_or(""))
+                        }
+                        // Missing already, a different type, or someone else's
+                        // handler: nothing of ours to remove.
+                        _ => ERROR_SUCCESS,
+                    }
+                }
             };
             // Deleting something that was never registered is a no-op.
             if rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND && rc != ERROR_MORE_DATA {
@@ -458,6 +574,36 @@ mod tests {
             let pid = prog_id(ext);
             assert!(adds.iter().any(|o| matches!(o, RegOp::SetValue { key, .. } if key == &format!(r"HKCU\Software\Classes\{pid}"))));
             assert!(removals.iter().any(|o| matches!(o, RegOp::DeleteKey { key } if key == &format!(r"HKCU\Software\Classes\{pid}"))));
+        }
+    }
+
+    #[test]
+    fn assoc_removals_clear_only_our_extension_default() {
+        // The default value we wrote must be dropped, and dropped
+        // *conditionally*: whatever the user picks after enabling ZipNest has
+        // to survive an unregister.
+        let removals = assoc_removals();
+        for ext in SUPPORTED_EXTENSIONS {
+            let pid = prog_id(ext);
+            let key = format!(r"HKCU\Software\Classes\.{ext}");
+            let default_at = removals
+                .iter()
+                .position(|o| {
+                    matches!(
+                        o,
+                        RegOp::DeleteValueIfEquals { key: k, name: None, expect }
+                            if k == &key && expect == &pid
+                    )
+                })
+                .unwrap_or_else(|| panic!("extension default not cleared for .{ext}"));
+            let tree_at = removals
+                .iter()
+                .position(|o| matches!(o, RegOp::DeleteKey { key: k } if k == &format!(r"HKCU\Software\Classes\{pid}")))
+                .expect("progid tree removal");
+            assert!(
+                default_at < tree_at,
+                "the default value must be cleared before the ProgID tree goes away"
+            );
         }
     }
 

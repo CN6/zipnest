@@ -48,11 +48,17 @@ pub struct UpdateState {
 }
 
 fn call_progress(raw: *mut c_void, p: &CreateProgress) -> bool {
-    unsafe {
+    // The closure is arbitrary caller code. A panic escaping it would unwind
+    // through the `extern "system"` progress callback that called us, and Rust
+    // aborts the process at that boundary — the user would just see the app
+    // vanish mid-create. Treat a panic as "stop": `set_completed` turns `false`
+    // into `E_ABORT`, which `create_archive` reports as `Cancelled`.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         let slot = raw as *mut &mut dyn FnMut(&CreateProgress) -> bool;
         let f = &mut *slot;
         (**f)(p)
-    }
+    }))
+    .unwrap_or(false)
 }
 
 /// Build a [`ProgressCell`] from a borrowed progress closure.
@@ -288,5 +294,64 @@ pub fn new(items: Vec<SourceItem>, state: Arc<UpdateState>, crypto: *mut c_void)
 pub unsafe fn release_void(p: *mut c_void) {
     if !p.is_null() {
         (UPDATE_CB_VT.release)(p);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The progress cell holds a raw closure pointer, so the Arc is not
+    // `Send`/`Sync` by construction — same as `extract_to_disk` in production.
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn state_with(progress: &mut dyn FnMut(&CreateProgress) -> bool) -> Arc<UpdateState> {
+        Arc::new(UpdateState {
+            done_bytes: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
+            cancelled: AtomicU8::new(0),
+            last_path: Mutex::new(String::new()),
+            progress: Mutex::new(progress_cell(progress)),
+            io_error: Mutex::new(None),
+        })
+    }
+
+    /// Drive `set_completed` (the engine-facing callback) and report what it
+    /// returned plus whether the run was flagged as cancelled.
+    fn drive(state: &Arc<UpdateState>) -> (Hresult, bool) {
+        let cb = new(Vec::new(), Arc::clone(state), std::ptr::null_mut());
+        let complete = 7u64;
+        let hr = unsafe { set_completed(cb, &complete) };
+        unsafe { release_void(cb) };
+        (hr, state.cancelled.load(Ordering::SeqCst) == 1)
+    }
+
+    #[test]
+    fn a_progress_closure_that_panics_cancels_instead_of_aborting() {
+        let mut boom = |_: &CreateProgress| -> bool { panic!("user closure panicked") };
+        let state = state_with(&mut boom);
+        // The panic is caught inside the trampoline: a panic crossing the
+        // `extern "system"` boundary would abort the test process outright.
+        let (hr, cancelled) = drive(&state);
+        assert_eq!(hr, E_ABORT);
+        assert!(cancelled);
+    }
+
+    #[test]
+    fn false_from_the_progress_closure_maps_to_e_abort() {
+        let mut stop = |_: &CreateProgress| -> bool { false };
+        let state = state_with(&mut stop);
+        let (hr, cancelled) = drive(&state);
+        assert_eq!(hr, E_ABORT);
+        assert!(cancelled);
+    }
+
+    #[test]
+    fn true_from_the_progress_closure_keeps_going() {
+        let mut keep = |_: &CreateProgress| -> bool { true };
+        let state = state_with(&mut keep);
+        let (hr, cancelled) = drive(&state);
+        assert_eq!(hr, S_OK);
+        assert!(!cancelled);
+        assert_eq!(state.done_bytes.load(Ordering::Relaxed), 7);
     }
 }

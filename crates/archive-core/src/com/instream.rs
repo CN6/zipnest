@@ -1,4 +1,4 @@
-﻿//! `IInStream` implementation backed by a real file on disk.
+//! `IInStream` implementation backed by a real file on disk.
 //!
 //! The engine may retain and call this stream from decoder threads, so all
 //! mutable state sits behind a mutex.
@@ -6,6 +6,7 @@
 use super::vtables::InStreamVt;
 use super::{as_void, Guid, Hresult, ComObject, E_FAIL, E_NOINTERFACE, IID_IIN_STREAM,
     IID_ISEQ_IN_STREAM, IID_IUNKNOWN, S_OK};
+use crate::error::{seek_target_checked, E_NEGATIVE_SEEK};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::raw::c_void;
@@ -82,6 +83,11 @@ unsafe extern "system" fn read(
     if size == 0 {
         return S_OK;
     }
+    if data.is_null() {
+        // Reading `size > 0` bytes into a null buffer is UB; the engine never
+        // asks for that, so a failure here means an ABI/layout mismatch.
+        return E_FAIL;
+    }
     let this = this as *mut InFileStream;
     let state = &*(*this).state;
     let buf = std::slice::from_raw_parts_mut(data as *mut u8, size as usize);
@@ -108,18 +114,29 @@ unsafe extern "system" fn seek(
 ) -> Hresult {
     let this = this as *mut InFileStream;
     let state = &*(*this).state;
-    let whence = match origin {
-        0 => SeekFrom::Start(offset as u64),
-        1 => SeekFrom::Current(offset),
-        2 => SeekFrom::End(offset),
-        _ => return E_FAIL,
-    };
     let mut guard = match state.file.lock() {
         Ok(g) => g,
         Err(_) => return E_FAIL,
     };
     let (file, pos) = &mut *guard;
-    match file.seek(whence) {
+    // Resolve the origin here instead of handing the raw `offset` to the OS:
+    // `offset as u64` on a negative offset used to become a ~1.8e19 forward
+    // seek that still reported S_OK. `IInStream::Seek` must reject a position
+    // before the start of the stream (vendor/7zip-sdk/IStream.h).
+    let base: u64 = match origin {
+        0 => 0,
+        1 => *pos,
+        2 => match file.metadata() {
+            Ok(meta) => meta.len(),
+            Err(_) => return E_FAIL,
+        },
+        _ => return E_FAIL,
+    };
+    let target = match seek_target_checked(base, offset) {
+        Some(t) => t,
+        None => return E_NEGATIVE_SEEK,
+    };
+    match file.seek(SeekFrom::Start(target)) {
         Ok(new_pos) => {
             *pos = new_pos;
             if !new_position.is_null() {
@@ -127,10 +144,7 @@ unsafe extern "system" fn seek(
             }
             S_OK
         }
-        Err(_) => {
-            // Negative seek etc.
-            E_FAIL
-        }
+        Err(_) => E_FAIL,
     }
 }
 
@@ -188,6 +202,69 @@ pub unsafe fn release_raw(p: *mut c_void) {
     if !p.is_null() {
         let vt = &**(p as *const *const InStreamVt);
         (vt.release)(p);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn temp_stream(tag: &str, body: &[u8]) -> (FileStreamOwner, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("zn-instream-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("in.bin");
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(body).unwrap();
+        }
+        (FileStreamOwner::new(File::open(&path).unwrap()).unwrap(), dir)
+    }
+
+    #[test]
+    fn seek_rejects_a_position_before_the_start_of_the_stream() {
+        let (owner, dir) = temp_stream("neg", b"abcdef");
+        let p = owner.as_void();
+        unsafe {
+            assert_eq!(seek(p, -1, 0, std::ptr::null_mut()), E_NEGATIVE_SEEK);
+            assert_eq!(seek(p, -1, 1, std::ptr::null_mut()), E_NEGATIVE_SEEK);
+            assert_eq!(seek(p, -7, 2, std::ptr::null_mut()), E_NEGATIVE_SEEK);
+            // Valid seeks still work and report the new position.
+            let mut pos = u64::MAX;
+            assert_eq!(seek(p, 2, 0, &mut pos), S_OK);
+            assert_eq!(pos, 2);
+            assert_eq!(seek(p, -1, 1, &mut pos), S_OK);
+            assert_eq!(pos, 1);
+            assert_eq!(seek(p, -6, 2, &mut pos), S_OK);
+            assert_eq!(pos, 0);
+            assert_eq!(seek(p, 0, 9, std::ptr::null_mut()), E_FAIL);
+        }
+        drop(owner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_rejects_a_null_buffer_but_allows_a_zero_size_read() {
+        let (owner, dir) = temp_stream("read", b"abcdef");
+        let p = owner.as_void();
+        let mut processed = 7u32;
+        unsafe {
+            assert_eq!(read(p, std::ptr::null_mut(), 4, &mut processed), E_FAIL);
+            assert_eq!(processed, 0);
+            // A zero-size read into a null buffer is legal.
+            assert_eq!(read(p, std::ptr::null_mut(), 0, &mut processed), S_OK);
+            let mut buf = [0u8; 3];
+            assert_eq!(
+                read(p, buf.as_mut_ptr() as *mut c_void, 3, &mut processed),
+                S_OK
+            );
+            assert_eq!(processed, 3);
+            assert_eq!(&buf, b"abc");
+        }
+        drop(owner);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

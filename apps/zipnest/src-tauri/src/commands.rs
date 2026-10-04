@@ -46,7 +46,10 @@ pub fn extract(
     overwrite: bool,
     password: Option<String>,
 ) -> Result<u64, IpcError> {
-    svc.extract(id, paths, dest, overwrite, password)
+    // This UI still exposes a plain "overwrite" checkbox; the engine's conflict
+    // policy is the richer form used by the native app and by settings.
+    let on_conflict = Some(if overwrite { "overwrite" } else { "skip" }.to_string());
+    svc.extract(id, paths, dest, on_conflict, password)
 }
 
 /// Queue a create job from on-disk `sources`; returns its id. The `options`
