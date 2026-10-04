@@ -608,6 +608,7 @@ mod tests {
     }
 
     fn service_with_settings(name: &str) -> IpcService {
+        crate::sweep_stale_test_temp("zipnest-svc-");
         let root = std::env::temp_dir().join(format!("zipnest-svc-{}-{name}", std::process::id()));
         IpcService::with_settings_path(
             Arc::new(|_, _| {}),

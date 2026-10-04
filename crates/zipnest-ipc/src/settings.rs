@@ -289,6 +289,7 @@ mod tests {
     static N: AtomicU32 = AtomicU32::new(0);
 
     fn tmp_path() -> PathBuf {
+        crate::sweep_stale_test_temp("zipnest-settings-");
         let n = N.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
             .join(format!("zipnest-settings-{}-{}", std::process::id(), n))

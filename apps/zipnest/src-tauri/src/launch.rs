@@ -58,6 +58,8 @@ mod tests {
         // Flags are skipped; the exe (arg[0]) never matches.
         let plain = vec!["ZipNest.exe".to_string(), "--x".to_string()];
         assert_eq!(archive_arg(&plain), None);
+        // The scratch file used to be left in %TEMP% after every run.
+        let _ = fs::remove_file(&tmp);
     }
 
     #[test]
