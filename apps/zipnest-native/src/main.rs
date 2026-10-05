@@ -310,16 +310,16 @@ fn main() -> Result<(), eframe::Error> {
         .with_inner_size([DESIGN_WIDTH, 620.0])
         .with_title(single_instance::WINDOW_TITLE);
     // Stored geometry is in physical pixels. `ViewportBuilder` wants logical
-    // points, so divide by the *effective* pixels-per-point: the monitor DPI
-    // scale times the saved UI zoom, which is exactly what
-    // `ctx.pixels_per_point()` returns on the side that wrote the value.
-    // Dividing by the DPI scale alone made every restart grow the window by the
-    // zoom factor and walk it down-right until it left the screen.
-    let ppp = effective_pixels_per_point(system_dpi_scale(), saved.ui_zoom);
+    // points, so divide by the monitor DPI scale — the same factor the saving
+    // side multiplies by. Note that egui's viewport rects are native points:
+    // the UI zoom does not enter them, so using `pixels_per_point()` on either
+    // side scaled the stored value by the zoom factor as well, and the window
+    // grew by that factor on every start until it walked off the screen.
+    let dpi = system_dpi_scale();
     if let (Some(w), Some(h)) = (saved.window_width, saved.window_height) {
         viewport = viewport.with_inner_size([
-            physical_to_logical(w as f32, ppp),
-            physical_to_logical(h as f32, ppp),
+            physical_to_logical(w as f32, dpi),
+            physical_to_logical(h as f32, dpi),
         ]);
     }
     if let (Some(x), Some(y)) = (saved.window_x, saved.window_y) {
@@ -332,8 +332,8 @@ fn main() -> Result<(), eframe::Error> {
         let h = saved.window_height.unwrap_or(0) as i32;
         if x >= vx - 8 && y >= vy - 8 && x + w <= vx + vw && y + h <= vy + vh {
             viewport = viewport.with_position([
-                physical_to_logical(x as f32, ppp),
-                physical_to_logical(y as f32, ppp),
+                physical_to_logical(x as f32, dpi),
+                physical_to_logical(y as f32, dpi),
             ]);
         }
     }
@@ -1926,11 +1926,14 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let viewport = ctx.input(|i| i.viewport().clone());
         if viewport.maximized != Some(true) {
             if let Some(rect) = viewport.inner_rect {
-                let ppp = ctx.pixels_per_point();
-                let (size, fallback_pos) = physical_geometry(rect, rect.min, ppp);
+                // Native DPI scale, *not* `ctx.pixels_per_point()`: the viewport
+                // rects are native points, so the zoom must not be applied here
+                // or the value written back is the window size times the zoom.
+                let dpi = system_dpi_scale();
+                let (size, fallback_pos) = physical_geometry(rect, rect.min, dpi);
                 let pos = viewport
                     .outer_rect
-                    .map(|r| physical_geometry(rect, r.min, ppp).1)
+                    .map(|r| physical_geometry(rect, r.min, dpi).1)
                     .unwrap_or(fallback_pos);
                 {
                     let due = self
@@ -2280,20 +2283,6 @@ fn physical_to_logical(physical: f32, dpi_scale: f32) -> f32 {
     physical / scale
 }
 
-/// The pixels-per-point the app actually runs at: monitor DPI scale times the
-/// saved UI zoom. Window creation happens before there is a context to ask, so
-/// this mirrors what `set_zoom_factor` applies a moment later. It has to match
-/// `ctx.pixels_per_point()` on the saving side, otherwise the stored physical
-/// pixels are scaled by the wrong factor every time the app starts.
-fn effective_pixels_per_point(dpi_scale: f32, ui_zoom_percent: u32) -> f32 {
-    let dpi = if dpi_scale.is_finite() && dpi_scale > 0.0 {
-        dpi_scale
-    } else {
-        1.0
-    };
-    dpi * (ui_zoom_percent.clamp(100, 200) as f32 / 100.0)
-}
-
 /// DPI scale of the primary monitor, read straight from Windows so the window
 /// can be created at the right size on the very first frame (no visible jump).
 #[cfg(windows)]
@@ -2317,35 +2306,22 @@ fn system_dpi_scale() -> f32 {
 
 #[cfg(test)]
 mod geometry_tests {
-    use super::{effective_pixels_per_point, physical_geometry, physical_to_logical};
+    use super::{physical_geometry, physical_to_logical};
 
     #[test]
-    fn the_effective_scale_includes_the_ui_zoom() {
-        // 100% DPI with 125% UI zoom is the setup the window geometry used to
-        // round-trip wrongly: saved at 1.25, restored at 1.0.
-        assert_eq!(effective_pixels_per_point(1.0, 125), 1.25);
-        assert_eq!(effective_pixels_per_point(1.5, 100), 1.5);
-        assert_eq!(effective_pixels_per_point(1.5, 200), 3.0);
-        // Nonsense values fall back instead of poisoning the window size.
-        assert_eq!(effective_pixels_per_point(0.0, 125), 1.25);
-        assert_eq!(effective_pixels_per_point(f32::NAN, 125), 1.25);
-        assert_eq!(effective_pixels_per_point(1.0, 0), 1.0);
-        assert_eq!(effective_pixels_per_point(1.0, 9999), 2.0);
-    }
-
-    #[test]
-    fn a_stored_geometry_survives_a_round_trip() {
-        // Save: points -> physical at 125% zoom.
-        let inner = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(712.0, 608.0));
-        let (size, pos) = physical_geometry(inner, egui::pos2(1177.6, 265.6), 1.25);
-        assert_eq!(size, (890, 760));
-        assert_eq!(pos, (1472, 332));
-        // Restore: physical -> points must give the original window back.
-        let ppp = effective_pixels_per_point(1.0, 125);
-        assert_eq!(physical_to_logical(size.0 as f32, ppp), 712.0);
-        assert_eq!(physical_to_logical(size.1 as f32, ppp), 608.0);
-        assert_eq!(physical_to_logical(pos.0 as f32, ppp), 1177.6);
-        assert_eq!(physical_to_logical(pos.1 as f32, ppp), 265.6);
+    fn a_stored_geometry_survives_a_round_trip_at_any_dpi() {
+        for dpi in [1.0_f32, 1.25, 1.5, 2.0] {
+            // Save: native points -> physical pixels.
+            let inner = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 620.0));
+            let (size, pos) = physical_geometry(inner, egui::pos2(120.0, 80.0), dpi);
+            assert_eq!(size.0 as f32, 900.0 * dpi);
+            assert_eq!(size.1 as f32, 620.0 * dpi);
+            // Restore: physical pixels -> native points gives the window back.
+            assert_eq!(physical_to_logical(size.0 as f32, dpi), 900.0);
+            assert_eq!(physical_to_logical(size.1 as f32, dpi), 620.0);
+            assert_eq!(physical_to_logical(pos.0 as f32, dpi), 120.0);
+            assert_eq!(physical_to_logical(pos.1 as f32, dpi), 80.0);
+        }
     }
 
     #[test]
