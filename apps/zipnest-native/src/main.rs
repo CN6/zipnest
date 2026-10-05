@@ -20,20 +20,30 @@ const DESIGN_WIDTH: f32 = 900.0;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// Size of the primary display, used to keep a restored window on screen.
+/// Bounds of the whole virtual desktop `(x, y, width, height)`. Every monitor
+/// counts, so a window parked on a second screen is still accepted, while one
+/// that ends up past the right or bottom edge is not.
 #[cfg(windows)]
-fn screen_size() -> (i32, i32) {
+fn virtual_screen_bounds() -> (i32, i32, i32, i32) {
     #[link(name = "user32")]
     extern "system" {
         fn GetSystemMetrics(index: i32) -> i32;
     }
-    // SM_CXSCREEN / SM_CYSCREEN.
-    unsafe { (GetSystemMetrics(0), GetSystemMetrics(1)) }
+    // SM_XVIRTUALSCREEN / SM_YVIRTUALSCREEN / SM_CXVIRTUALSCREEN /
+    // SM_CYVIRTUALSCREEN.
+    unsafe {
+        (
+            GetSystemMetrics(76),
+            GetSystemMetrics(77),
+            GetSystemMetrics(78),
+            GetSystemMetrics(79),
+        )
+    }
 }
 
 #[cfg(not(windows))]
-fn screen_size() -> (i32, i32) {
-    (1920, 1080)
+fn virtual_screen_bounds() -> (i32, i32, i32, i32) {
+    (0, 0, 1920, 1080)
 }
 
 /// Format an archive timestamp (Unix ms, UTC) the way Explorer shows it:
@@ -97,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.0";
+const CURRENT_VERSION: &str = "0.4.1";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 const UPDATE_UA: &str = "ZipNest-Updater/0.4.0";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
@@ -299,24 +309,31 @@ fn main() -> Result<(), eframe::Error> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([DESIGN_WIDTH, 620.0])
         .with_title(single_instance::WINDOW_TITLE);
-    // Stored geometry is in physical pixels; `ViewportBuilder` wants logical
-    // points, so divide by the monitor DPI scale.
-    let dpi = system_dpi_scale();
+    // Stored geometry is in physical pixels. `ViewportBuilder` wants logical
+    // points, so divide by the *effective* pixels-per-point: the monitor DPI
+    // scale times the saved UI zoom, which is exactly what
+    // `ctx.pixels_per_point()` returns on the side that wrote the value.
+    // Dividing by the DPI scale alone made every restart grow the window by the
+    // zoom factor and walk it down-right until it left the screen.
+    let ppp = effective_pixels_per_point(system_dpi_scale(), saved.ui_zoom);
     if let (Some(w), Some(h)) = (saved.window_width, saved.window_height) {
         viewport = viewport.with_inner_size([
-            physical_to_logical(w as f32, dpi),
-            physical_to_logical(h as f32, dpi),
+            physical_to_logical(w as f32, ppp),
+            physical_to_logical(h as f32, ppp),
         ]);
     }
     if let (Some(x), Some(y)) = (saved.window_x, saved.window_y) {
-        // Only trust a position that still lands on a screen: a window restored
-        // off-screen looks exactly like "the app does not start".
-        let (sw, sh) = screen_size();
-        if x >= -8 && y >= -8 && x < sw - 120 && y < sh - 80 {
-            // Physical pixels, so this compares directly with the screen size.
+        // Only trust a position that lands the whole window inside the virtual
+        // desktop (every monitor): a window restored off-screen looks exactly
+        // like "the app does not start". Both sides are physical pixels, so they
+        // compare directly with the screen metrics.
+        let (vx, vy, vw, vh) = virtual_screen_bounds();
+        let w = saved.window_width.unwrap_or(0) as i32;
+        let h = saved.window_height.unwrap_or(0) as i32;
+        if x >= vx - 8 && y >= vy - 8 && x + w <= vx + vw && y + h <= vy + vh {
             viewport = viewport.with_position([
-                physical_to_logical(x as f32, dpi),
-                physical_to_logical(y as f32, dpi),
+                physical_to_logical(x as f32, ppp),
+                physical_to_logical(y as f32, ppp),
             ]);
         }
     }
@@ -395,6 +412,8 @@ struct App {
     create_sfx: bool,
     show_settings: bool,
     show_donate: bool,
+    /// A help hint the user clicked on: `(field label, explanation)`.
+    help_popup: Option<(String, String)>,
     // assets
     qr_wechat: Option<egui::TextureHandle>,
     qr_alipay: Option<egui::TextureHandle>,
@@ -517,6 +536,7 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             create_sfx: false,
             show_settings: false,
             show_donate: false,
+            help_popup: None,
             qr_wechat,
             qr_alipay,
             update,
@@ -539,19 +559,55 @@ fn t(&self, key: &str) -> String {
         Some(text)
     }
 
-    /// Small "?" that shows a tooltip on hover (help text for wizard fields).
-    fn help_hint(&mut self, ui: &mut egui::Ui, text: &str) {
+    /// Small "?" that explains a wizard field.
+    ///
+    /// Hovering shows the explanation right away; clicking pins the same text in
+    /// a small popup, because a hover-only hint silently does nothing for anyone
+    /// who (as most people do) clicks the mark instead of hovering it.
+    fn help_hint(&mut self, ui: &mut egui::Ui, label: &str, text: &str) {
         let accent = ui.visuals().hyperlink_color;
         let fill = ui.visuals().widgets.inactive.weak_bg_fill;
         let stroke = ui.visuals().widgets.inactive.bg_stroke.color;
         let resp = ui.add(
-            egui::Button::new(egui::RichText::new("?").size(13.0).color(accent))
-                .rounding(egui::Rounding::same(9.0))
-                .min_size(egui::vec2(18.0, 18.0))
+            egui::Button::new(egui::RichText::new("?").size(11.0).color(accent))
+                .rounding(egui::Rounding::same(7.0))
+                .min_size(egui::vec2(15.0, 15.0))
                 .fill(fill)
-                .stroke(egui::Stroke::new(1.0, stroke)),
+                .stroke(egui::Stroke::new(1.0_f32, stroke)),
         );
-        resp.on_hover_text(text);
+        let resp = resp.on_hover_ui(|ui| {
+            ui.set_max_width(380.0);
+            ui.label(text);
+        });
+        if resp.clicked() {
+            self.help_popup = Some((label.to_string(), text.to_string()));
+        }
+    }
+
+    /// The clicked help hint, shown until it is closed.
+    fn help_window(&mut self, ctx: &egui::Context) {
+        let Some((label, text)) = self.help_popup.clone() else {
+            return;
+        };
+        let title = format!("{} · {}", self.t("help.title"), label);
+        let close_label = self.t("job.close");
+        let mut open = true;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                theme::dialog_scale(ui);
+                ui.set_max_width(400.0);
+                ui.label(text);
+                ui.separator();
+                if ui.button(close_label).clicked() {
+                    self.help_popup = None;
+                }
+            });
+        if !open {
+            self.help_popup = None;
+        }
     }
 
     /// Drain job events emitted by the service into UI state.
@@ -1264,25 +1320,38 @@ let extract_enabled = self.archive.is_some();
             ui.label(self.t("create.dest"));
             ui.text_edit_singleline(&mut self.create_dest);
             if ui.button(self.t("extract.browse")).clicked() {
-                if let Some(p) = rfd::FileDialog::new().save_file() {
+                // The Save-As dialog used to open with an empty file name and an
+                // "All files" filter, so 保存 did nothing until the user typed a
+                // name themselves — which reads as "browse cannot select
+                // anything". Pre-fill a sensible name and match the format.
+                let format = self.create_format.clone();
+                let (desc, exts) = format_filter(&format);
+                let picked = rfd::FileDialog::new()
+                    .set_file_name(suggested_archive_name(&self.create_sources, &format))
+                    .add_filter(desc, exts)
+                    .save_file();
+                if let Some(p) = picked {
                     self.create_dest = p.to_str().unwrap_or("").to_string();
                 }
             }
 ui.horizontal(|ui| {
-                ui.label(self.t("create.format"));
+                let label = self.t("create.format");
+                ui.label(&label);
                 let hint = self.t("help.format");
-                self.help_hint(ui, &hint);
+                self.help_hint(ui, &label, &hint);
                 for f in ["zip", "7z", "tar", "tar.gz", "tar.bz2", "tar.xz"] {
                     let sel = self.create_format == f;
                     if ui.selectable_label(sel, f).clicked() {
                         self.create_format = f.to_string();
+                        self.create_dest = retarget_archive_ext(&self.create_dest, f);
                     }
                 }
             });
             ui.horizontal(|ui| {
-                ui.label(self.t("create.level"));
+                let label = self.t("create.level");
+                ui.label(&label);
                 let hint = self.t("help.level");
-                self.help_hint(ui, &hint);
+                self.help_hint(ui, &label, &hint);
                 for l in ["store", "fastest", "normal", "maximum", "ultra"] {
                     let sel = self.create_level == l;
                     let lbl = self.t(&format!("create.level.{l}"));
@@ -1292,9 +1361,10 @@ ui.horizontal(|ui| {
                 }
             });
             ui.horizontal(|ui| {
-                ui.label(self.t("create.method"));
+                let label = self.t("create.method");
+                ui.label(&label);
                 let hint = self.t("help.method");
-                self.help_hint(ui, &hint);
+                self.help_hint(ui, &label, &hint);
                 for m in ["auto", "copy", "deflate", "lzma2", "bzip2"] {
                     let sel = self.create_method == m;
                     let lbl = self.t(&format!("create.method.{m}"));
@@ -1304,23 +1374,25 @@ ui.horizontal(|ui| {
                 }
             });
             ui.horizontal(|ui| {
-                ui.label(self.t("create.password"));
+                let label = self.t("create.password");
+                ui.label(&label);
                 let hint = self.t("help.password");
-                self.help_hint(ui, &hint);
+                self.help_hint(ui, &label, &hint);
                 ui.text_edit_singleline(&mut self.create_password);
             });
             if self.create_format == "7z" {
                 let lbl = self.t("create.encrypt_names");
                 let hint = self.t("help.encrypt_names");
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.create_encrypt_names, lbl);
-                    self.help_hint(ui, &hint);
+                    ui.checkbox(&mut self.create_encrypt_names, &lbl);
+                    self.help_hint(ui, &lbl, &hint);
                 });
             }
             ui.horizontal(|ui| {
-                ui.label(self.t("create.volume"));
+                let label = self.t("create.volume");
+                ui.label(&label);
                 let hint = self.t("help.volume");
-                self.help_hint(ui, &hint);
+                self.help_hint(ui, &label, &hint);
 for v in ["off", "10m", "100m", "1g", "custom"] {
                     let sel = self.create_volume == v;
                     let lbl = self.t(&format!("create.volume.{v}"));
@@ -1473,9 +1545,10 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.label(self.t("settings.max_extract"));
+                            let label = self.t("settings.max_extract");
+                            ui.label(&label);
                             let hint = self.t("settings.max_extract.hint");
-                            self.help_hint(ui, &hint);
+                            self.help_hint(ui, &label, &hint);
                             let mut mb = self.settings.max_extract_bytes / (1024 * 1024);
                             if ui.add(egui::DragValue::new(&mut mb).speed(256.0)).changed() {
                                 // Real clamping happens in Settings::apply on the way out.
@@ -1780,6 +1853,52 @@ fn format_preview_hex(bytes: &[u8]) -> String {
     s
 }
 
+/// rfd filter for a create format: `(description, extensions)`.
+fn format_filter(format: &str) -> (&'static str, &'static [&'static str]) {
+    match format {
+        "7z" => ("7z archive", &["7z"]),
+        "tar" => ("TAR archive", &["tar"]),
+        "tar.gz" => ("TAR.GZ archive", &["gz"]),
+        "tar.bz2" => ("TAR.BZ2 archive", &["bz2"]),
+        "tar.xz" => ("TAR.XZ archive", &["xz"]),
+        _ => ("ZIP archive", &["zip"]),
+    }
+}
+
+/// The name to pre-fill in the Save-As dialog: the single source's own name, or
+/// the folder holding several sources, plus the format's extension. The create
+/// formats are also their extensions (`zip`, `tar.gz`, ...).
+fn suggested_archive_name(sources: &[String], format: &str) -> String {
+    let stem = match sources {
+        [] => "archive".to_string(),
+        [one] => std::path::Path::new(one)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "archive".to_string()),
+        [first, ..] => std::path::Path::new(first)
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "archive".to_string()),
+    };
+    format!("{stem}.{format}")
+}
+
+/// Swap a known archive extension in `dest` for the one `format` needs, so
+/// switching the format after browsing does not leave `out.zip` behind while
+/// writing 7z data. Paths without a known extension are left untouched.
+fn retarget_archive_ext(dest: &str, format: &str) -> String {
+    const KNOWN: [&str; 6] = ["tar.bz2", "tar.gz", "tar.xz", "zip", "7z", "tar"];
+    let lower = dest.to_ascii_lowercase();
+    for ext in KNOWN {
+        let suffix = format!(".{ext}");
+        if lower.ends_with(&suffix) {
+            return format!("{}.{}", &dest[..dest.len() - suffix.len()], format);
+        }
+    }
+    dest.to_string()
+}
+
 fn parse_volume(input: &str) -> Option<u64> {
     let s = input.trim().to_lowercase();
     if s.is_empty() {
@@ -1949,6 +2068,7 @@ egui::CentralPanel::default().show(ctx, |ui| {
         self.create_dialog(ctx);
         self.settings_dialog(ctx);
         self.donate_dialog(ctx);
+        self.help_window(ctx);
         self.job_window(ctx);
         self.update_window(ctx);
         self.error_window(ctx);
@@ -2160,6 +2280,20 @@ fn physical_to_logical(physical: f32, dpi_scale: f32) -> f32 {
     physical / scale
 }
 
+/// The pixels-per-point the app actually runs at: monitor DPI scale times the
+/// saved UI zoom. Window creation happens before there is a context to ask, so
+/// this mirrors what `set_zoom_factor` applies a moment later. It has to match
+/// `ctx.pixels_per_point()` on the saving side, otherwise the stored physical
+/// pixels are scaled by the wrong factor every time the app starts.
+fn effective_pixels_per_point(dpi_scale: f32, ui_zoom_percent: u32) -> f32 {
+    let dpi = if dpi_scale.is_finite() && dpi_scale > 0.0 {
+        dpi_scale
+    } else {
+        1.0
+    };
+    dpi * (ui_zoom_percent.clamp(100, 200) as f32 / 100.0)
+}
+
 /// DPI scale of the primary monitor, read straight from Windows so the window
 /// can be created at the right size on the very first frame (no visible jump).
 #[cfg(windows)]
@@ -2183,7 +2317,36 @@ fn system_dpi_scale() -> f32 {
 
 #[cfg(test)]
 mod geometry_tests {
-    use super::{physical_geometry, physical_to_logical};
+    use super::{effective_pixels_per_point, physical_geometry, physical_to_logical};
+
+    #[test]
+    fn the_effective_scale_includes_the_ui_zoom() {
+        // 100% DPI with 125% UI zoom is the setup the window geometry used to
+        // round-trip wrongly: saved at 1.25, restored at 1.0.
+        assert_eq!(effective_pixels_per_point(1.0, 125), 1.25);
+        assert_eq!(effective_pixels_per_point(1.5, 100), 1.5);
+        assert_eq!(effective_pixels_per_point(1.5, 200), 3.0);
+        // Nonsense values fall back instead of poisoning the window size.
+        assert_eq!(effective_pixels_per_point(0.0, 125), 1.25);
+        assert_eq!(effective_pixels_per_point(f32::NAN, 125), 1.25);
+        assert_eq!(effective_pixels_per_point(1.0, 0), 1.0);
+        assert_eq!(effective_pixels_per_point(1.0, 9999), 2.0);
+    }
+
+    #[test]
+    fn a_stored_geometry_survives_a_round_trip() {
+        // Save: points -> physical at 125% zoom.
+        let inner = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(712.0, 608.0));
+        let (size, pos) = physical_geometry(inner, egui::pos2(1177.6, 265.6), 1.25);
+        assert_eq!(size, (890, 760));
+        assert_eq!(pos, (1472, 332));
+        // Restore: physical -> points must give the original window back.
+        let ppp = effective_pixels_per_point(1.0, 125);
+        assert_eq!(physical_to_logical(size.0 as f32, ppp), 712.0);
+        assert_eq!(physical_to_logical(size.1 as f32, ppp), 608.0);
+        assert_eq!(physical_to_logical(pos.0 as f32, ppp), 1177.6);
+        assert_eq!(physical_to_logical(pos.1 as f32, ppp), 265.6);
+    }
 
     #[test]
     fn egui_points_become_physical_pixels() {
@@ -2223,5 +2386,34 @@ mod geometry_tests {
             physical_to_logical(size.1 as f32, 1.0),
         );
         assert_eq!((logical.0 as u32, logical.1 as u32), size);
+    }
+}
+
+#[cfg(test)]
+mod create_form_tests {
+    use super::{retarget_archive_ext, suggested_archive_name};
+
+    #[test]
+    fn the_suggested_name_comes_from_the_source() {
+        let file = vec![r"C:\tmp\photos.zip".to_string()];
+        assert_eq!(suggested_archive_name(&file, "7z"), "photos.7z");
+        let dir = vec![r"C:\tmp\my folder".to_string()];
+        assert_eq!(suggested_archive_name(&dir, "zip"), "my folder.zip");
+        // Several sources: name it after the folder that holds them.
+        let many = vec![r"C:\tmp\a.txt".to_string(), r"C:\tmp\b.txt".to_string()];
+        assert_eq!(suggested_archive_name(&many, "tar.gz"), "tmp.tar.gz");
+        // Nothing picked yet: still a usable name, never an empty dialog box.
+        assert_eq!(suggested_archive_name(&[], "zip"), "archive.zip");
+    }
+
+    #[test]
+    fn the_extension_follows_the_chosen_format() {
+        assert_eq!(retarget_archive_ext(r"C:\out\a.zip", "7z"), r"C:\out\a.7z");
+        assert_eq!(retarget_archive_ext(r"C:\out\a.7z", "tar.gz"), r"C:\out\a.tar.gz");
+        assert_eq!(retarget_archive_ext(r"C:\out\a.tar.gz", "zip"), r"C:\out\a.zip");
+        assert_eq!(retarget_archive_ext(r"C:\out\a.TAR.XZ", "zip"), r"C:\out\a.zip");
+        // A name the user typed themselves is left alone.
+        assert_eq!(retarget_archive_ext(r"C:\out\notes", "7z"), r"C:\out\notes");
+        assert_eq!(retarget_archive_ext("", "zip"), "");
     }
 }

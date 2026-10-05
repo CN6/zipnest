@@ -130,6 +130,9 @@ fn fill(ctx: &egui::Context, mode: Mode) {
 fn tune(style: &mut egui::Style, mode: Mode) {
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    // Show tooltips at once: the default half-second delay made the "?" hints
+    // look like they did nothing at all when the pointer was only passing over.
+    style.interaction.tooltip_delay = 0.0;
     style.spacing.window_margin = Margin::same(14.0);
     style.spacing.menu_margin = Margin::same(6.0);
     style.visuals.widgets.inactive.rounding = Rounding::same(6.0);
