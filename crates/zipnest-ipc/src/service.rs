@@ -12,6 +12,40 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// How often a running job is allowed to report progress to the UI.
+///
+/// The engines call back once per entry, and every report wakes the UI thread
+/// and repaints the window: a folder with tens of thousands of small files spent
+/// far longer repainting a progress bar than compressing. Throttling cannot
+/// change the archive — it only decides how often the same numbers are drawn.
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Rate limiter for progress callbacks. The first report always goes out, so a
+/// short job still shows something.
+struct ProgressThrottle {
+    last: std::time::Instant,
+    interval: Duration,
+}
+
+impl ProgressThrottle {
+    fn new(interval: Duration) -> Self {
+        Self {
+            last: std::time::Instant::now() - interval,
+            interval,
+        }
+    }
+
+    /// `true` when this progress report is due to be forwarded.
+    fn due(&mut self) -> bool {
+        if self.last.elapsed() >= self.interval {
+            self.last = std::time::Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// One archive row in the UI. Serialized camel-free: fields match the
 /// frontend `EntryDto` interface verbatim.
 #[derive(Debug, Clone, Serialize)]
@@ -467,6 +501,7 @@ impl IpcService {
                 on_conflict,
             };
             let mut seen_paths = std::collections::HashSet::new();
+            let mut throttle = ProgressThrottle::new(PROGRESS_MIN_INTERVAL);
             let result = guard.0.extract(&opts, password.as_deref(), &mut |d| {
                 if ctx.cancelled() {
                     return false;
@@ -474,12 +509,14 @@ impl IpcService {
                 // `ExtractProgress` has no item counter; count distinct
                 // paths observed as an approximation of files touched.
                 seen_paths.insert(d.current_path.clone());
-                ctx.report(
-                    seen_paths.len() as u64,
-                    total_items,
-                    d.done_bytes,
-                    total_bytes,
-                );
+                if throttle.due() {
+                    ctx.report(
+                        seen_paths.len() as u64,
+                        total_items,
+                        d.done_bytes,
+                        total_bytes,
+                    );
+                }
                 true
             });
             drop(guard);
@@ -556,12 +593,15 @@ impl IpcService {
             // `CreateProgress` has no item counter; count distinct paths
             // observed as an approximation of entries written.
             let mut seen = std::collections::HashSet::new();
+            let mut throttle = ProgressThrottle::new(PROGRESS_MIN_INTERVAL);
             archive_core::create_archive(&engine_sources, &dest_path, &opts, &mut |p| {
                 if ctx.cancelled() {
                     return false;
                 }
                 seen.insert(p.current_path.clone());
-                ctx.report(seen.len() as u64, total_items, p.done_bytes, p.total_bytes);
+                if throttle.due() {
+                    ctx.report(seen.len() as u64, total_items, p.done_bytes, p.total_bytes);
+                }
                 true
             })
             .map_err(|e| e.error_key().to_string())?;

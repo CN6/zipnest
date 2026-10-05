@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.1";
+const CURRENT_VERSION: &str = "0.4.2";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 const UPDATE_UA: &str = "ZipNest-Updater/0.4.0";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
@@ -367,9 +367,8 @@ struct App {
     /// Last published busy-marker state; `None` forces one write on becoming
     /// primary so a marker left by a crash cannot make us look busy.
     published_busy: Option<bool>,
-    /// The window exists for a shell request, so it should disappear once its
-    /// job is done instead of lingering.
-    auto_close: bool,
+    /// The window exists for a shell request rather than a user session; it is
+    /// closed once its job is done when `settings.auto_close_after_job` is on.
     /// When to close after a finished job (short delay so the result is read).
     close_at: Option<std::time::Instant>,
     /// Next attempt to take the primary role once the current holder is gone.
@@ -500,7 +499,6 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             pending_open: None,
             is_primary: false,
             published_busy: None,
-            auto_close: false,
             close_at: None,
             primary_retry_at: std::time::Instant::now(),
             saved_geometry: None,
@@ -610,6 +608,17 @@ fn t(&self, key: &str) -> String {
         }
     }
 
+    /// Keep the output path sensible while the user has not chosen one: beside
+    /// the first source, named after it. A path the user browsed for is never
+    /// overwritten.
+    fn refresh_default_dest(&mut self) {
+        if self.create_dest.trim().is_empty() {
+            if let Some(path) = default_archive_path(&self.create_sources, &self.create_format) {
+                self.create_dest = path;
+            }
+        }
+    }
+
     /// Drain job events emitted by the service into UI state.
     fn poll_jobs(&mut self) {
         let pending: Vec<_> = self.jobs.lock().unwrap().drain(..).collect();
@@ -656,10 +665,10 @@ fn t(&self, key: &str) -> String {
                         // Pop a dialog so a failure is never missed.
                         self.error = Some(self.t(&key));
                     }
-                    // Done or cancelled: a window that was only here for the
-                    // task disappears. A real failure stays open so its dialog
-                    // can be read (and retried).
-                    if self.auto_close && (ok || cancelled) {
+                    // Done or cancelled: close only when the user asked for it.
+                    // The window carries the "done" message (and the output
+                    // path), so disappearing on its own hides the result.
+                    if self.settings.auto_close_after_job && (ok || cancelled) {
                         self.close_at = Some(
                             std::time::Instant::now() + std::time::Duration::from_secs(2),
                         );
@@ -689,9 +698,6 @@ fn t(&self, key: &str) -> String {
     /// Act on a launch request — our own command line, or one a later launch
     /// forwarded through the single-instance queue.
     fn apply_launch(&mut self, request: single_instance::LaunchRequest) {
-        // Whoever asked us to do something (Explorer, a shortcut, the command
-        // line) is not here to browse: this window should not outlive the job.
-        self.auto_close = true;
         match request {
             single_instance::LaunchRequest::Open(path) => {
                 if self.job_running() {
@@ -707,6 +713,7 @@ fn t(&self, key: &str) -> String {
                 self.create_sources = paths;
                 self.create_dest = String::new();
                 self.show_create = true;
+                self.refresh_default_dest();
             }
         }
     }
@@ -1303,6 +1310,7 @@ let extract_enabled = self.archive.is_some();
                         }
                     }
                 }
+                self.refresh_default_dest();
             }
             if ui.button(self.t("create.add_folder")).clicked() {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
@@ -1312,13 +1320,26 @@ let extract_enabled = self.archive.is_some();
                         }
                     }
                 }
+                self.refresh_default_dest();
             }
             for s in &self.create_sources.clone() {
                 ui.label(format!("• {s}"));
             }
             ui.separator();
-            ui.label(self.t("create.dest"));
-            ui.text_edit_singleline(&mut self.create_dest);
+            let dest_label = self.t("create.dest");
+            ui.label(&dest_label);
+            // Read-only on purpose. A bare name typed here used to be handed to
+            // the engine as-is, so the archive was written relative to whatever
+            // working directory the shell happened to pass us and the user could
+            // not find it. The path is now always picked with 浏览…, or filled in
+            // next to the sources before the dialog opens.
+            let dest_hint = self.t("create.dest_hint");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.create_dest)
+                    .interactive(false)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(dest_hint),
+            );
             if ui.button(self.t("extract.browse")).clicked() {
                 // The Save-As dialog used to open with an empty file name and an
                 // "All files" filter, so 保存 did nothing until the user typed a
@@ -1344,6 +1365,7 @@ ui.horizontal(|ui| {
                     if ui.selectable_label(sel, f).clicked() {
                         self.create_format = f.to_string();
                         self.create_dest = retarget_archive_ext(&self.create_dest, f);
+                        self.refresh_default_dest();
                     }
                 }
             });
@@ -1409,7 +1431,11 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                 ui.checkbox(&mut self.create_sfx, lbl);
             }
             ui.separator();
-            let can = !self.create_sources.is_empty() && !self.create_dest.trim().is_empty();
+            // The engine resolves a relative destination against the process
+            // working directory, which for a shell-launched window is nowhere
+            // the user would look, so only a full path may start a job.
+            let dest_absolute = std::path::Path::new(self.create_dest.trim()).is_absolute();
+            let can = !self.create_sources.is_empty() && dest_absolute;
             let clicked = ui
                 .add_enabled(can, egui::Button::new(self.t("create.start")))
                 .clicked();
@@ -1519,6 +1545,12 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                             }
                         });
 
+                        // Whether a finished job takes its own window with it.
+                        // Applies to create and extract alike.
+                        let auto_close_label = self.t("settings.auto_close");
+                        ui.checkbox(&mut self.settings.auto_close_after_job, auto_close_label);
+                        theme::hint(ui, &self.t("settings.auto_close.hint"));
+
                         theme::section(ui, &self.t("settings.section.extract"));
                         ui.label(self.t("settings.default_dir"));
                         ui.horizontal(|ui| {
@@ -1623,6 +1655,7 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                 theme_mode: Some(self.settings.theme_mode.clone()),
                 ui_zoom: Some(self.settings.ui_zoom),
                 auto_check_update: Some(self.settings.auto_check_update),
+                auto_close_after_job: Some(self.settings.auto_close_after_job),
                 ..Default::default()
             });
             if self.settings.language != "system" {
@@ -1884,6 +1917,22 @@ fn suggested_archive_name(sources: &[String], format: &str) -> String {
     format!("{stem}.{format}")
 }
 
+/// Suggested output path: alongside the first source, named after it (or after
+/// the folder holding several). `None` when there is nothing to derive the
+/// location from, so the field stays empty and the hint asks for 浏览… instead.
+fn default_archive_path(sources: &[String], format: &str) -> Option<String> {
+    let first = sources.first()?;
+    let dir = std::path::Path::new(first).parent()?;
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    Some(
+        dir.join(suggested_archive_name(sources, format))
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 /// Swap a known archive extension in `dest` for the one `format` needs, so
 /// switching the format after browsing does not leave `out.zip` behind while
 /// writing 7z data. Paths without a known extension are left untouched.
@@ -2031,6 +2080,7 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
                 self.create_sources = dropped;
                 self.create_dest = String::new();
                 self.show_create = true;
+                self.refresh_default_dest();
             }
         }
 
@@ -2367,7 +2417,31 @@ mod geometry_tests {
 
 #[cfg(test)]
 mod create_form_tests {
-    use super::{retarget_archive_ext, suggested_archive_name};
+    use super::{default_archive_path, retarget_archive_ext, suggested_archive_name};
+
+    #[test]
+    fn the_suggested_output_path_sits_beside_the_source() {
+        let dir = vec![r"C:\tmp\my folder".to_string()];
+        assert_eq!(
+            default_archive_path(&dir, "zip").as_deref(),
+            Some(r"C:\tmp\my folder.zip")
+        );
+        let file = vec![r"C:\tmp\photo.png".to_string()];
+        assert_eq!(
+            default_archive_path(&file, "7z").as_deref(),
+            Some(r"C:\tmp\photo.7z")
+        );
+        // Several sources are named after the folder that holds them.
+        let many = vec![r"C:\tmp\a.txt".to_string(), r"D:\other\b.txt".to_string()];
+        assert_eq!(
+            default_archive_path(&many, "zip").as_deref(),
+            Some(r"C:\tmp\tmp.zip")
+        );
+        // Nothing to derive a location from, so the field stays empty and the
+        // hint tells the user to browse.
+        assert_eq!(default_archive_path(&[], "zip"), None);
+        assert_eq!(default_archive_path(&["bare.txt".to_string()], "zip"), None);
+    }
 
     #[test]
     fn the_suggested_name_comes_from_the_source() {

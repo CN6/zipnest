@@ -322,6 +322,17 @@ unsafe fn apply_properties(raw: *mut c_void, opts: &CreateOptions) {
         &mut names,
         &mut values,
     );
+    // Multi-threaded compression, as 7-Zip's own `-mmt=on` default. This is
+    // what makes 7z/LZMA2 use every core; encoders that are single-threaded by
+    // nature (ZIP's Deflate) simply ignore the property, and the resulting
+    // archive stays an ordinary lossless one in both cases.
+    add(
+        "mt",
+        PropVariant::from_bstr("on"),
+        &mut names_keep,
+        &mut names,
+        &mut values,
+    );
     if let Some(m) = opts.method.engine_name() {
         add(
             "m",

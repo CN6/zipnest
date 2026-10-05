@@ -46,6 +46,10 @@ pub struct Settings {
     pub associate: bool,
     /// Register the Explorer context menu (HKCU).
     pub context_menu: bool,
+    /// Close the window by itself once a create or extract job finishes. Off by
+    /// default: the window carries the "done" message, and a window that
+    /// disappears on its own takes that message with it.
+    pub auto_close_after_job: bool,
     /// Cap for in-app previews, in bytes.
     pub preview_max_bytes: u64,
     /// UI zoom percent, 100 = 100%. Fixed value applied at startup; the app
@@ -73,6 +77,7 @@ impl Default for Settings {
             overwrite_policy: "ask".into(),
             associate: false,
             context_menu: false,
+            auto_close_after_job: false,
             preview_max_bytes: 8 * 1024 * 1024,
             ui_zoom: 100,
             auto_check_update: true,
@@ -94,6 +99,7 @@ pub struct SettingsPatch {
     pub overwrite_policy: Option<String>,
     pub associate: Option<bool>,
     pub context_menu: Option<bool>,
+    pub auto_close_after_job: Option<bool>,
     pub preview_max_bytes: Option<u64>,
     pub ui_zoom: Option<u32>,
     pub auto_check_update: Option<bool>,
@@ -133,6 +139,9 @@ impl Settings {
         }
         if let Some(v) = patch.context_menu {
             self.context_menu = v;
+        }
+        if let Some(v) = patch.auto_close_after_job {
+            self.auto_close_after_job = v;
         }
         if let Some(v) = patch.preview_max_bytes {
             self.preview_max_bytes = v.clamp(PREVIEW_MAX_BYTES.0, PREVIEW_MAX_BYTES.1);
