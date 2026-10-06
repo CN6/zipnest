@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.2";
+const CURRENT_VERSION: &str = "0.4.3";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 const UPDATE_UA: &str = "ZipNest-Updater/0.4.0";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
@@ -416,6 +416,13 @@ struct App {
     // assets
     qr_wechat: Option<egui::TextureHandle>,
     qr_alipay: Option<egui::TextureHandle>,
+    /// Windows shell icons for the file list, keyed by [`shell_icon_key`]. A
+    /// key the shell could not answer for is cached as `None` too, so the
+    /// shell is asked at most once per key.
+    icons: std::collections::HashMap<String, Option<egui::TextureHandle>>,
+    /// Insertion order of `icons`, oldest first, so eviction can free the
+    /// oldest texture instead of letting the cache grow without bound.
+    icon_order: std::collections::VecDeque<String>,
     // auto-update
     update: Arc<Mutex<UpdateState>>,
 }
@@ -460,6 +467,15 @@ fn new(
         // Fixed zoom from settings, applied ONCE at startup. Never re-zoom per
         // frame — that feedback loop made fullscreen flicker badly.
         cc.egui_ctx.set_zoom_factor(settings.ui_zoom.clamp(100, 200) as f32 / 100.0);
+        // One wheel notch should travel three rows, like Explorer. egui turns a
+        // native `LineDelta` notch into `Options::line_scroll_speed` points (40
+        // by default, about 1.5 rows here), which is why the list crawled.
+        // Raising that option instead of rescaling
+        // `InputState::smooth_scroll_delta` leaves the ScrollArea, scrollbar
+        // dragging, keyboard navigation and selection untouched, and it only
+        // affects real notches: touchpad / high-resolution `Point` deltas are
+        // already proportional and stay as they are.
+        cc.egui_ctx.options_mut(|o| o.line_scroll_speed = scroll_points_per_notch(Self::ROW_H));
         let lang = match settings.language.as_str() {
             "zh-CN" => "zh-CN",
             "en-US" => "en-US",
@@ -537,6 +553,8 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             help_popup: None,
             qr_wechat,
             qr_alipay,
+            icons: Default::default(),
+            icon_order: Default::default(),
             update,
         }
     }
@@ -734,12 +752,60 @@ fn t(&self, key: &str) -> String {
         }
     }
 
+    /// The one place that changes the browsed directory. Descending, the up and
+    /// root buttons, a breadcrumb click and Backspace all funnel through here,
+    /// so `cwd` and `rows` can never disagree about where we are.
     fn navigate(&mut self, dir: &str) {
+        let dir = normalize_dir(dir);
         if let Some(a) = &self.archive {
-            self.cwd = dir.to_string();
-            self.rows = self.svc.list_children(a.id, dir.to_string()).unwrap_or_default();
+            self.rows = self.svc.list_children(a.id, dir.clone()).unwrap_or_default();
+            self.cwd = dir;
             self.selected.clear();
             self.preview = PreviewKind::None;
+        }
+    }
+
+    /// Backspace and the "up" button. At the root there is nowhere to go, so
+    /// this does nothing rather than clearing the current view.
+    fn go_up(&mut self) {
+        if let Some(up) = parent_dir(&self.cwd) {
+            self.navigate(&up);
+        }
+    }
+
+    /// Up / root / breadcrumb strip, drawn above the file list once we are
+    /// inside the archive (at the root all three controls would be dead).
+    fn nav_row(&mut self, ui: &mut egui::Ui) {
+        if self.cwd.is_empty() {
+            return;
+        }
+        // Compact: the breadcrumb is a row of chips, not a second toolbar.
+        // Scoped to this child row so the list's own spacing is untouched.
+        let mut target: Option<String> = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if theme::ghost_button(ui, &self.t("browser.up"))
+                .on_hover_text(self.t("browser.up_hint"))
+                .clicked()
+            {
+                target = parent_dir(&self.cwd);
+            }
+            if theme::ghost_button(ui, &self.t("browser.root")).clicked() {
+                target = Some(String::new());
+            }
+            ui.separator();
+            if crumb_button(ui, &self.t("browser.root")).clicked() {
+                target = Some(String::new());
+            }
+            for (label, path) in breadcrumb_segments(&self.cwd) {
+                ui.label(egui::RichText::new("/").weak());
+                if crumb_button(ui, &label).clicked() {
+                    target = Some(path);
+                }
+            }
+        });
+        if let Some(dir) = target {
+            self.navigate(&dir);
         }
     }
 
@@ -917,6 +983,48 @@ let extract_enabled = self.archive.is_some();
     const COL_ENC: f32 = 54.0;
     const ROW_H: f32 = 26.0;
 
+    /// Shell icons resolved per frame (see `entry_icon`).
+    const ICONS_PER_FRAME: usize = 4;
+    /// Hard cap on cached icons. Textures are freed as their key is evicted,
+    /// so browsing a huge archive cannot leak GPU memory.
+    const ICON_CACHE_MAX: usize = 256;
+
+    /// Drop the oldest cached icons. Runs at the start of the list, before any
+    /// row is painted: egui frees a texture when its last handle goes, so
+    /// evicting in the middle of the row loop could free one that a row has
+    /// already queued for this frame. A key evicted here is simply reloaded if
+    /// a later row asks for it again.
+    fn trim_icons(&mut self) {
+        while self.icon_order.len() > Self::ICON_CACHE_MAX {
+            if let Some(oldest) = self.icon_order.pop_front() {
+                self.icons.remove(&oldest);
+            }
+        }
+    }
+
+    /// The shell icon for one row, resolving at most `budget` new keys per
+    /// frame. `None` means "not resolved yet, or the shell has no icon for it"
+    /// — the caller paints the fallback badge then.
+    fn entry_icon(
+        &mut self,
+        ctx: &egui::Context,
+        e: &EntryDto,
+        budget: &mut usize,
+    ) -> Option<egui::TextureHandle> {
+        let key = shell_icon_key(e);
+        if let Some(cached) = self.icons.get(&key) {
+            return cached.clone();
+        }
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        let tex = load_shell_icon(ctx, &key);
+        self.icons.insert(key.clone(), tex.clone());
+        self.icon_order.push_back(key);
+        tex
+    }
+
     fn browser(&mut self, ui: &mut egui::Ui) {
         theme::card(ui, |ui| {
             let full_w = ui.available_width();
@@ -926,6 +1034,9 @@ let extract_enabled = self.archive.is_some();
             let weak = ui.visuals().weak_text_color();
             let text_color = ui.visuals().text_color();
             let hairline = ui.visuals().widgets.inactive.bg_stroke.color;
+
+            self.trim_icons();
+            self.nav_row(ui);
 
             // ---- header ----
             let (head, _) = ui.allocate_exact_size(egui::vec2(full_w, 20.0), egui::Sense::hover());
@@ -970,6 +1081,10 @@ let extract_enabled = self.archive.is_some();
             let mut click_dir: Option<String> = None;
             let mut dbl: Option<String> = None;
             let mut click_file: Option<String> = None;
+            // Shell icons cost a Win32 round trip each; resolve a handful per
+            // frame and let the painted badge stand in until a row's turn
+            // comes, so a 10 000-entry directory cannot stall the UI thread.
+            let mut icon_budget = Self::ICONS_PER_FRAME;
             let rows = self.rows.clone();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -1001,7 +1116,27 @@ let extract_enabled = self.archive.is_some();
                             rect.min + egui::vec2(6.0, 3.0),
                             egui::vec2(22.0, 20.0),
                         );
-                        paint_entry_icon(&painter, icon_rect, e, dark);
+                        // The real Explorer-style icon when Windows gives us
+                        // one; the painted badge is the fallback, never a blank
+                        // square. Icons are RGBA and drawn untinted, so they
+                        // read on both themes.
+                        match self.entry_icon(ui.ctx(), e, &mut icon_budget) {
+                            Some(tex) => {
+                                painter.image(
+                                    tex.id(),
+                                    egui::Rect::from_center_size(
+                                        icon_rect.center(),
+                                        egui::Vec2::splat(icon_rect.height() - 2.0),
+                                    ),
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                            None => paint_entry_icon(&painter, icon_rect, e, dark),
+                        }
 
                         // Name: one line, ellipsised inside its column.
                         let name_rect = egui::Rect::from_min_max(
@@ -2084,6 +2219,17 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             }
         }
 
+        // Backspace is the keyboard twin of the "up" button. Skipped while a
+        // text field owns the keyboard (a dialog is open), so editing a path
+        // never navigates the browser behind the dialog.
+        if self.archive.is_some()
+            && !self.cwd.is_empty()
+            && !ctx.wants_keyboard_input()
+            && ctx.input(|i| i.key_pressed(egui::Key::Backspace))
+        {
+            self.go_up();
+        }
+
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
             self.toolbar(ui);
@@ -2099,6 +2245,9 @@ egui::CentralPanel::default().show(ctx, |ui| {
                 self.empty_state(ui);
             } else if self.rows.is_empty() {
                 theme::card(ui, |ui| {
+                    // The navigation row stays: an empty folder is exactly
+                    // where a user needs a way back to its parent.
+                    self.nav_row(ui);
                     ui.add_space(20.0);
                     ui.vertical_centered(|ui| theme::hint(ui, &self.t("browser.empty_dir")));
                 });
@@ -2138,6 +2287,70 @@ egui::CentralPanel::default().show(ctx, |ui| {
 
 
 
+
+// ---------------------------------------------------------------------------
+// Archive paths
+// ---------------------------------------------------------------------------
+
+/// Archive paths are `/`-separated and carry no leading or trailing separator.
+/// Entry paths do not always arrive in that shape (a stored name may use `\`,
+/// a directory entry is often written with a trailing `/`), so every path the
+/// UI shows or compares against is normalised here first.
+fn normalize_dir(dir: &str) -> String {
+    dir.replace('\\', "/").trim_matches('/').to_string()
+}
+
+/// The parent of an archive directory, or `None` when it is the root — the
+/// caller then leaves the view alone instead of navigating off the tree.
+fn parent_dir(cwd: &str) -> Option<String> {
+    let cwd = normalize_dir(cwd);
+    if cwd.is_empty() {
+        return None;
+    }
+    Some(match cwd.rsplit_once('/') {
+        Some((head, _)) => head.to_string(),
+        // One level below the root: the parent *is* the root.
+        None => String::new(),
+    })
+}
+
+/// One level deeper. Used to build breadcrumb targets, so the path a crumb
+/// jumps to is exactly the path descending would have produced.
+fn join_dir(parent: &str, name: &str) -> String {
+    let parent = normalize_dir(parent);
+    let name = normalize_dir(name);
+    match (parent.is_empty(), name.is_empty()) {
+        (_, true) => parent,
+        (true, _) => name,
+        (false, _) => format!("{parent}/{name}"),
+    }
+}
+
+/// `(label, path)` for every level of `cwd`, root first, so each crumb can jump
+/// to the level it names. Empty at the root, where there is nothing to show.
+fn breadcrumb_segments(cwd: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut path = String::new();
+    for segment in normalize_dir(cwd).split('/').filter(|s| !s.is_empty()) {
+        path = join_dir(&path, segment);
+        out.push((segment.to_string(), path.clone()));
+    }
+    out
+}
+
+/// A breadcrumb chip: text only, like the toolbar's ghost buttons, but with a
+/// smaller font because a deep path puts many of them in one row.
+fn crumb_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(egui::Button::new(egui::RichText::new(text).size(12.0)).frame(false))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// How far one wheel notch should travel: three rows, the Windows default.
+/// egui's own default (`Options::line_scroll_speed`, 40 points) is about one
+/// and a half rows of this list.
+fn scroll_points_per_notch(row_height: f32) -> f32 {
+    row_height * 3.0
+}
 
 // ---------------------------------------------------------------------------
 // Table painting helpers
@@ -2193,6 +2406,306 @@ fn paint_entry_icon(p: &egui::Painter, icon_rect: egui::Rect, e: &EntryDto, dark
             accent,
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Windows shell icons
+// ---------------------------------------------------------------------------
+
+/// Cache key for a row's shell icon.
+///
+/// An entry lives *inside* the archive, so the shell can never inspect the real
+/// file's embedded resources: `SHGFI_USEFILEATTRIBUTES` is the only mode that
+/// works here, and it resolves icons by file *type*. Keying by extension is
+/// therefore both correct and cheap — two files with the same extension share
+/// one texture, and all directories share the folder icon. A real `.exe` or
+/// `.lnk` would need its own path looked up on disk, which an archive entry
+/// does not have, so those fall back to the per-type icon as well.
+fn shell_icon_key(e: &EntryDto) -> String {
+    if e.is_dir {
+        return "dir".to_string();
+    }
+    let ext = e
+        .name
+        .rsplit_once('.')
+        .map(|(_, s)| s.to_lowercase())
+        .unwrap_or_default();
+    format!("ext:{ext}")
+}
+
+/// Resolve a [`shell_icon_key`] into a texture. `None` on non-Windows builds
+/// and whenever the shell has no icon of its own to offer.
+fn load_shell_icon(ctx: &egui::Context, key: &str) -> Option<egui::TextureHandle> {
+    let (size, rgba) = shell_icon_rgba(key)?;
+    let image = egui::ColorImage::from_rgba_unmultiplied([size.0, size.1], &rgba);
+    Some(ctx.load_texture(
+        format!("shell-icon:{key}"),
+        image,
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+/// Ask the Windows shell for the small icon of a directory, or of a file whose
+/// extension follows `ext:`. Must be called from the UI thread — the texture
+/// upload needs the egui context anyway, and `SHGetFileInfoW` is not documented
+/// as safe to call concurrently.
+#[cfg(windows)]
+fn shell_icon_rgba(key: &str) -> Option<((usize, usize), Vec<u8>)> {
+    use std::mem::zeroed;
+
+    const SHGFI_ICON: u32 = 0x0000_0100;
+    const SHGFI_SMALLICON: u32 = 0x0000_0001;
+    const SHGFI_USEFILEATTRIBUTES: u32 = 0x0000_0010;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+
+    #[repr(C)]
+    struct ShFileInfoW {
+        hicon: isize,
+        iicon: i32,
+        attributes: u32,
+        display_name: [u16; 260],
+        type_name: [u16; 80],
+    }
+
+    #[repr(C)]
+    struct IconInfo {
+        is_icon: i32,
+        x_hotspot: u32,
+        y_hotspot: u32,
+        mask: isize,
+        color: isize,
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetFileInfoW(
+            path: *const u16,
+            attributes: u32,
+            info: *mut ShFileInfoW,
+            info_size: u32,
+            flags: u32,
+        ) -> usize;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetIconInfo(icon: isize, info: *mut IconInfo) -> i32;
+        fn DestroyIcon(icon: isize) -> i32;
+    }
+
+    #[link(name = "gdi32")]
+    extern "system" {
+        // The two bitmaps behind an HICON are ours to release.
+        fn DeleteObject(object: isize) -> i32;
+    }
+
+    // Nothing is looked up on disk: we hand the shell a plausible *name* plus
+    // the attribute it should pretend the file has. That is what keeps this
+    // cheap on a directory with thousands of entries.
+    let (name, attributes) = if key == "dir" {
+        ("folder".to_string(), FILE_ATTRIBUTE_DIRECTORY)
+    } else {
+        let ext = key.strip_prefix("ext:").unwrap_or("");
+        let name = if ext.is_empty() {
+            "x".to_string()
+        } else {
+            format!("x.{ext}")
+        };
+        (name, FILE_ATTRIBUTE_NORMAL)
+    };
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        let mut info: ShFileInfoW = zeroed();
+        let found = SHGetFileInfoW(
+            wide.as_ptr(),
+            attributes,
+            &mut info,
+            std::mem::size_of::<ShFileInfoW>() as u32,
+            SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
+        );
+        if found == 0 || info.hicon == 0 {
+            return None;
+        }
+        let hicon = info.hicon;
+        let mut icon_info: IconInfo = zeroed();
+        let rgba = if GetIconInfo(hicon, &mut icon_info) == 0 {
+            None
+        } else {
+            let rgba = icon_bitmaps_to_rgba(icon_info.color, icon_info.mask);
+            // Both bitmaps belong to us once `GetIconInfo` returned.
+            if icon_info.color != 0 {
+                DeleteObject(icon_info.color);
+            }
+            if icon_info.mask != 0 {
+                DeleteObject(icon_info.mask);
+            }
+            rgba
+        };
+        // The HICON is ours as well (SHGFI_ICON hands over a copy).
+        DestroyIcon(hicon);
+        rgba
+    }
+}
+
+/// Non-Windows: there is no shell to ask, so the caller keeps painting the
+/// coloured badge and nothing renders blank.
+#[cfg(not(windows))]
+fn shell_icon_rgba(_key: &str) -> Option<((usize, usize), Vec<u8>)> {
+    None
+}
+
+/// Fold one icon's colour bitmap and 1bpp AND mask into straight RGBA. Modern
+/// icons carry a real alpha channel, legacy ones only the mask, so which of the
+/// two is authoritative is decided per icon.
+#[cfg(windows)]
+unsafe fn icon_bitmaps_to_rgba(color: isize, mask: isize) -> Option<((usize, usize), Vec<u8>)> {
+    use std::ffi::c_void;
+    use std::mem::zeroed;
+
+    const BI_RGB: u32 = 0;
+    const DIB_RGB_COLORS: u32 = 0;
+    // No icon is anywhere near this big; a bogus bitmap size must not allocate.
+    const MAX_SIDE: i32 = 256;
+
+    #[repr(C)]
+    struct Bitmap {
+        kind: u32,
+        width: i32,
+        height: i32,
+        width_bytes: u32,
+        planes: u16,
+        bits_per_pixel: u16,
+        bits: *mut u8,
+    }
+
+    #[repr(C)]
+    struct BitmapInfoHeader {
+        size: u32,
+        width: i32,
+        height: i32,
+        planes: u16,
+        bit_count: u16,
+        compression: u32,
+        size_image: u32,
+        x_pels_per_meter: i32,
+        y_pels_per_meter: i32,
+        colors_used: u32,
+        colors_important: u32,
+    }
+
+    #[link(name = "gdi32")]
+    extern "system" {
+        fn CreateCompatibleDC(dc: isize) -> isize;
+        fn DeleteDC(dc: isize) -> i32;
+        fn GetDIBits(
+            dc: isize,
+            bitmap: isize,
+            start: u32,
+            lines: u32,
+            bits: *mut u8,
+            header: *mut BitmapInfoHeader,
+            usage: u32,
+        ) -> i32;
+        fn GetObjectW(object: isize, size: i32, out: *mut c_void) -> i32;
+    }
+
+    let mut bitmap: Bitmap = zeroed();
+    if color == 0
+        || GetObjectW(
+            color,
+            std::mem::size_of::<Bitmap>() as i32,
+            &mut bitmap as *mut Bitmap as *mut c_void,
+        ) == 0
+    {
+        return None;
+    }
+    let (w, h) = (bitmap.width, bitmap.height);
+    if w <= 0 || h <= 0 || w > MAX_SIDE || h > MAX_SIDE {
+        return None;
+    }
+    let (w, h) = (w as usize, h as usize);
+
+    // GetDIBits needs a device context, and any one will do: the screen DC's
+    // compatible context keeps us from having to release a shared handle.
+    let dc = CreateCompatibleDC(0);
+    if dc == 0 {
+        return None;
+    }
+    let header = |w: usize, h: usize| BitmapInfoHeader {
+        size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+        width: w as i32,
+        // Positive height: GDI hands the rows back bottom-up, flipped below.
+        height: h as i32,
+        planes: 1,
+        bit_count: 32,
+        compression: BI_RGB,
+        size_image: 0,
+        x_pels_per_meter: 0,
+        y_pels_per_meter: 0,
+        colors_used: 0,
+        colors_important: 0,
+    };
+    let mut color_px = vec![0u8; w * h * 4];
+    let mut mask_px = vec![0u8; w * h * 4];
+    let mut color_header = header(w, h);
+    let got_color = GetDIBits(
+        dc,
+        color,
+        0,
+        h as u32,
+        color_px.as_mut_ptr(),
+        &mut color_header,
+        DIB_RGB_COLORS,
+    );
+    let mut got_mask = 0;
+    if mask != 0 {
+        // A 1bpp mask asked for as 32bpp comes back as black/white, which is
+        // easier to combine than the padded bit rows.
+        let mut mask_header = header(w, h);
+        got_mask = GetDIBits(
+            dc,
+            mask,
+            0,
+            h as u32,
+            mask_px.as_mut_ptr(),
+            &mut mask_header,
+            DIB_RGB_COLORS,
+        );
+    }
+    DeleteDC(dc);
+    if got_color == 0 {
+        return None;
+    }
+
+    let mut out = vec![0u8; w * h * 4];
+    // An icon either carries a real alpha channel (modern) or leans on its
+    // legacy 1bpp AND mask. Which one is decided once per icon: a 32bpp icon
+    // may legitimately have alpha 0 on a pixel whose mask bit is clear, and
+    // reading that as "opaque" paints those pixels black.
+    let has_alpha = color_px.iter().skip(3).step_by(4).any(|a| *a != 0);
+    // GDI hands the rows back bottom-up; walk them in reverse so the texture
+    // comes out top-down like every other image we upload.
+    for y in (0..h).rev() {
+        let row = y * w * 4;
+        for x in 0..w {
+            let s = row + x * 4;
+            let alpha = if has_alpha {
+                color_px[s + 3]
+            } else if got_mask != 0 && mask_px[s] != 0 {
+                0
+            } else {
+                255
+            };
+            // GDI stores BGRA.
+            out[row + x * 4] = color_px[s + 2];
+            out[row + x * 4 + 1] = color_px[s + 1];
+            out[row + x * 4 + 2] = color_px[s];
+            out[row + x * 4 + 3] = alpha;
+        }
+    }
+    Some(((w, h), out))
 }
 
 /// The little red padlock for encrypted entries, centred in its column.
@@ -2352,6 +2865,127 @@ fn system_dpi_scale() -> f32 {
 #[cfg(not(windows))]
 fn system_dpi_scale() -> f32 {
     1.0
+}
+
+#[cfg(test)]
+mod archive_path_tests {
+    use super::{breadcrumb_segments, join_dir, normalize_dir, parent_dir};
+
+    #[test]
+    fn one_separator_shape_is_used_everywhere() {
+        assert_eq!(normalize_dir(""), "");
+        assert_eq!(normalize_dir("/"), "");
+        assert_eq!(normalize_dir("photos/"), "photos");
+        // Entries stored by other tools carry backslashes.
+        assert_eq!(normalize_dir(r"\photos\2024\"), "photos/2024");
+    }
+
+    #[test]
+    fn the_parent_of_a_top_level_folder_is_the_root() {
+        assert_eq!(normalize_dir("photos"), "photos");
+        assert_eq!(parent_dir("photos").as_deref(), Some(""));
+        assert_eq!(parent_dir("photos/2024/a").as_deref(), Some("photos/2024"));
+        // Same answer whatever shape the entry path arrived in.
+        assert_eq!(parent_dir(r"photos\2024\").as_deref(), Some("photos"));
+        // At the root there is nowhere to go up to.
+        assert_eq!(parent_dir(""), None);
+        assert_eq!(parent_dir("/"), None);
+    }
+
+    #[test]
+    fn joining_builds_the_path_the_browser_would_list() {
+        assert_eq!(join_dir("", "photos"), "photos");
+        assert_eq!(join_dir("photos", "2024"), "photos/2024");
+        assert_eq!(join_dir("photos/", "/2024"), "photos/2024");
+        assert_eq!(join_dir("photos", ""), "photos");
+        assert_eq!(join_dir("", ""), "");
+    }
+
+    #[test]
+    fn every_breadcrumb_names_a_level_it_can_jump_to() {
+        let crumbs = breadcrumb_segments("photos/2024/a b");
+        assert_eq!(
+            crumbs,
+            vec![
+                ("photos".to_string(), "photos".to_string()),
+                ("2024".to_string(), "photos/2024".to_string()),
+                ("a b".to_string(), "photos/2024/a b".to_string()),
+            ]
+        );
+        // Each crumb path is exactly what joining the labels gives, which is
+        // also what descending into that level would set as `cwd`.
+        assert_eq!(crumbs.last().unwrap().1, join_dir("photos/2024", "a b"));
+        // At the root there is nothing to show.
+        assert!(breadcrumb_segments("").is_empty());
+        assert!(breadcrumb_segments("/").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shell_icon_tests {
+    use super::{shell_icon_key, EntryDto};
+
+    fn entry(name: &str, is_dir: bool) -> EntryDto {
+        EntryDto {
+            path: name.to_string(),
+            name: name.to_string(),
+            is_dir,
+            size: 0,
+            mtime_ms: None,
+            encrypted: false,
+        }
+    }
+
+    #[test]
+    fn the_icon_cache_key_is_the_file_type() {
+        // Every directory shares one icon, whatever it is called.
+        assert_eq!(shell_icon_key(&entry("photos", true)), "dir");
+        assert_eq!(shell_icon_key(&entry("photos", false)), "ext:");
+        // Case is irrelevant to the shell, so it must be irrelevant to the key:
+        // otherwise the same icon is cached and uploaded twice.
+        assert_eq!(shell_icon_key(&entry("A.ZIP", false)), "ext:zip");
+        assert_eq!(shell_icon_key(&entry("b.zip", false)), "ext:zip");
+        // Only the last dot counts.
+        assert_eq!(shell_icon_key(&entry("a.tar.gz", false)), "ext:gz");
+    }
+
+    /// The ROP chain (HICON -> DIBs -> straight RGBA) is the part that silently
+    /// produces garbage when a constant or a row order is wrong, and it is the
+    /// part no unit test of the key can see. Windows only — elsewhere the
+    /// loader is compiled out and the painted badge is the icon.
+    #[cfg(windows)]
+    #[test]
+    fn a_real_shell_icon_comes_back_as_rgba() {
+        for key in ["dir", "ext:txt"] {
+            let (size, rgba) = super::shell_icon_rgba(key).expect("shell icon");
+            assert!(size.0 > 0 && size.1 > 0 && size.0 <= 64 && size.1 <= 64);
+            assert_eq!(rgba.len(), size.0 * size.1 * 4);
+            // An icon is mostly opaque; an all-transparent buffer would mean
+            // the AND mask was folded the wrong way round.
+            let opaque = rgba.iter().skip(3).step_by(4).filter(|a| **a > 0).count();
+            assert!(
+                opaque * 2 > size.0 * size.1,
+                "{key}: only {opaque} of {} pixels opaque",
+                size.0 * size.1
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::{scroll_points_per_notch, App};
+
+    #[test]
+    fn one_wheel_notch_travels_three_rows() {
+        // Explorer's default is three lines per notch. egui would move the
+        // list `Options::line_scroll_speed` points (40 on native), about a row
+        // and a half, so the option has to be raised to this value.
+        assert_eq!(scroll_points_per_notch(App::ROW_H), 78.0);
+        assert!(scroll_points_per_notch(App::ROW_H) > 40.0);
+        // Degenerate row heights must not produce a nonsense speed.
+        assert_eq!(scroll_points_per_notch(0.0), 0.0);
+    }
 }
 
 #[cfg(test)]
