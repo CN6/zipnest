@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.3";
+const CURRENT_VERSION: &str = "0.4.4";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 const UPDATE_UA: &str = "ZipNest-Updater/0.4.0";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
@@ -613,7 +613,6 @@ fn t(&self, key: &str) -> String {
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
-                theme::dialog_scale(ui);
                 ui.set_max_width(400.0);
                 ui.label(text);
                 ui.separator();
@@ -1348,7 +1347,6 @@ let extract_enabled = self.archive.is_some();
             .default_pos(center)
             .open(&mut open)
             .show(ctx, |ui| {
-            theme::dialog_scale(ui);
             ui.label(self.t("extract.dest"));
             ui.text_edit_singleline(&mut self.extract_dest);
             if ui.button(self.t("extract.browse")).clicked() {
@@ -1641,7 +1639,6 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
             .default_width(470.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                theme::dialog_scale(ui);
                 // The body scrolls and the buttons stay put, so adding a setting
                 // can never push them off the bottom edge of the dialog.
                 egui::ScrollArea::vertical()
@@ -1852,7 +1849,6 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                     .default_pos(ctx.screen_rect().center() - egui::vec2(190.0, 60.0))
                     .open(&mut open)
                     .show(ctx, |ui| {
-                        theme::dialog_scale(ui);
                         ui.label(found);
                         ui.label(hint);
                         ui.horizontal(|ui| {
@@ -1922,7 +1918,6 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
             .default_width(360.0)
             .default_pos(center)
             .show(ctx, |ui| {
-                theme::dialog_scale(ui);
                 let bar = if j.finished { 1.0 } else { j.pct() };
                 ui.add_sized([360.0, 22.0], egui::ProgressBar::new(bar).show_percentage());
                 if j.finished {

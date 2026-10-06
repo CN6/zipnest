@@ -3,7 +3,7 @@ Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.4.3"
+!define VERSION "0.4.4"
 ; This installer is a 32-bit process, so plain $PROGRAMFILES would resolve to
 ; "C:\Program Files (x86)" on 64-bit Windows. ZipNest ships as x64, so force
 ; the 64-bit location. InstallDirRegKey below still reads HKCU\...\ZipNest's
@@ -26,7 +26,7 @@ Unicode True
 !define ZN_BUSY_GIVEUP_MSG_EN "Some files are still in use and were not updated. Close ZipNest (or reboot) and run the installer again."
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.4.3_x64-setup.exe"
+OutFile "ZipNest_0.4.4_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin

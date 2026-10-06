@@ -210,18 +210,6 @@ pub fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
         .show(ui, add_contents);
 }
 
-/// Enlarge text + spacing inside a dialog so it is easier to read.
-pub fn dialog_scale(ui: &mut egui::Ui) {
-    ui.style_mut()
-        .text_styles
-        .insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
-    ui.style_mut()
-        .text_styles
-        .insert(egui::TextStyle::Button, egui::FontId::proportional(16.0));
-    ui.style_mut().spacing.item_spacing = egui::vec2(10.0, 10.0);
-    ui.style_mut().spacing.button_padding = egui::vec2(14.0, 8.0);
-    ui.style_mut().spacing.interact_size.y = 26.0;
-}
 
 /// A small section heading used inside dialogs, with a hairline under it.
 pub fn section(ui: &mut egui::Ui, title: &str) {
