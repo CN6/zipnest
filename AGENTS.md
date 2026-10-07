@@ -74,7 +74,11 @@ older web UI and is NOT shipped.
   `Capabilities`), the installer's `zipnest.exe --register-integration`, and a
   one-time first-launch bootstrap guarded by `Settings::integration_applied`.
   Registering from the Settings dialog only (<= v0.4.7) is why a fresh machine
-  was never the default. The two flags default to **true** now.
+  was never the default. The two flags default to **true** now. The decision
+  lives in `integration_plan` (zipnest-native/main.rs): never-claimed → claim
+  with defaults whatever the old flags hold; recorded → apply as-is; the
+  installer's flag forces a re-apply, a normal launch never does (that is what
+  makes an opt-out stick).
 - **A foreign `UserChoice` cannot be taken over — do not try.** Measured on
   Windows 10 26H1: `HKCU\...\Explorer\FileExts\.<ext>\UserChoice` carries a
   Deny-SetValue ACE for the user, so writing `ProgId` fails ("不允许所请求的
