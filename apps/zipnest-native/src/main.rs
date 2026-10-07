@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.5";
+const CURRENT_VERSION: &str = "0.4.6";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 const UPDATE_UA: &str = "ZipNest-Updater/0.4.0";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
@@ -339,8 +339,11 @@ fn main() -> Result<(), eframe::Error> {
     }
     // Restore a window that was left maximized; without this the window came
     // back at its old normal size every launch.
+    // A window left maximized is created hidden and already maximized: passing
+    // a size/position makes it appear small for a moment before the platform
+    // maximizes it, which reads as a flash. The first frame shows it again.
     if saved.window_maximized {
-        viewport = viewport.with_maximized(true);
+        viewport = viewport.with_maximized(true).with_visible(false);
     }
     // Same icon embedded in the exe via build.rs: window and taskbar then match
     // the Explorer icon and shortcuts.
@@ -2165,14 +2168,15 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         }
 
         if self.restore_maximized {
-            match viewport.maximized {
-                Some(true) => self.restore_maximized = false,
-                Some(false) => {
-                    self.restore_maximized = false;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
-                }
-                None => {}
+            self.restore_maximized = false;
+            // The window was created hidden so a maximized window never shows
+            // its small pre-maximized state; show it once the wish is on its
+            // way. Asking for the maximize and the show in the same frame keeps
+            // both in one event-loop pass, so nothing flashes in between.
+            if viewport.maximized != Some(true) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
 
         // Take the primary role if it is free: the window that holds it is the
