@@ -13,7 +13,7 @@ pub const SUPPORTED_EXTENSIONS: [&str; 9] =
     ["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "iso"];
 
 /// Which parts of the integration to (un)register.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub struct ShellOptions {
     pub associate: bool,
     pub context_menu: bool,

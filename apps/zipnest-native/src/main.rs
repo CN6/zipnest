@@ -176,23 +176,43 @@ fn open_default_apps_page() {
     }
 }
 
-/// Claim the Explorer integration exactly once per machine.
+/// Which integration to apply when somebody asks for it.
 ///
-/// Called by `--register-integration` (the installer runs it right after
-/// copying the files) and by the first UI launch, which covers the portable
-/// zip. `integration_applied` is what makes it once-only: the fresh install is
-/// claimed with the product defaults, and every later launch leaves whatever
-/// the user chose in Settings alone — including a deliberate opt-out.
-fn bootstrap_integration(
-    svc: &IpcService,
-) -> Option<zipnest_ipc::shell::ShellRegisterResult> {
-    if svc.settings_get().ok()?.integration_applied {
+/// Split out from the registry work because it is the part that is easy to get
+/// wrong, and it carries the whole "is a fresh install the default?" answer:
+///
+/// - never claimed before (`integration_applied == false`): claim everything,
+///   whatever the two flags happen to hold. On a fresh profile they default to
+///   true, and an old settings file's `false` was the *old* default rather than
+///   a decision — honouring it is exactly how v0.4.7 machines stayed unclaimed.
+/// - decision already recorded: apply that decision. `force` (the installer's
+///   `--register-integration`) re-applies it, so a lost registration comes back
+///   on reinstall; without `force` (a normal launch) nothing is touched, so a
+///   deliberate opt-out is never undone.
+fn integration_plan(
+    settings: &zipnest_ipc::Settings,
+    force: bool,
+) -> Option<ShellOptions> {
+    if !force && settings.integration_applied {
         return None;
     }
+    Some(if settings.integration_applied {
+        ShellOptions { associate: settings.associate, context_menu: settings.context_menu }
+    } else {
+        ShellOptions { associate: true, context_menu: true }
+    })
+}
+
+/// Claim the Explorer integration. Called by `--register-integration` (the
+/// installer runs it right after copying the files, `force = true`) and by the
+/// first UI launch (`force = false`, which also covers the portable zip).
+fn apply_integration(svc: &IpcService, force: bool) -> Option<zipnest_ipc::shell::ShellRegisterResult> {
+    let settings = svc.settings_get().ok()?;
+    let opts = integration_plan(&settings, force)?;
     let exe = std::env::current_exe().unwrap_or_default();
     svc.shell_register(
         &exe,
-        ShellOptions { associate: true, context_menu: true },
+        opts,
         &zipnest_ipc::shell::WindowsRegistry,
         &zipnest_ipc::shell::WindowsRegistry,
     )
@@ -299,7 +319,7 @@ fn main() -> Result<(), eframe::Error> {
             std::time::Duration::ZERO,
         );
         let already_applied = svc.settings_get().map(|s| s.integration_applied).unwrap_or(false);
-        let applied = bootstrap_integration(&svc);
+        let applied = apply_integration(&svc, true);
         return if already_applied || applied.is_some() {
             Ok(())
         } else {
@@ -533,7 +553,7 @@ fn new(
         // installed copy the installer already ran this, so in practice this
         // path is the portable zip. A failure (a locked-down machine) must not
         // stop the app from starting.
-        let boot = bootstrap_integration(&svc);
+        let boot = apply_integration(&svc, false);
         let mut settings = settings;
         if let Some(r) = &boot {
             settings.associate = r.associate;
@@ -3215,5 +3235,51 @@ mod create_form_tests {
         // A name the user typed themselves is left alone.
         assert_eq!(retarget_archive_ext(r"C:\out\notes", "7z"), r"C:\out\notes");
         assert_eq!(retarget_archive_ext("", "zip"), "");
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::{integration_plan, ShellOptions};
+
+    fn settings(applied: bool, associate: bool, context_menu: bool) -> zipnest_ipc::Settings {
+        zipnest_ipc::Settings {
+            integration_applied: applied,
+            associate,
+            context_menu,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_fresh_machine_is_claimed_even_if_the_flags_were_off() {
+        // The v0.4.7 file on a real machine says `associate: false` because
+        // that used to be the default. Treating it as a decision is exactly how
+        // a fresh install stayed unclaimed; the first claim ignores it.
+        let plan = integration_plan(&settings(false, false, false), false).unwrap();
+        assert_eq!(plan, ShellOptions { associate: true, context_menu: true });
+    }
+
+    #[test]
+    fn a_normal_launch_never_touches_a_recorded_decision() {
+        // Once the decision exists, launching the app must not re-register:
+        // that is what makes unticking the box stick.
+        assert!(integration_plan(&settings(true, true, true), false).is_none());
+        assert!(integration_plan(&settings(true, false, false), false).is_none());
+    }
+
+    #[test]
+    fn the_installer_reapplies_a_recorded_decision() {
+        // `--register-integration` (force) restores a registration that went
+        // missing, using the settings the user already has. Without this, a
+        // reinstall could never bring the associations back.
+        let plan = integration_plan(&settings(true, true, true), true).unwrap();
+        assert_eq!(plan, ShellOptions { associate: true, context_menu: true });
+        // ... and an explicit opt-out still wins over the installer.
+        let off = integration_plan(&settings(true, false, false), true).unwrap();
+        assert_eq!(off, ShellOptions { associate: false, context_menu: false });
+        // Half-registered is a state the user can legitimately choose.
+        let partial = integration_plan(&settings(true, true, false), true).unwrap();
+        assert_eq!(partial, ShellOptions { associate: true, context_menu: false });
     }
 }
