@@ -27,7 +27,10 @@ const DEFAULT_MAX_EXTRACT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const UI_ZOOM: (u32, u32) = (100, 200);
 /// Accepted window size in logical points: small enough to stay usable, large
 /// enough for a maximised 4K window.
-const WINDOW_SIZE: (u32, u32) = (760, 20_000);
+/// Accepted window size range. The minimums are deliberately small: a window
+/// the user resized short has to come back short. A 760px floor used to swallow
+/// every shorter height, so the window reopened at a size nobody chose.
+const WINDOW_SIZE: (u32, u32) = (400, 20_000);
 /// Accepted window position. Generous because multi-monitor setups legitimately
 /// place windows at negative coordinates.
 const WINDOW_POS: i32 = 32_000;
@@ -64,6 +67,8 @@ pub struct Settings {
     /// Last window size in logical points; `None` on the first run.
     pub window_width: Option<u32>,
     pub window_height: Option<u32>,
+    /// Whether the window was left maximized.
+    pub window_maximized: bool,
     /// Last window position; `None` lets the OS place the window.
     pub window_x: Option<i32>,
     pub window_y: Option<i32>,
@@ -85,6 +90,7 @@ impl Default for Settings {
             theme_mode: "system".into(),
             window_width: None,
             window_height: None,
+            window_maximized: false,
             window_x: None,
             window_y: None,
         }
@@ -105,6 +111,7 @@ pub struct SettingsPatch {
     pub auto_check_update: Option<bool>,
     pub max_extract_bytes: Option<u64>,
     pub theme_mode: Option<String>,
+    pub window_maximized: Option<bool>,
     pub window_width: Option<u32>,
     pub window_height: Option<u32>,
     pub window_x: Option<i32>,
@@ -160,6 +167,9 @@ impl Settings {
                 return Err(invalid());
             }
             self.theme_mode = v;
+        }
+        if let Some(v) = patch.window_maximized {
+            self.window_maximized = v;
         }
         if let Some(v) = patch.window_width {
             self.window_width = Some(v.clamp(WINDOW_SIZE.0, WINDOW_SIZE.1));
@@ -296,6 +306,31 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static N: AtomicU32 = AtomicU32::new(0);
+
+    /// A window the user resized small has to come back the same size: a 760px
+    /// floor used to clamp every shorter height back up, so the window reopened
+    /// at a size the user never chose.
+    #[test]
+    fn a_small_window_is_remembered() {
+        let mut s = Settings::default();
+        s.apply(SettingsPatch {
+            window_width: Some(600),
+            window_height: Some(400),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(s.window_width, Some(600));
+        assert_eq!(s.window_height, Some(400));
+        // Sizes no layout can live in are still rejected.
+        s.apply(SettingsPatch {
+            window_width: Some(50),
+            window_height: Some(10),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(s.window_width, Some(WINDOW_SIZE.0));
+        assert_eq!(s.window_height, Some(WINDOW_SIZE.0));
+    }
 
     fn tmp_path() -> PathBuf {
         crate::sweep_stale_test_temp("zipnest-settings-");

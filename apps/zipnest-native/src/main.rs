@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.4";
+const CURRENT_VERSION: &str = "0.4.5";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 const UPDATE_UA: &str = "ZipNest-Updater/0.4.0";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
@@ -337,6 +337,11 @@ fn main() -> Result<(), eframe::Error> {
             ]);
         }
     }
+    // Restore a window that was left maximized; without this the window came
+    // back at its old normal size every launch.
+    if saved.window_maximized {
+        viewport = viewport.with_maximized(true);
+    }
     // Same icon embedded in the exe via build.rs: window and taskbar then match
     // the Explorer icon and shortcuts.
     if let Some(icon) = load_app_icon() {
@@ -377,6 +382,10 @@ struct App {
     /// dragging the window does not rewrite the settings file every frame.
     saved_geometry: Option<((u32, u32), (i32, i32))>,
     geometry_saved_at: Option<std::time::Instant>,
+    /// Last maximized flag written to settings (edge-triggered, like the size).
+    maximized_saved: Option<bool>,
+    /// The window should be maximized again once the first frame sees it is not.
+    restore_maximized: bool,
     archive: Option<zipnest_ipc::OpenArchiveResult>,
     archive_path: String,
     cwd: String,
@@ -506,6 +515,12 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
                 }
             });
         }
+        // ViewportBuilder::with_maximized is not reliably honored once a size
+        // and a position are also supplied, so keep the wish and re-ask on the
+        // first frame. maximized_saved starts at the stored value so the first
+        // frame cannot immediately write the opposite back.
+        let restore_maximized = settings.window_maximized;
+        let maximized_saved = Some(settings.window_maximized);
         Self {
             ctx,
             svc,
@@ -519,6 +534,8 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             primary_retry_at: std::time::Instant::now(),
             saved_geometry: None,
             geometry_saved_at: None,
+            maximized_saved,
+            restore_maximized,
             archive: None,
             archive_path: String::new(),
             cwd: String::new(),
@@ -2131,6 +2148,30 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
                         });
                     }
                 }
+            }
+        }
+
+        // Remember the maximized flag on its own: the geometry above is skipped
+        // while maximized (it keeps the last normal size), so this is the only
+        // place the state is written.
+        if let Some(is_max) = viewport.maximized {
+            if self.maximized_saved != Some(is_max) {
+                self.maximized_saved = Some(is_max);
+                let _ = self.svc.settings_set(SettingsPatch {
+                    window_maximized: Some(is_max),
+                    ..Default::default()
+                });
+            }
+        }
+
+        if self.restore_maximized {
+            match viewport.maximized {
+                Some(true) => self.restore_maximized = false,
+                Some(false) => {
+                    self.restore_maximized = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                }
+                None => {}
             }
         }
 
