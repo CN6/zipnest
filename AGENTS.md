@@ -66,8 +66,32 @@ older web UI and is NOT shipped.
    with `+refs/tags/v<ver>`, then `gh release create v<ver> <installer> <zip>
    --title ... --notes-file ...`.
 
-## Known open items / gotchas (as of v0.4.7)
+## Known open items / gotchas (as of v0.4.8)
 
+- **File associations are claimed automatically** (v0.4.8). Three pieces, all
+  HKCU: `assoc_ops` (ProgID per extension + the extension default +
+  `OpenWithProgids` + `Applications\zipnest.exe` + `RegisteredApplications` /
+  `Capabilities`), the installer's `zipnest.exe --register-integration`, and a
+  one-time first-launch bootstrap guarded by `Settings::integration_applied`.
+  Registering from the Settings dialog only (<= v0.4.7) is why a fresh machine
+  was never the default. The two flags default to **true** now.
+- **A foreign `UserChoice` cannot be taken over — do not try.** Measured on
+  Windows 10 26H1: `HKCU\...\Explorer\FileExts\.<ext>\UserChoice` carries a
+  Deny-SetValue ACE for the user, so writing `ProgId` fails ("不允许所请求的
+  注册表访问权") and `reg delete /f` on the key reports access denied. Only the
+  user can change it, via 设置 → 默认应用. `shell::user_choice_blocks` /
+  `blocked_extensions` report those extensions and the Settings dialog deep-links
+  to `ms-settings:defaultapps?registeredAppUser=ZipNest`. Never forge the hash.
+- **`assoc:double-click` smoke test**: `cmd /c start "" x.7z` must launch
+  `zipnest.exe` from an extension with no `UserChoice`. Shell-level probes are
+  unreliable on this box: `assoc .ext` says "not found" and
+  `AssocQueryStringW(ASSOCSTR_EXECUTABLE)` returns `0x80070483` even for `.txt`,
+  so verify against the registry itself.
+- **settings.json tolerates a leading UTF-8 BOM** (v0.4.8). Notepad writes one
+  by default; before the fix the whole document failed to parse, the store fell
+  back to defaults and the next save wrote those over every preference. Note
+  this shell is **Windows PowerShell 5.1**: `Set-Content -Encoding UTF8` adds a
+  BOM, so use the `write` tool or `-Encoding utf8NoBOM` for JSON fixtures here.
 - **Startup flash**: Windows applies the window size roughly 0.3 s after the
   window becomes visible, so a 16x16 square can be seen briefly on restore.
   Creating the window hidden (`with_visible(false)`) and showing it with

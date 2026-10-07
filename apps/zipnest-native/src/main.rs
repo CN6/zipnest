@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.7";
+const CURRENT_VERSION: &str = "0.4.8";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 const UPDATE_UA: &str = "ZipNest-Updater/0.4.0";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
@@ -159,6 +159,44 @@ fn open_in_browser(url: &str) {
             .creation_flags(CREATE_NO_WINDOW)
             .spawn();
     }
+}
+
+/// Open Windows' own Default apps page, pre-selecting ZipNest where the OS
+/// supports it. This is the only supported way to hand ZipNest an extension
+/// whose `UserChoice` already belongs to another program: Windows protects that
+/// key (it cannot be written and cannot be deleted), so no amount of registry
+/// work can take it back by itself.
+fn open_default_apps_page() {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", zipnest_ipc::shell::DEFAULT_APPS_URI])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+}
+
+/// Claim the Explorer integration exactly once per machine.
+///
+/// Called by `--register-integration` (the installer runs it right after
+/// copying the files) and by the first UI launch, which covers the portable
+/// zip. `integration_applied` is what makes it once-only: the fresh install is
+/// claimed with the product defaults, and every later launch leaves whatever
+/// the user chose in Settings alone — including a deliberate opt-out.
+fn bootstrap_integration(
+    svc: &IpcService,
+) -> Option<zipnest_ipc::shell::ShellRegisterResult> {
+    if svc.settings_get().ok()?.integration_applied {
+        return None;
+    }
+    let exe = std::env::current_exe().unwrap_or_default();
+    svc.shell_register(
+        &exe,
+        ShellOptions { associate: true, context_menu: true },
+        &zipnest_ipc::shell::WindowsRegistry,
+        &zipnest_ipc::shell::WindowsRegistry,
+    )
+    .ok()
 }
 
 fn spawn_update_check(state: Arc<Mutex<UpdateState>>) {
@@ -252,6 +290,23 @@ fn main() -> Result<(), eframe::Error> {
     }
     let mut launch_open: Option<String> = None;
     let mut launch_add: Vec<String> = Vec::new();
+    // `--register-integration` is what the installer runs after copying the
+    // files: it claims the archive extensions and the context menus, so a
+    // machine where the app is never opened still has them. No UI starts.
+    if args.iter().skip(1).any(|a| a == "--register-integration") {
+        let svc = IpcService::new(
+            Arc::new(|_: &str, _: serde_json::Value| {}),
+            std::time::Duration::ZERO,
+        );
+        let already_applied = svc.settings_get().map(|s| s.integration_applied).unwrap_or(false);
+        let applied = bootstrap_integration(&svc);
+        return if already_applied || applied.is_some() {
+            Ok(())
+        } else {
+            eprintln!("ZipNest: shell integration registration failed");
+            std::process::exit(1);
+        };
+    }
     {
         let mut add_mode = false;
         for a in args.iter().skip(1) {
@@ -420,6 +475,11 @@ struct App {
     create_custom_volume: String,
     create_sfx: bool,
     show_settings: bool,
+    /// Extensions Windows has already assigned to another program (its
+    /// protected per-extension `UserChoice`). The writes succeeded, but the OS
+    /// keeps the other handler until the user changes it in the system Default
+    /// apps page, so the Settings dialog explains it and offers the deep link.
+    assoc_blocked: Vec<String>,
     show_donate: bool,
     /// A help hint the user clicked on: `(field label, explanation)`.
     help_popup: Option<(String, String)>,
@@ -468,6 +528,19 @@ fn new(
             std::time::Duration::from_millis(100),
         ));
         let settings = svc.settings_get().unwrap_or_default();
+        // First launch on a machine that has never recorded an integration
+        // decision: claim the archive handlers and the context menus now. On an
+        // installed copy the installer already ran this, so in practice this
+        // path is the portable zip. A failure (a locked-down machine) must not
+        // stop the app from starting.
+        let boot = bootstrap_integration(&svc);
+        let mut settings = settings;
+        if let Some(r) = &boot {
+            settings.associate = r.associate;
+            settings.context_menu = r.context_menu;
+            settings.integration_applied = true;
+        }
+        let assoc_blocked = boot.map(|r| r.blocked).unwrap_or_default();
         // Theme: light, dark, or whatever the system is set to. Applied here
         // rather than next to install_fonts because it needs the settings.
         theme::apply_setting(&cc.egui_ctx, &settings.theme_mode);
@@ -562,6 +635,7 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             create_custom_volume: String::new(),
             create_sfx: false,
             show_settings: false,
+            assoc_blocked,
             show_donate: false,
             help_popup: None,
             qr_wechat,
@@ -1742,6 +1816,23 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                         theme::hint(ui, &self.t("settings.shell.assoc_hint"));
                         let menu_label = self.t("settings.shell.context_menu");
                         ui.checkbox(&mut self.settings.context_menu, menu_label);
+                        if !self.assoc_blocked.is_empty() {
+                            // Windows' per-extension UserChoice beats every key
+                            // we can write, and it cannot be rewritten or
+                            // deleted by any program. Say so, and hand over the
+                            // one page that can change it.
+                            let exts = self
+                                .assoc_blocked
+                                .iter()
+                                .map(|e| format!(".{e}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let msg = self.t("settings.shell.blocked").replace("{exts}", &exts);
+                            theme::hint(ui, &msg);
+                            if ui.button(self.t("settings.shell.open_default_apps")).clicked() {
+                                open_default_apps_page();
+                            }
+                        }
 
                         theme::section(ui, &self.t("settings.section.about"));
                         let update_label = self.t("settings.auto_update");
@@ -1779,6 +1870,7 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                 &exe,
                 ShellOptions { associate: assoc, context_menu: menu },
                 &zipnest_ipc::shell::WindowsRegistry,
+                &zipnest_ipc::shell::WindowsRegistry,
             ) {
                 Ok(r) => {
                     // Reflect what the OS actually accepted: a hardened
@@ -1787,6 +1879,9 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                     // the registry holds.
                     self.settings.associate = r.associate;
                     self.settings.context_menu = r.context_menu;
+                    // Extensions Windows keeps for another program stay
+                    // visibly unresolved instead of looking registered.
+                    self.assoc_blocked = r.blocked;
                     self.notice = r.warnings.first().cloned();
                 }
                 Err(_) => self.notice = Some("error.io".into()),

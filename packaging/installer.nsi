@@ -1,9 +1,9 @@
-﻿; ZipNest 0.4.0 native installer (NSIS Unicode)
+﻿; ZipNest 0.4.8 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.4.7"
+!define VERSION "0.4.8"
 ; This installer is a 32-bit process, so plain $PROGRAMFILES would resolve to
 ; "C:\Program Files (x86)" on 64-bit Windows. ZipNest ships as x64, so force
 ; the 64-bit location. InstallDirRegKey below still reads HKCU\...\ZipNest's
@@ -26,7 +26,7 @@ Unicode True
 !define ZN_BUSY_GIVEUP_MSG_EN "Some files are still in use and were not updated. Close ZipNest (or reboot) and run the installer again."
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.4.7_x64-setup.exe"
+OutFile "ZipNest_0.4.8_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -191,7 +191,21 @@ zn_copy_files:
   ; Refresh the shell icon cache so the new shortcut icon shows immediately.
   System::Call "shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)"
 
-  ; Register the Windows 11 context menu (per-user; ignored on Windows 10).
+  ; Claim the archive extensions (ZIP/7Z/RAR/...) and the context menus right
+  ; here, so a machine where ZipNest is never launched still opens archives
+  ; with it -- registering only from the app's Settings dialog (<= 0.4.7) is
+  ; why a fresh install was never the default. The exe also writes the
+  ; "applications" and "capabilities" keys Windows needs to list ZipNest under
+  ; 设置 → 应用 → 默认应用. Runs per-user (HKCU), no elevation beyond the
+  ; installer's own; a failure is reported but never aborts the install.
+  nsExec::ExecToLog '"$INSTDIR\zipnest.exe" --register-integration'
+  Pop $0
+  IntCmp $0 0 zn_integration_ok zn_integration_failed zn_integration_failed
+zn_integration_failed:
+  DetailPrint "文件关联/右键菜单自动注册失败（可在 ZipNest 设置里手动开启）"
+zn_integration_ok:
+
+; Register the Windows 11 context menu (per-user; ignored on Windows 10).
   Call RegisterWin11Shell
 SectionEnd
 

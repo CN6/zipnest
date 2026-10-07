@@ -120,11 +120,15 @@ export const settingsSet = (patch: SettingsPatch) =>
  * Note the top-level command args are camelCase (Tauri converts them).
  */
 /** Outcome of `shell_register`: what actually applied plus one warning key
- * per Explorer integration point the OS denied (e.g. a hardened `*\shell`). */
+ * per Explorer integration point the OS denied (e.g. a hardened `*\shell`).
+ * `blocked` lists the extensions Windows has already assigned to another
+ * program: Windows protects that per-extension choice, so only the user can
+ * change it in the system Default apps page. */
 export interface ShellRegisterResult {
   associate: boolean;
   context_menu: boolean;
   warnings: string[];
+  blocked: string[];
 }
 
 export const shellRegister = (associate: boolean, contextMenu: boolean) =>

@@ -45,10 +45,20 @@ pub struct Settings {
     pub default_extract_dir: String,
     /// `"ask" | "overwrite" | "skip" | "rename"`.
     pub overwrite_policy: String,
-    /// Register per-user file associations (HKCU).
+    /// Register per-user file associations (HKCU). **On by default**: a fresh
+    /// install is expected to open archives with ZipNest, so the app claims the
+    /// handler on its first run and the installer does the same. Unticking it
+    /// removes the registration and is remembered.
     pub associate: bool,
-    /// Register the Explorer context menu (HKCU).
+    /// Register the Explorer context menu (HKCU). On by default, for the same
+    /// reason: an unused right-click menu is dead weight nobody goes looking
+    /// for.
     pub context_menu: bool,
+    /// Set once the Explorer integration has been applied or explicitly
+    /// refused. While it is `false` the app applies the current settings' 
+    /// integration at startup (the fresh-install path); afterwards it never
+    /// does, so a deliberate opt-out is not undone on the next launch.
+    pub integration_applied: bool,
     /// Close the window by itself once a create or extract job finishes. Off by
     /// default: the window carries the "done" message, and a window that
     /// disappears on its own takes that message with it.
@@ -79,8 +89,9 @@ impl Default for Settings {
             language: "system".into(),
             default_extract_dir: String::new(),
             overwrite_policy: "ask".into(),
-            associate: false,
-            context_menu: false,
+            associate: true,
+            context_menu: true,
+            integration_applied: false,
             auto_close_after_job: false,
             preview_max_bytes: 8 * 1024 * 1024,
             ui_zoom: 100,
@@ -104,6 +115,7 @@ pub struct SettingsPatch {
     pub overwrite_policy: Option<String>,
     pub associate: Option<bool>,
     pub context_menu: Option<bool>,
+    pub integration_applied: Option<bool>,
     pub auto_close_after_job: Option<bool>,
     pub preview_max_bytes: Option<u64>,
     pub ui_zoom: Option<u32>,
@@ -145,6 +157,9 @@ impl Settings {
         }
         if let Some(v) = patch.context_menu {
             self.context_menu = v;
+        }
+        if let Some(v) = patch.integration_applied {
+            self.integration_applied = v;
         }
         if let Some(v) = patch.auto_close_after_job {
             self.auto_close_after_job = v;
@@ -242,6 +257,11 @@ impl SettingsStore {
 fn load_from(path: &Path) -> Settings {
     let mut s: Settings = std::fs::read_to_string(path)
         .ok()
+        // Notepad and plenty of Windows editors save UTF-8 *with* a BOM.
+        // Handed straight to serde_json, that first character makes the whole
+        // document invalid — the store then fell back to defaults and the next
+        // save wrote those over every preference the user had. Strip it.
+        .map(|raw| raw.trim_start_matches('\u{feff}').to_string())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     s.sanitize();
@@ -342,8 +362,48 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.language, "system");
         assert_eq!(s.overwrite_policy, "ask");
-        assert!(!s.associate && !s.context_menu);
+        // Integration is claimed out of the box (v0.4.8): a fresh install opens
+        // archives with ZipNest without the user hunting for a checkbox.
+        assert!(s.associate && s.context_menu);
+        // ... but the one-time bootstrap has not run yet.
+        assert!(!s.integration_applied);
         assert!(s.preview_max_bytes > 0);
+    }
+
+    #[test]
+    fn an_explicit_opt_out_survives_a_restart() {
+        // The bootstrap must run exactly once: unchecking the box has to stick,
+        // otherwise every launch would re-claim the associations.
+        let path = tmp_path();
+        {
+            let mut store = SettingsStore::new(path.clone());
+            store
+                .set(SettingsPatch {
+                    associate: Some(false),
+                    context_menu: Some(false),
+                    integration_applied: Some(true),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let reopened = SettingsStore::new(path);
+        let s = reopened.get();
+        assert!(!s.associate && !s.context_menu);
+        assert!(s.integration_applied, "opted out, and the bootstrap must not run again");
+    }
+
+    #[test]
+    fn an_older_settings_file_without_the_flag_opts_in() {
+        // v0.4.7 and earlier never wrote `integration_applied`, so the field
+        // reads back as false and the app applies whatever the file says —
+        // removals for a user who turned it off, registration for everyone
+        // else.
+        let path = tmp_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"language":"zh-CN","associate":false}"#).unwrap();
+        let store = SettingsStore::new(path);
+        assert!(!store.get().integration_applied);
+        assert!(!store.get().associate, "the recorded opt-out is honoured");
     }
 
     #[test]
@@ -396,6 +456,30 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, r#"{"language":"en-US","future":true}"#).unwrap();
         assert_eq!(SettingsStore::new(path).get().language, "en-US");
+    }
+
+    #[test]
+    fn a_bom_prefixed_file_is_still_read() {
+        // Notepad writes UTF-8 with a BOM by default. Treating that BOM as
+        // corruption threw away every preference and then overwrote the file
+        // with defaults on the next save.
+        let path = tmp_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "\u{feff}{\"language\":\"zh-CN\",\"overwrite_policy\":\"rename\"}")
+            .unwrap();
+        let store = SettingsStore::new(path);
+        assert_eq!(store.get().language, "zh-CN");
+        assert_eq!(store.get().overwrite_policy, "rename");
+    }
+
+    #[test]
+    fn only_a_leading_bom_is_stripped() {
+        // A BOM anywhere else is still a broken document, not a silent reset
+        // trigger we should paper over.
+        let path = tmp_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"language\":\"zh-CN\"\u{feff}}").unwrap();
+        assert_eq!(SettingsStore::new(path).get().language, "system");
     }
 
     #[test]

@@ -67,8 +67,51 @@ impl RegOp {
 
 const CLASSES: &str = r"HKCU\Software\Classes";
 
+/// `HKCU\Software\ZipNest\Capabilities` — the block Windows reads to list
+/// ZipNest under 设置 → 应用 → 默认应用 with its own "设为默认值" button.
+const CAPABILITIES: &str = r"HKCU\Software\ZipNest\Capabilities";
+const REGISTERED_APPS: &str = r"HKCU\Software\RegisteredApplications";
+const REGISTERED_APP_NAME: &str = "ZipNest";
+
+/// File name behind `...\Classes\Applications\<name>`. A constant, not derived
+/// from the running exe, so [`assoc_ops`] and [`assoc_removals`] can never
+/// disagree about which key they own.
+const APP_EXE_NAME: &str = "zipnest.exe";
+
 fn prog_id(ext: &str) -> String {
     format!("ZipNest.{ext}")
+}
+
+/// `HKCU\Software\Classes\Applications\zipnest.exe` — what puts ZipNest in the
+/// "打开方式" list as "ZipNest" instead of as a bare path.
+fn app_key() -> String {
+    format!(r"{CLASSES}\Applications\{APP_EXE_NAME}")
+}
+
+/// `HKCU\...\Explorer\FileExts\.<ext>\UserChoice` — Windows' per-extension
+/// locked-in choice.
+pub fn user_choice_key(ext: &str) -> String {
+    format!(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.{ext}\UserChoice")
+}
+
+/// Deep link to the Windows page where the user can hand ZipNest the archive
+/// extensions. Windows 11 honours `registeredAppUser`; Windows 10 opens the
+/// same Default apps page and ignores the extra parameter.
+pub const DEFAULT_APPS_URI: &str = "ms-settings:defaultapps?registeredAppUser=ZipNest";
+
+/// Does the extension's `UserChoice` keep us from being the default?
+///
+/// Once the user picks an app in the "打开方式" dialog, Windows writes
+/// `UserChoice` with a hash and a **Deny SetValue** ACE for the user. The key
+/// cannot be written and cannot even be deleted (measured: `reg delete /f` →
+/// access denied). Everything [`assoc_ops`] writes is ignored for that one
+/// extension, so the honest answer is "report it and send the user to the
+/// system page" — never a forged hash.
+pub fn user_choice_blocks(ext: &str, user_choice: Option<&str>) -> bool {
+    match user_choice {
+        Some(pid) => !pid.eq_ignore_ascii_case(&prog_id(ext)),
+        None => false,
+    }
 }
 
 /// `"<exe>"` — quoted so a path with spaces still resolves.
@@ -84,8 +127,19 @@ fn open_command(exe: &std::path::Path) -> String {
 /// File-association ops: a ProgID per extension that becomes the **default**
 /// handler (writing the extension's default value), plus an `OpenWithProgids`
 /// entry so the user can still switch back without losing us.
+///
+/// Three more blocks are written so Windows treats ZipNest as a real handler
+/// rather than an anonymous path:
+/// - `...\Classes\Applications\zipnest.exe` — the "打开方式" entry and the
+///   name Explorer shows next to it;
+/// - `HKCU\Software\ZipNest\Capabilities` + `RegisteredApplications` — the
+///   registration that makes ZipNest appear in 设置 → 应用 → 默认应用, which
+///   is the only place a user can hand it an extension whose `UserChoice`
+///   already belongs to another program.
 pub fn assoc_ops(exe: &std::path::Path) -> Vec<RegOp> {
     let icon = format!("{},0", quoted(exe));
+    let cmd = open_command(exe);
+    let app = app_key();
     let mut ops = Vec::new();
     for ext in SUPPORTED_EXTENSIONS {
         let pid = prog_id(ext);
@@ -98,7 +152,7 @@ pub fn assoc_ops(exe: &std::path::Path) -> Vec<RegOp> {
         ops.push(RegOp::set(
             format!(r"{CLASSES}\{pid}\shell\open\command"),
             None,
-            open_command(exe),
+            cmd.clone(),
         ));
         // Make ZipNest the default opener for this extension.
         ops.push(RegOp::set(
@@ -112,12 +166,46 @@ pub fn assoc_ops(exe: &std::path::Path) -> Vec<RegOp> {
             Some(&pid),
             "",
         ));
+        // ... and list the extension under the application entry.
+        ops.push(RegOp::set(
+            format!(r"{app}\SupportedTypes\.{ext}"),
+            None,
+            "",
+        ));
     }
+    // The application entry itself: one key, shared by every extension.
+    ops.push(RegOp::set(format!(r"{app}\FriendlyAppName"), None, "ZipNest"));
+    ops.push(RegOp::set(format!(r"{app}\shell\open\command"), None, cmd));
+    // Capabilities + the RegisteredApplications pointer that exposes them.
+    ops.push(RegOp::set(CAPABILITIES, None, REGISTERED_APP_NAME));
+    ops.push(RegOp::set(
+        format!(r"{CAPABILITIES}\ApplicationName"),
+        None,
+        REGISTERED_APP_NAME,
+    ));
+    ops.push(RegOp::set(
+        format!(r"{CAPABILITIES}\ApplicationDescription"),
+        None,
+        "ZipNest archive manager",
+    ));
+    for ext in SUPPORTED_EXTENSIONS {
+        ops.push(RegOp::set(
+            format!(r"{CAPABILITIES}\FileAssociations\.{ext}"),
+            None,
+            prog_id(ext),
+        ));
+    }
+    ops.push(RegOp::set(
+        REGISTERED_APPS,
+        Some(REGISTERED_APP_NAME),
+        r"Software\ZipNest\Capabilities",
+    ));
     ops
 }
 
-/// Undo [`assoc_ops`]: drop each ProgID tree, its `OpenWithProgids` entry, and
-/// the "we are the default handler" value we wrote.
+/// Undo [`assoc_ops`]: drop each ProgID tree, its `OpenWithProgids` entry, the
+/// "we are the default handler" value we wrote, the application entry and the
+/// capability registration.
 ///
 /// The extension's default value is only cleared while it still points at our
 /// ProgID: leaving it behind would point the extension at a handler that no
@@ -140,6 +228,12 @@ pub fn assoc_removals() -> Vec<RegOp> {
             name: pid,
         });
     }
+    ops.push(RegOp::DeleteKey { key: app_key() });
+    ops.push(RegOp::DeleteKey { key: r"HKCU\Software\ZipNest".to_string() });
+    ops.push(RegOp::DeleteValue {
+        key: REGISTERED_APPS.to_string(),
+        name: REGISTERED_APP_NAME.to_string(),
+    });
     ops
 }
 
@@ -210,18 +304,41 @@ pub fn context_menu_removals() -> Vec<RegOp> {
 
 /// Outcome of a (possibly partial) integration update. `warnings` holds one
 /// i18n key per component the OS denied, so a hardened machine blocks only
-/// that piece instead of the whole save.
+/// that piece instead of the whole save. `blocked` lists the extensions whose
+/// `UserChoice` belongs to another program — the registry writes succeeded,
+/// but Windows still opens those with the other handler until the user changes
+/// it in the system Default apps page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShellRegisterResult {
     pub associate: bool,
     pub context_menu: bool,
     pub warnings: Vec<String>,
+    pub blocked: Vec<String>,
 }
 
 /// Applies generated ops. Implemented for real by [`WindowsRegistry`] and by
 /// a recorder in tests.
 pub trait ShellApplier {
     fn run(&self, ops: &[RegOp]) -> std::io::Result<()>;
+}
+
+/// Reads the state of Windows' own choice for an extension. Separate from
+/// [`ShellApplier`] because it is a query, and because tests want to answer it
+/// without touching the registry.
+pub trait AssocProbe {
+    /// The `UserChoice` ProgID locked in for `ext`. `None` means "no choice
+    /// recorded" (our registration wins) or "unreadable".
+    fn user_choice_progid(&self, ext: &str) -> Option<String>;
+}
+
+/// Extensions where Windows' locked-in choice names somebody else's handler,
+/// so [`assoc_ops`] cannot take effect no matter how it is written.
+pub fn blocked_extensions(probe: &dyn AssocProbe) -> Vec<String> {
+    SUPPORTED_EXTENSIONS
+        .iter()
+        .filter(|ext| user_choice_blocks(ext, probe.user_choice_progid(ext).as_deref()))
+        .map(|ext| (*ext).to_string())
+        .collect()
 }
 
 /// Writes directly through the Win32 registry API — no `reg.exe` child
@@ -472,6 +589,12 @@ mod win32 {
         std::io::Error::from_raw_os_error(rc)
     }
 
+    /// Read a `REG_SZ` value for callers outside this module (the [`AssocProbe`]
+    /// implementation, which reads Windows' `UserChoice`).
+    pub fn read_sz(key: &str, name: Option<&str>) -> Option<String> {
+        read_value(key, name)
+    }
+
     pub fn apply(ops: &[RegOp]) -> std::io::Result<()> {
         for op in ops {
             let rc = match op {
@@ -508,6 +631,20 @@ impl ShellApplier for WindowsRegistry {
         #[cfg(windows)]
         {
             win32::apply(ops)
+        }
+    }
+}
+
+impl AssocProbe for WindowsRegistry {
+    fn user_choice_progid(&self, ext: &str) -> Option<String> {
+        #[cfg(not(windows))]
+        {
+            let _ = ext;
+            None
+        }
+        #[cfg(windows)]
+        {
+            win32::read_sz(&user_choice_key(ext), Some("ProgId"))
         }
     }
 }
@@ -639,6 +776,160 @@ mod tests {
         let removals = context_menu_removals();
         assert_eq!(removals.len(), 3);
         assert!(removals.iter().all(|o| matches!(o, RegOp::DeleteKey { .. })));
+    }
+
+    #[test]
+    fn assoc_registers_the_application_entry() {
+        // Without `...\Classes\Applications\zipnest.exe` the "打开方式" list
+        // shows a bare path instead of "ZipNest".
+        let ops = assoc_ops(exe());
+        assert_eq!(
+            find_set(&ops, r"HKCU\Software\Classes\Applications\zipnest.exe\shell\open\command", None),
+            Some(r#""C:\Program Files\ZipNest\ZipNest.exe" "%1""#)
+        );
+        assert_eq!(
+            find_set(&ops, r"HKCU\Software\Classes\Applications\zipnest.exe\FriendlyAppName", None),
+            Some("ZipNest")
+        );
+        for ext in SUPPORTED_EXTENSIONS {
+            let key = format!(r"HKCU\Software\Classes\Applications\zipnest.exe\SupportedTypes\.{ext}");
+            assert_eq!(find_set(&ops, &key, None), Some(""), "missing SupportedTypes for .{ext}");
+        }
+    }
+
+    #[test]
+    fn assoc_registers_capabilities_so_windows_lists_us() {
+        // `RegisteredApplications` + a Capabilities block is what puts ZipNest
+        // in 设置 → 应用 → 默认应用, the only place a locked-out extension can
+        // be handed back to us.
+        let ops = assoc_ops(exe());
+        assert_eq!(
+            find_set(&ops, r"HKCU\Software\RegisteredApplications", Some("ZipNest")),
+            Some(r"Software\ZipNest\Capabilities")
+        );
+        assert_eq!(
+            find_set(&ops, r"HKCU\Software\ZipNest\Capabilities", None),
+            Some("ZipNest")
+        );
+        assert_eq!(
+            find_set(&ops, r"HKCU\Software\ZipNest\Capabilities\ApplicationName", None),
+            Some("ZipNest")
+        );
+        for ext in SUPPORTED_EXTENSIONS {
+            let key = format!(r"HKCU\Software\ZipNest\Capabilities\FileAssociations\.{ext}");
+            assert_eq!(
+                find_set(&ops, &key, None),
+                Some(prog_id(ext).as_str()),
+                "capability missing for .{ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn assoc_removals_drop_the_application_and_capability_keys() {
+        let removals = assoc_removals();
+        for key in [
+            r"HKCU\Software\Classes\Applications\zipnest.exe",
+            r"HKCU\Software\ZipNest",
+        ] {
+            assert!(
+                removals.iter().any(|o| matches!(o, RegOp::DeleteKey { key: k } if k == key)),
+                "removal missing for {key}"
+            );
+        }
+        assert!(removals.iter().any(|o| matches!(
+            o,
+            RegOp::DeleteValue { key, name }
+                if key == r"HKCU\Software\RegisteredApplications" && name == "ZipNest"
+        )));
+    }
+
+    #[test]
+    fn removals_never_touch_another_program() {
+        // Every op must be scoped to a key this app owns: uninstalling must
+        // never clear a ProgrID the user picked, or another archiver's entry.
+        let removals = assoc_removals();
+        for op in &removals {
+            let key = match op {
+                RegOp::SetValue { key, .. }
+                | RegOp::DeleteKey { key }
+                | RegOp::DeleteValue { key, .. }
+                | RegOp::DeleteValueIfEquals { key, .. } => key,
+            };
+            let owned = key.contains(r"\ZipNest")
+                || key.contains(r"\ZipNest.")
+                || key.contains(r"\Applications")
+                || key.starts_with(r"HKCU\Software\Classes\.")
+                || key == r"HKCU\Software\RegisteredApplications";
+            assert!(owned, "removal reaches outside our keys: {key}");
+        }
+    }
+
+    fn probe_with(choice: &'static str, exts: &'static [&'static str]) -> impl AssocProbe {
+        struct Probe(&'static str, &'static [&'static str]);
+        impl AssocProbe for Probe {
+            fn user_choice_progid(&self, ext: &str) -> Option<String> {
+                self.1.contains(&ext).then(|| self.0.to_string())
+            }
+        }
+        Probe(choice, exts)
+    }
+
+    #[test]
+    fn user_choice_blocks_only_someone_elses_handler() {
+        // No choice at all: our Classes default wins, nothing is blocked.
+        assert!(!user_choice_blocks("zip", None));
+        // Our own ProgID: no conflict, whatever the casing.
+        assert!(!user_choice_blocks("zip", Some("ZipNest.zip")));
+        assert!(!user_choice_blocks("zip", Some("zipnest.ZIP")));
+        // Windows' built-in zip folder, or any other archiver: we lose.
+        assert!(user_choice_blocks("zip", Some("CompressedFolder")));
+        assert!(user_choice_blocks("7z", Some("7-Zip.7z")));
+        // A choice recorded for a *different* extension is irrelevant.
+        assert!(!user_choice_blocks("rar", None));
+    }
+
+    #[test]
+    fn blocked_extensions_reports_the_locked_out_ones() {
+        let probe = probe_with("Bandizip.zip", &["zip", "rar"]);
+        assert_eq!(blocked_extensions(&probe), vec!["zip".to_string(), "rar".to_string()]);
+
+        let none = probe_with("ZipNest.zip", &[]);
+        assert!(blocked_extensions(&none).is_empty());
+
+        // Our own ProgIDs everywhere: a fully claimed machine reports nothing.
+        let ours = probe_with("ZipNest.7z", &["7z"]);
+        assert!(!blocked_extensions(&ours).contains(&"7z".to_string()));
+    }
+
+    #[test]
+    fn user_choice_key_and_default_apps_uri_are_the_documented_ones() {
+        assert_eq!(
+            user_choice_key("zip"),
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.zip\UserChoice"
+        );
+        // Windows 11 deep-links to the per-app page by capability name.
+        assert_eq!(
+            DEFAULT_APPS_URI,
+            "ms-settings:defaultapps?registeredAppUser=ZipNest"
+        );
+    }
+
+    #[test]
+    fn real_registry_probe_classifies_the_environment_consistently() {
+        // Smoke test against the machine's real state. On a machine with no
+        // `UserChoice` for these extensions it reports nothing; the point is
+        // that the live probe and the pure classifier never disagree.
+        let probe = WindowsRegistry;
+        let blocked = blocked_extensions(&probe);
+        for ext in SUPPORTED_EXTENSIONS {
+            let got = probe.user_choice_progid(ext);
+            assert_eq!(
+                blocked.contains(&ext.to_string()),
+                user_choice_blocks(ext, got.as_deref()),
+                "probe and classifier disagree for .{ext}"
+            );
+        }
     }
 }
 

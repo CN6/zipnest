@@ -323,12 +323,18 @@ impl IpcService {
     /// can deny one injection point while the rest still succeed, so the
     /// outcome carries a warning key per denied component instead of failing
     /// the whole save. The registry side is injected through `applier` so
-    /// tests never touch the real registry.
+    /// tests never touch the real registry, and Windows' own per-extension
+    /// choice is read through `probe`.
+    ///
+    /// `blocked` in the result names the extensions Windows has already
+    /// assigned to another program: those writes succeed but the OS keeps its
+    /// locked-in handler, and no program can change that without the user.
     pub fn shell_register(
         &self,
         exe: &std::path::Path,
         opts: crate::shell::ShellOptions,
         applier: &dyn crate::shell::ShellApplier,
+        probe: &dyn crate::shell::AssocProbe,
     ) -> Result<crate::shell::ShellRegisterResult, IpcError> {
         use crate::shell;
         let mut warnings = Vec::new();
@@ -343,11 +349,13 @@ impl IpcService {
             return Err(IpcError::new("error.shell.dev_path"));
         }
 
+        let mut blocked = Vec::new();
         let associate_ok = if opts.associate {
             let ok = applier.run(&shell::assoc_ops(exe)).is_ok();
             if !ok {
                 warnings.push("error.shell.associate".into());
             }
+            blocked = shell::blocked_extensions(probe);
             ok
         } else {
             let _ = applier.run(&shell::assoc_removals());
@@ -374,12 +382,16 @@ impl IpcService {
         let settings = self.lock_settings()?.set(SettingsPatch {
             associate: Some(opts.associate && associate_ok),
             context_menu: Some(opts.context_menu && menu_ok),
+            // Whatever happened, the one-time startup bootstrap must not run
+            // again: an explicit opt-out has to survive a restart.
+            integration_applied: Some(true),
             ..Default::default()
         })?;
         Ok(crate::shell::ShellRegisterResult {
             associate: settings.associate,
             context_menu: settings.context_menu,
             warnings,
+            blocked,
         })
     }
 
@@ -614,7 +626,7 @@ impl IpcService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shell::{RegOp, ShellApplier, ShellOptions};
+    use crate::shell::{AssocProbe, RegOp, ShellApplier, ShellOptions};
     use std::sync::Mutex;
 
     /// Records the ops the service would apply instead of touching the registry.
@@ -625,6 +637,26 @@ mod tests {
         fn run(&self, ops: &[RegOp]) -> std::io::Result<()> {
             self.0.lock().unwrap().extend_from_slice(ops);
             Ok(())
+        }
+    }
+
+    /// A machine where Windows has not recorded a choice: our registration is
+    /// what Explorer will use.
+    struct NoChoice;
+
+    impl AssocProbe for NoChoice {
+        fn user_choice_progid(&self, _ext: &str) -> Option<String> {
+            None
+        }
+    }
+
+    /// A machine where `.zip` is locked to another archiver, the situation the
+    /// app cannot fix and has to report.
+    struct ZipLockedToAnother;
+
+    impl AssocProbe for ZipLockedToAnother {
+        fn user_choice_progid(&self, ext: &str) -> Option<String> {
+            (ext == "zip").then(|| "Bandizip.zip".to_string())
         }
     }
 
@@ -664,9 +696,15 @@ mod tests {
 
         let rec = Recorder::default();
         let out = svc
-            .shell_register(exe, ShellOptions { associate: true, context_menu: false }, &rec)
+            .shell_register(
+                exe,
+                ShellOptions { associate: true, context_menu: false },
+                &rec,
+                &NoChoice,
+            )
             .unwrap();
         assert!(out.associate && !out.context_menu);
+        assert!(out.blocked.is_empty());
         assert!(rec
             .0
             .lock()
@@ -676,8 +714,11 @@ mod tests {
 
         // Turning everything off emits removals only.
         let rec2 = Recorder::default();
-        let out2 = svc.shell_register(exe, ShellOptions::default(), &rec2).unwrap();
+        let out2 = svc
+            .shell_register(exe, ShellOptions::default(), &rec2, &NoChoice)
+            .unwrap();
         assert!(!out2.associate && !out2.context_menu);
+        assert!(out2.blocked.is_empty(), "nothing is claimed, so nothing is blocked");
         assert!(rec2
             .0
             .lock()
@@ -692,6 +733,26 @@ mod tests {
     }
 
     #[test]
+    fn shell_register_reports_extensions_windows_will_not_hand_over() {
+        // Registering succeeds, `.zip` still opens with the other program, and
+        // the UI needs to know which extensions those are.
+        let svc = service_with_settings("blocked");
+        let exe = std::path::Path::new(r"C:\Apps\ZipNest.exe");
+        let rec = Recorder::default();
+        let out = svc
+            .shell_register(
+                exe,
+                ShellOptions { associate: true, context_menu: false },
+                &rec,
+                &ZipLockedToAnother,
+            )
+            .unwrap();
+        assert!(out.associate, "the registry writes themselves succeeded");
+        assert!(out.warnings.is_empty());
+        assert_eq!(out.blocked, vec!["zip".to_string()]);
+    }
+
+    #[test]
     fn shell_register_survives_partial_denial() {
         let svc = service_with_settings("partial");
         let exe = std::path::Path::new(r"C:\Apps\ZipNest.exe");
@@ -700,6 +761,7 @@ mod tests {
                 exe,
                 ShellOptions { associate: true, context_menu: true },
                 &PartialFail,
+                &NoChoice,
             )
             .unwrap();
         // Associations and the two allowed menu targets applied; the

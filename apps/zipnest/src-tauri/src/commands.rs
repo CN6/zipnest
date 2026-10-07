@@ -108,6 +108,7 @@ pub fn shell_register(
         &exe,
         ShellOptions { associate, context_menu },
         &zipnest_ipc::shell::WindowsRegistry,
+        &zipnest_ipc::shell::WindowsRegistry,
     )
 }
 
