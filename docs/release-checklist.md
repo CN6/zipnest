@@ -26,6 +26,12 @@
 
 - [ ] 注册表 `HKCU\Software\Classes\ZipNest.<ext>\shell\open\command` 指向**发布路径**（安装目录或便携目录），且命令带正确引号：`"<exe>" "%1"`
 - [ ] **绝不**指向 `target\debug\...` 或 `target\release\...`（开发脚本已拒绝，发布时要抽查）
+- [ ] v0.4.8 起还有三处必须存在（否则"装完不是默认"会复发）：
+  - [ ] 9 个扩展名的默认值指向 `ZipNest.<ext>`：`HKCU\Software\Classes\.zip` 等
+  - [ ] `HKCU\Software\RegisteredApplications\ZipNest` → `Software\ZipNest\Capabilities`，
+        且 `...\Capabilities\FileAssociations\.<ext>` 齐全（决定 ZipNest 是否出现在系统「默认应用」里）
+  - [ ] `HKCU\Software\Classes\Applications\zipnest.exe\shell\open\command`（"打开方式"里的名字与命令）
+- [ ] 安装包内含 `zipnest.exe --register-integration` 调用（v0.4.8 起安装即注册，`installer.nsi` 内搜该字符串）
 - [ ] 安装包内包含桌面快捷方式（`$DESKTOP\ZipNest.lnk`）
 - [ ] 卸载时删除桌面快捷方式
 
@@ -33,6 +39,11 @@
 
 - [ ] 用**发布 exe** 双击/命令行打开一个 `.zip` → 正常打开、无黑色命令框
 - [ ] 打开 `plain.zip` 列表正常
+- [ ] **新机默认关联冒烟**（v0.4.8 起必做）：
+  1. `zipnest.exe --unregister-shell` 清空关联（模拟新装机器）
+  2. `zipnest.exe --register-integration`（或直接启动一次程序，走首次启动路径）
+  3. `cmd /c start "" x.7z`（选一个**没有 UserChoice** 的扩展名）→ 应启动 `zipnest.exe`
+  4. 只启动程序（不带参数）再查一次：`%APPDATA%\ZipNest\settings.json` 的 `integration_applied` 必须变成 `true`
 - [ ] 右键文件夹 → ZipNest → 打开正常（若系统策略拒绝 `*\shell`，属已知降级，不算失败）
 - [ ] Win11：安装后重启资源管理器，**新菜单**出现「添加到压缩包…」（文件/文件夹/空白处），点击打开新建向导并预填路径；卸载后条目消失
 
@@ -55,6 +66,13 @@
 - 本机系统策略拒绝 `HKCU\Software\Classes\*\shell`（所有文件右键）与
   `Directory\Background\shell`（空白处右键）→ 产品显示中文警告并回滚开关。
 - 这属于加固策略，不是发布缺陷。
+- **已经被用户指定给别的程序的扩展名无法由程序改回**：`HKCU\...\FileExts\.<ext>\UserChoice`
+  带 Deny-SetValue ACE，写入 ProgId 报"不允许所请求的注册表访问权"，`reg delete /f`
+  也报拒绝访问（v0.4.8 实测）。凡此类扩展名，设置页会列出并给出「打开系统默认应用」
+  按钮 —— 那是唯一合法路径（绝不伪造 hash）。
+- 本机 shell 探测 API 不可靠：`assoc .ext` 报"File association not found"、
+  `AssocQueryStringW(ASSOCSTR_EXECUTABLE)` 对 `.txt` 也返回 `0x80070483`。
+  校验一律以注册表本身 + `start` 实测为准。
 
 ---
 
