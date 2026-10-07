@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.6";
+const CURRENT_VERSION: &str = "0.4.7";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 const UPDATE_UA: &str = "ZipNest-Updater/0.4.0";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
@@ -308,7 +308,11 @@ fn main() -> Result<(), eframe::Error> {
         .clone();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([DESIGN_WIDTH, 620.0])
-        .with_title(single_instance::WINDOW_TITLE);
+        .with_title(single_instance::WINDOW_TITLE)
+        // Created hidden and shown on the first frame. A window that is shown
+        // before its size is applied sits as a 16x16 square in the corner for a
+        // moment, which reads as a flash before the real window appears.
+        .with_visible(false);
     // Stored geometry is in physical pixels. `ViewportBuilder` wants logical
     // points, so divide by the monitor DPI scale — the same factor the saving
     // side multiplies by. Note that egui's viewport rects are native points:
@@ -339,12 +343,7 @@ fn main() -> Result<(), eframe::Error> {
     }
     // Restore a window that was left maximized; without this the window came
     // back at its old normal size every launch.
-    // A window left maximized is created hidden and already maximized: passing
-    // a size/position makes it appear small for a moment before the platform
-    // maximizes it, which reads as a flash. The first frame shows it again.
-    if saved.window_maximized {
-        viewport = viewport.with_maximized(true).with_visible(false);
-    }
+
     // Same icon embedded in the exe via build.rs: window and taskbar then match
     // the Explorer icon and shortcuts.
     if let Some(icon) = load_app_icon() {
@@ -375,6 +374,8 @@ struct App {
     /// Last published busy-marker state; `None` forces one write on becoming
     /// primary so a marker left by a crash cannot make us look busy.
     published_busy: Option<bool>,
+    /// The window is created hidden; the first frame is what shows it.
+    show_on_first_frame: bool,
     /// The window exists for a shell request rather than a user session; it is
     /// closed once its job is done when `settings.auto_close_after_job` is on.
     /// When to close after a finished job (short delay so the result is read).
@@ -385,10 +386,7 @@ struct App {
     /// dragging the window does not rewrite the settings file every frame.
     saved_geometry: Option<((u32, u32), (i32, i32))>,
     geometry_saved_at: Option<std::time::Instant>,
-    /// Last maximized flag written to settings (edge-triggered, like the size).
-    maximized_saved: Option<bool>,
-    /// The window should be maximized again once the first frame sees it is not.
-    restore_maximized: bool,
+
     archive: Option<zipnest_ipc::OpenArchiveResult>,
     archive_path: String,
     cwd: String,
@@ -518,12 +516,7 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
                 }
             });
         }
-        // ViewportBuilder::with_maximized is not reliably honored once a size
-        // and a position are also supplied, so keep the wish and re-ask on the
         // first frame. maximized_saved starts at the stored value so the first
-        // frame cannot immediately write the opposite back.
-        let restore_maximized = settings.window_maximized;
-        let maximized_saved = Some(settings.window_maximized);
         Self {
             ctx,
             svc,
@@ -533,12 +526,12 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             pending_open: None,
             is_primary: false,
             published_busy: None,
+            show_on_first_frame: true,
             close_at: None,
             primary_retry_at: std::time::Instant::now(),
             saved_geometry: None,
             geometry_saved_at: None,
-            maximized_saved,
-            restore_maximized,
+
             archive: None,
             archive_path: String::new(),
             cwd: String::new(),
@@ -2119,10 +2112,21 @@ impl eframe::App for App {
 fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs();
 
+        if self.show_on_first_frame {
+            self.show_on_first_frame = false;
+            // The size is applied by now, so the window can appear at its final
+            // geometry instead of flashing a small default first.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+
         // Remember the window geometry so the next launch opens where the user
         // left it. Debounced: dragging fires this every frame, and a maximised
         // window keeps the last normal size instead of overwriting it.
         let viewport = ctx.input(|i| i.viewport().clone());
+        // Deliberately NOT remembered: restoring a maximized window makes it
+        // appear small for a moment before it is maximized, which reads as a
+        // flash. So this keeps the last *normal* size, and every launch opens as
+        // a normal window the user can maximize themselves.
         if viewport.maximized != Some(true) {
             if let Some(rect) = viewport.inner_rect {
                 // Native DPI scale, *not* `ctx.pixels_per_point()`: the viewport
@@ -2154,30 +2158,7 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             }
         }
 
-        // Remember the maximized flag on its own: the geometry above is skipped
-        // while maximized (it keeps the last normal size), so this is the only
-        // place the state is written.
-        if let Some(is_max) = viewport.maximized {
-            if self.maximized_saved != Some(is_max) {
-                self.maximized_saved = Some(is_max);
-                let _ = self.svc.settings_set(SettingsPatch {
-                    window_maximized: Some(is_max),
-                    ..Default::default()
-                });
-            }
-        }
 
-        if self.restore_maximized {
-            self.restore_maximized = false;
-            // The window was created hidden so a maximized window never shows
-            // its small pre-maximized state; show it once the wish is on its
-            // way. Asking for the maximize and the show in the same frame keeps
-            // both in one event-loop pass, so nothing flashes in between.
-            if viewport.maximized != Some(true) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        }
 
         // Take the primary role if it is free: the window that holds it is the
         // one later launches reuse, so an existing window should pick it up

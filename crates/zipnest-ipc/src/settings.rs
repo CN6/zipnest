@@ -67,8 +67,7 @@ pub struct Settings {
     /// Last window size in logical points; `None` on the first run.
     pub window_width: Option<u32>,
     pub window_height: Option<u32>,
-    /// Whether the window was left maximized.
-    pub window_maximized: bool,
+
     /// Last window position; `None` lets the OS place the window.
     pub window_x: Option<i32>,
     pub window_y: Option<i32>,
@@ -90,7 +89,7 @@ impl Default for Settings {
             theme_mode: "system".into(),
             window_width: None,
             window_height: None,
-            window_maximized: false,
+
             window_x: None,
             window_y: None,
         }
@@ -111,7 +110,7 @@ pub struct SettingsPatch {
     pub auto_check_update: Option<bool>,
     pub max_extract_bytes: Option<u64>,
     pub theme_mode: Option<String>,
-    pub window_maximized: Option<bool>,
+
     pub window_width: Option<u32>,
     pub window_height: Option<u32>,
     pub window_x: Option<i32>,
@@ -168,9 +167,7 @@ impl Settings {
             }
             self.theme_mode = v;
         }
-        if let Some(v) = patch.window_maximized {
-            self.window_maximized = v;
-        }
+
         if let Some(v) = patch.window_width {
             self.window_width = Some(v.clamp(WINDOW_SIZE.0, WINDOW_SIZE.1));
         }
