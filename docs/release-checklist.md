@@ -32,6 +32,9 @@
         且 `...\Capabilities\FileAssociations\.<ext>` 齐全（决定 ZipNest 是否出现在系统「默认应用」里）
   - [ ] `HKCU\Software\Classes\Applications\zipnest.exe\shell\open\command`（"打开方式"里的名字与命令）
 - [ ] 安装包内含 `zipnest.exe --register-integration` 调用（v0.4.8 起安装即注册，`installer.nsi` 内搜该字符串）
+- [ ] **安装程序绝不能等待 `zipnest.exe`**（v0.4.8 用 `nsExec::ExecToLog` 等它，在「旧 exe 没被替换掉」的机器上卡死在「创建快捷方式」）：
+      只允许 `Exec`（启动即返回）；调用前用 `GetDLLVersion` 挡掉旧版本；每个步骤都要有自己的
+      `DetailPrint`，这样用户截一张详情图就能指出卡在哪一步
 - [ ] 安装包内包含桌面快捷方式（`$DESKTOP\ZipNest.lnk`）
 - [ ] 卸载时删除桌面快捷方式
 

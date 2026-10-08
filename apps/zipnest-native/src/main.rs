@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.8";
+const CURRENT_VERSION: &str = "0.4.9";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 const UPDATE_UA: &str = "ZipNest-Updater/0.4.0";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
@@ -149,9 +149,9 @@ fn fetch_latest() -> Result<(String, String), String> {
     Ok((tag, url))
 }
 
-fn open_in_browser(url: &str) {
-    // Hand the URL to the default browser. `start` needs the empty "" title
-    // argument before the URL when the URL could be quoted.
+/// Hand a URL (web page, or `mailto:`) to whatever Windows has registered for
+/// it. `start` needs the empty "" title argument before a quoted URL.
+fn open_shell_url(url: &str) {
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("cmd")
@@ -159,6 +159,91 @@ fn open_in_browser(url: &str) {
             .creation_flags(CREATE_NO_WINDOW)
             .spawn();
     }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+/// Where feedback goes. Kept as two halves so the Settings dialog can show it
+/// with the `@` broken up (`… @ …`): the joined address only ever exists at
+/// runtime and inside the `mailto:` link, so a static scan of the exe does not
+/// find a ready-made `user@domain` string to scrape.
+///
+/// Changing the channel is this one line: put the new mailbox in
+/// [`FEEDBACK_EMAIL_USER`] / [`FEEDBACK_EMAIL_DOMAIN`].
+const FEEDBACK_EMAIL_USER: &str = "1106205793";
+const FEEDBACK_EMAIL_DOMAIN: &str = "qq.com";
+
+fn feedback_email() -> String {
+    format!("{FEEDBACK_EMAIL_USER}@{FEEDBACK_EMAIL_DOMAIN}")
+}
+
+/// `Windows 10.0.26100 (x64)`. The build number is what identifies a Windows
+/// version — the marketing name lies (Windows 11 reports 10.0) — and
+/// `RtlGetVersion` is used because `GetVersionExW` has been deprecated and
+/// reports a fixed 6.2 since Windows 8.1.
+#[cfg(windows)]
+fn windows_version_string() -> String {
+    #[repr(C)]
+    struct OsVersionInfoW {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform_id: u32,
+        csd: [u16; 128],
+    }
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn RtlGetVersion(info: *mut OsVersionInfoW) -> i32;
+    }
+
+    let arch = arch_label();
+    let mut info = OsVersionInfoW {
+        size: std::mem::size_of::<OsVersionInfoW>() as u32,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform_id: 0,
+        csd: [0; 128],
+    };
+    if unsafe { RtlGetVersion(&mut info) } == 0 {
+        format!("Windows {}.{}.{} ({arch})", info.major, info.minor, info.build)
+    } else {
+        format!("Windows (build unknown) ({arch})")
+    }
+}
+
+#[cfg(not(windows))]
+fn windows_version_string() -> String {
+    format!("{} ({})", std::env::consts::OS, arch_label())
+}
+
+fn arch_label() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "x86",
+        other => other,
+    }
+}
+
+/// Hard cap for the command-line modes (`--register-integration`,
+/// `--unregister-shell`).
+///
+/// The uninstaller runs `--unregister-shell` through `nsExec::ExecToLog`, which
+/// blocks until this process exits (and the installer did the same until the
+/// stuck-install report). Anything that wedged the process would therefore hang
+/// the installer with nothing on screen to explain it. The real work is a
+/// handful of registry writes, so a deadline costs nothing. Detached, so a
+/// normal exit never waits for it.
+fn cap_cli_runtime() {
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        eprintln!("ZipNest: command-line mode did not finish within 20s, exiting");
+        std::process::exit(0);
+    });
 }
 
 /// Open Windows' own Default apps page, pre-selecting ZipNest where the OS
@@ -167,13 +252,7 @@ fn open_in_browser(url: &str) {
 /// key (it cannot be written and cannot be deleted), so no amount of registry
 /// work can take it back by itself.
 fn open_default_apps_page() {
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", zipnest_ipc::shell::DEFAULT_APPS_URI])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
-    }
+    open_shell_url(zipnest_ipc::shell::DEFAULT_APPS_URI);
 }
 
 /// Which integration to apply when somebody asks for it.
@@ -295,6 +374,7 @@ fn main() -> Result<(), eframe::Error> {
     // ProgIDs and the extension defaults we pointed at them) without starting
     // the UI. A failure is reported through the exit code.
     if args.iter().skip(1).any(|a| a == "--unregister-shell") {
+        cap_cli_runtime();
         let mut ops = zipnest_ipc::shell::context_menu_removals();
         ops.extend(zipnest_ipc::shell::assoc_removals());
         return match zipnest_ipc::shell::ShellApplier::run(
@@ -314,6 +394,7 @@ fn main() -> Result<(), eframe::Error> {
     // files: it claims the archive extensions and the context menus, so a
     // machine where the app is never opened still has them. No UI starts.
     if args.iter().skip(1).any(|a| a == "--register-integration") {
+        cap_cli_runtime();
         let svc = IpcService::new(
             Arc::new(|_: &str, _: serde_json::Value| {}),
             std::time::Duration::ZERO,
@@ -469,6 +550,9 @@ struct App {
     selected: std::collections::HashSet<String>,
     error: Option<String>,
     notice: Option<String>,
+    /// When the diagnostics report was last copied, so the Settings dialog can
+    /// show a short "已复制" confirmation instead of a silent button.
+    copied_at: Option<std::time::Instant>,
     lang: String,
     open_picker: bool,
     // jobs / preview
@@ -632,6 +716,7 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             selected: Default::default(),
             error: None,
             notice: None,
+            copied_at: None,
             lang,
             open_picker: false,
             jobs,
@@ -668,6 +753,43 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
 
 fn t(&self, key: &str) -> String {
         i18n::tr(&self.lang, key)
+    }
+
+    /// The text behind 设置 → 帮助与反馈. One source for the clipboard button and
+    /// the mail body, so what a user sends is exactly what the button showed.
+    ///
+    /// Built by [`zipnest_ipc::diagnostics`], which is where the privacy rules
+    /// live: version, OS build, the exe path with the account name masked, the
+    /// integration flags, the engine state and the last error *key* — never a
+    /// file name, an archive entry or anything else about the user's work.
+    fn diagnostics_report(&self) -> String {
+        zipnest_ipc::diagnostics::render(&zipnest_ipc::Diagnostics {
+            version: CURRENT_VERSION.to_string(),
+            os: windows_version_string(),
+            exe: std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            profile_dir: std::env::var("USERPROFILE").ok(),
+            engine_ok: zipnest_ipc::engine_available(),
+            settings: self.settings.clone(),
+            last_error: self.error.clone().or_else(|| self.notice.clone()),
+        })
+    }
+
+    /// Copy the report and open the user's mail client with it prefilled.
+    ///
+    /// The clipboard comes first on purpose: plenty of Windows installs have no
+    /// mail client configured, in which case the `mailto:` does nothing at all —
+    /// and the user still has the text ready to paste into webmail.
+    fn send_feedback_mail(&mut self, ctx: &egui::Context) {
+        let report = self.diagnostics_report();
+        ctx.copy_text(report.clone());
+        self.copied_at = Some(std::time::Instant::now());
+        let subject = format!(
+            "[ZipNest v{CURRENT_VERSION}] {}",
+            self.t("settings.feedback.mail_subject")
+        );
+        open_shell_url(&zipnest_ipc::mailto_url(&feedback_email(), &subject, &report));
     }
 
     /// Status text for the last job. `job.ok_skipped` carries the count as
@@ -1861,6 +1983,44 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                             ui.label(self.t("settings.version"));
                             ui.label(egui::RichText::new(format!("v{CURRENT_VERSION}")).strong());
                         });
+
+                        theme::section(ui, &self.t("settings.section.feedback"));
+                        theme::hint(ui, &self.t("settings.feedback.hint"));
+                        ui.horizontal(|ui| {
+                            if ui.button(self.t("settings.feedback.copy")).clicked() {
+                                // Everything the maintainer asks for first, and
+                                // nothing about what the user was working on.
+                                let report = self.diagnostics_report();
+                                ui.ctx().copy_text(report);
+                                self.copied_at = Some(std::time::Instant::now());
+                            }
+                            if let Some(at) = self.copied_at {
+                                if at.elapsed() < std::time::Duration::from_secs(4) {
+                                    ui.label(
+                                        egui::RichText::new(self.t("settings.feedback.copied"))
+                                            .italics(),
+                                    );
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(self.t("settings.feedback.email"));
+                            // Shown with the `@` broken up: a bare address in a UI
+                            // string is a ready-made scrape target. Selectable so
+                            // the user can copy it, with the real one only inside
+                            // the mailto link.
+                            let shown = format!(
+                                "{FEEDBACK_EMAIL_USER} @ {FEEDBACK_EMAIL_DOMAIN}"
+                            );
+                            ui.add(egui::Label::new(egui::RichText::new(shown).strong()).selectable(true));
+                            if ui.button(self.t("settings.feedback.copy_email")).clicked() {
+                                ui.ctx().copy_text(feedback_email());
+                                self.copied_at = Some(std::time::Instant::now());
+                            }
+                        });
+                        if ui.button(self.t("settings.feedback.mail")).clicked() {
+                            self.send_feedback_mail(ui.ctx());
+                        }
                     });
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1981,7 +2141,7 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                         ui.label(hint);
                         ui.horizontal(|ui| {
                             if ui.button(dl).clicked() {
-                                open_in_browser(&url);
+                                open_shell_url(&url);
                             }
                             if ui.button(cancel).clicked() {
                                 *upd.lock().unwrap() = UpdateState::Idle;
@@ -3241,7 +3401,6 @@ mod create_form_tests {
 #[cfg(test)]
 mod integration_tests {
     use super::{integration_plan, ShellOptions};
-
     fn settings(applied: bool, associate: bool, context_menu: bool) -> zipnest_ipc::Settings {
         zipnest_ipc::Settings {
             integration_applied: applied,
@@ -3281,5 +3440,44 @@ mod integration_tests {
         // Half-registered is a state the user can legitimately choose.
         let partial = integration_plan(&settings(true, true, false), true).unwrap();
         assert_eq!(partial, ShellOptions { associate: true, context_menu: false });
+    }
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::{feedback_email, FEEDBACK_EMAIL_DOMAIN, FEEDBACK_EMAIL_USER};
+
+    #[test]
+    fn the_feedback_address_is_a_usable_mailbox() {
+        // A typo here (a space, a doubled `@`, an empty half) is a channel that
+        // silently swallows every report, so it is worth asserting.
+        let addr = feedback_email();
+        assert_eq!(addr.matches('@').count(), 1, "exactly one @: {addr}");
+        assert!(!addr.contains(char::is_whitespace), "no spaces in an address");
+        let (user, domain) = addr.split_once('@').unwrap();
+        assert!(!user.is_empty(), "local part is empty");
+        assert!(domain.contains('.'), "domain has no dot: {domain}");
+        assert!(!addr.contains(".."), "doubled dot: {addr}");
+    }
+
+    #[test]
+    fn the_ui_never_prints_the_joined_address() {
+        // The Settings dialog shows `user @ domain`; only the `mailto:` link and
+        // the copy button build the real thing. This is what keeps a scrape of
+        // the UI/executable strings from getting a working address.
+        let shown = format!("{FEEDBACK_EMAIL_USER} @ {FEEDBACK_EMAIL_DOMAIN}");
+        let real = feedback_email();
+        assert_ne!(shown, real);
+        assert!(!shown.contains(&real), "split form must not contain the whole address");
+    }
+
+    #[test]
+    fn the_mail_link_targets_that_mailbox() {
+        let url = zipnest_ipc::mailto_url(&feedback_email(), "[ZipNest v0.4.9] test", "body");
+        assert!(
+            url.starts_with(&format!("mailto:{}?", feedback_email())),
+            "mailto must point at the feedback mailbox: {url}"
+        );
+        assert!(url.contains("subject=") && url.contains("&body="));
     }
 }

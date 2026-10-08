@@ -66,8 +66,25 @@ older web UI and is NOT shipped.
    with `+refs/tags/v<ver>`, then `gh release create v<ver> <installer> <zip>
    --title ... --notes-file ...`.
 
-## Known open items / gotchas (as of v0.4.8)
+## Known open items / gotchas (as of v0.4.9)
 
+- **Never make the installer wait on zipnest.exe** (v0.4.8 shipped exactly that
+  hang). `nsExec::ExecToLog` blocks until the child exits *and* closes its output
+  pipe; v0.4.8 ran `zipnest.exe --register-integration` through it, and on a
+  machine where the file copy was skipped (`SetOverwrite try` skips a locked file
+  silently) that child was a **stale build** that does not know the flag — it
+  treats it as "no arguments" and opens its main window, so the installer waited
+  forever on the shortcut screen. Now: `Exec` (start, never wait), a
+  `GetDLLVersion` guard so an unreplaced exe is not called at all, a registry
+  read-back to report the real outcome, a `DetailPrint` per step (so a screenshot
+  of the Details pane names the stuck step), and `cap_cli_runtime` makes both CLI
+  modes self-terminate after 20 s.
+- **Feedback entry** (v0.4.9): 设置 → 帮助与反馈. `zipnest_ipc::diagnostics`
+  renders the report (version, OS build, exe path with the account name masked to
+  `%USERPROFILE%`, integration flags, engine state, last error key) and builds
+  the `mailto:` URL. It must never gain a file name, an archive entry or a user
+  path; the tests in that module are the guard. Nothing is transmitted
+  automatically — clipboard and `mailto:` only, so the "no telemetry" rule holds.
 - **File associations are claimed automatically** (v0.4.8). Three pieces, all
   HKCU: `assoc_ops` (ProgID per extension + the extension default +
   `OpenWithProgids` + `Applications\zipnest.exe` + `RegisteredApplications` /

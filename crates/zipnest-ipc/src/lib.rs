@@ -4,16 +4,28 @@
 //! wire a recording vector. No file-system access beyond what the engine
 //! performs through [`IpcService`].
 
+pub mod diagnostics;
 pub mod error;
 pub mod registry;
 pub mod service;
 pub mod settings;
 pub mod shell;
 
+pub use diagnostics::{mailto_url, Diagnostics};
 pub use error::IpcError;
 pub use service::{CreateRequest, EntryDto, IpcService, OpenArchiveResult};
 pub use settings::{Settings, SettingsPatch, SettingsStore};
 pub use shell::{ShellApplier, ShellOptions, ShellRegisterResult};
+
+/// Whether the unpacking engine can be loaded right now.
+///
+/// Used by the diagnostics report in Settings. It runs the same load the engine
+/// would (cached after the first call) and never logs or transmits anything:
+/// "7z.dll missing" is otherwise invisible until a user tries to open an
+/// archive.
+pub fn engine_available() -> bool {
+    archive_core::dll::load().is_ok()
+}
 
 /// Test-only: remove temp files and directories left behind by *earlier* runs.
 ///

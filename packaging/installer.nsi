@@ -1,9 +1,9 @@
-﻿; ZipNest 0.4.8 native installer (NSIS Unicode)
+﻿; ZipNest 0.4.9 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.4.8"
+!define VERSION "0.4.9"
 ; This installer is a 32-bit process, so plain $PROGRAMFILES would resolve to
 ; "C:\Program Files (x86)" on 64-bit Windows. ZipNest ships as x64, so force
 ; the 64-bit location. InstallDirRegKey below still reads HKCU\...\ZipNest's
@@ -26,7 +26,7 @@ Unicode True
 !define ZN_BUSY_GIVEUP_MSG_EN "Some files are still in use and were not updated. Close ZipNest (or reboot) and run the installer again."
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.4.8_x64-setup.exe"
+OutFile "ZipNest_0.4.9_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -197,13 +197,51 @@ zn_copy_files:
   ; why a fresh install was never the default. The exe also writes the
   ; "applications" and "capabilities" keys Windows needs to list ZipNest under
   ; 设置 → 应用 → 默认应用. Runs per-user (HKCU), no elevation beyond the
-  ; installer's own; a failure is reported but never aborts the install.
-  nsExec::ExecToLog '"$INSTDIR\zipnest.exe" --register-integration'
-  Pop $0
-  IntCmp $0 0 zn_integration_ok zn_integration_failed zn_integration_failed
-zn_integration_failed:
-  DetailPrint "文件关联/右键菜单自动注册失败（可在 ZipNest 设置里手动开启）"
-zn_integration_ok:
+  ; installer's own.
+  ;
+  ; Two rules this step has to follow, both learned from the v0.4.8 report of an
+  ; install that sat on this very screen forever on another machine:
+  ;
+  ;   1. NEVER wait for it. v0.4.8 used `nsExec::ExecToLog`, which blocks until
+  ;      the child exits AND closes its output pipe. A build that does not know
+  ;      the flag (an *older* zipnest.exe left behind because the copy above was
+  ;      skipped -- `SetOverwrite try` does that silently) treats it as "no
+  ;      arguments" and opens its window instead, which never returns. `Exec`
+  ;      only starts the process, so nothing the child does can hold the
+  ;      installer here. Registration is idempotent, and the app re-applies it
+  ;      on first launch, so the result is never actually lost.
+  ;   2. Say in the log what happened. The Details pane is what a user
+  ;      screenshots when something stalls; a silent step is undiagnosable.
+  DetailPrint "注册压缩包默认打开方式…"
+  GetDLLVersion "$INSTDIR\zipnest.exe" $5 $6
+  ; $5 = (major<<16)|minor, $6 = (build<<16)|revision. Anything below 0.4.9
+  ; predates the flag, so do not start it at all (that is also how a skipped
+  ; file replacement shows up). 0.4.9 = $5 4, $6 589824.
+  ;
+  ; The branch order is not cosmetic: IntCmpU takes [equal] [less] [greater],
+  ; which was verified against 0.3.x / 0.4.8 / 0.4.9 / 0.4.10 / 0.5.0 / 1.0.0
+  ; before shipping. Written the other way round a 0.3.x build reads as "new
+  ; enough" (it opens a stray window) and 0.5.0+ as "too old" (which is the
+  ; v0.4.8 "not the default after install" bug all over again).
+  IntCmpU $5 4 zn_assoc_minor_eq zn_assoc_too_old zn_assoc_new_enough
+zn_assoc_minor_eq:
+  IntCmpU $6 589824 zn_assoc_new_enough zn_assoc_too_old zn_assoc_new_enough
+zn_assoc_too_old:
+  DetailPrint "zipnest.exe 仍是旧版本（安装时被占用未替换），跳过自动注册；下次启动 ZipNest 时会补上"
+  Goto zn_assoc_done
+zn_assoc_new_enough:
+  Exec '"$INSTDIR\zipnest.exe" --register-integration'
+  ; Give it a moment, then report the registry truth rather than an exit code
+  ; we would have to block for. 1.5 s is far more than the write takes.
+  Sleep 1500
+  ReadRegStr $0 HKCU "Software\Classes\.zip" ""
+  StrCmp $0 "ZipNest.zip" zn_assoc_registered zn_assoc_missing
+zn_assoc_missing:
+  DetailPrint "自动注册没有生效（可能是系统策略），可在 ZipNest 设置 → 集成里手动开启"
+  Goto zn_assoc_done
+zn_assoc_registered:
+  DetailPrint "已把 ZipNest 登记为压缩包默认打开方式"
+zn_assoc_done:
 
 ; Register the Windows 11 context menu (per-user; ignored on Windows 10).
   Call RegisterWin11Shell
@@ -215,8 +253,14 @@ Function RegisterWin11Shell
   ReadRegStr $0 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "CurrentBuildNumber"
   IntCmpU $0 22000 do_register skip_register do_register
 do_register:
+  ; This one still waits for PowerShell (its exit code decides whether we warn),
+  ; and `Add-AppxPackage` can stall on a broken AppX deployment store. The line
+  ; below is deliberate: if a user ever reports a stuck install again, the
+  ; Details pane must show whether it stalled here or in the step above.
+  DetailPrint "注册 Windows 11 右键菜单…"
   nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Win11Shell\install.ps1" -InstallDir "$INSTDIR" -PackageDir "$INSTDIR\Win11Shell"'
   Pop $0
+  DetailPrint "Windows 11 右键菜单注册返回码：$0"
   ; Certificate import / Add-AppxPackage failures used to be swallowed, so the
   ; user saw "installed" but had no context menu. Report, but do not abort:
   ; only the Win11 modern menu is missing.
