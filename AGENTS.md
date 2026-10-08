@@ -80,7 +80,21 @@ older web UI and is NOT shipped.
    - Local installers/portable zips are not kept: upload them and delete the
      copies (the maintainer does not want them on disk).
 
-## Known open items / gotchas (as of v0.4.9)
+## Known open items / gotchas (as of v0.4.10)
+
+- **The finish page owns the desktop shortcut** (v0.4.10). "创建桌面快捷方式"
+  is MUI's *readme* checkbox repurposed through
+  `MUI_FINISHPAGE_SHOWREADME_FUNCTION`; `MUI_FINISHPAGE_SHOWREADME` still has to
+  be defined (empty) because Finish.nsh wraps the whole block, FUNCTION branch
+  included, in `!ifdef MUI_FINISHPAGE_SHOWREADME`. The install section creates
+  only the Start-menu shortcuts, so clearing the box really means "no desktop
+  icon"; an upgrade never deletes a shortcut the user already had.
+- **Update checks are silent unless they have news** (v0.4.10).
+  `spawn_update_check(state, manual)`: the manual call sets `Checking` and
+  reports failures, the startup call touches no state while it runs and only
+  ever writes `Found`. Before this, `Checking` was set unconditionally, so every
+  launch flashed the "正在检查更新" window and an offline machine got an error
+  dialog.
 
 - **Never make the installer wait on zipnest.exe** (v0.4.8 shipped exactly that
   hang). `nsExec::ExecToLog` blocks until the child exits *and* closes its output

@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.9";
+const CURRENT_VERSION: &str = "0.4.10";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 const UPDATE_UA: &str = "ZipNest-Updater/0.4.0";
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
@@ -299,19 +299,34 @@ fn apply_integration(svc: &IpcService, force: bool) -> Option<zipnest_ipc::shell
     .ok()
 }
 
-fn spawn_update_check(state: Arc<Mutex<UpdateState>>) {
+/// Look for a newer release.
+///
+/// `manual` marks the Settings/toolbar button. Only that path may show a state:
+/// the automatic check on startup runs **silently** and touches nothing the
+/// user can see unless a genuinely newer release exists. `Checking` used to be
+/// set unconditionally, so every launch flashed an "正在检查更新" window even
+/// when there was nothing to report, and a failed check (no network) popped an
+/// error dialog nobody asked for. The background thread therefore leaves the
+/// state alone while it works, and only writes `Found`; "no update" and "the
+/// request failed" are both non-events on that path.
+fn spawn_update_check(state: Arc<Mutex<UpdateState>>, manual: bool) {
     std::thread::spawn(move || {
-        *state.lock().unwrap() = UpdateState::Checking;
+        if manual {
+            *state.lock().unwrap() = UpdateState::Checking;
+        }
         match fetch_latest() {
             Ok((tag, url)) => {
-                let next = if is_newer(&tag) {
-                    UpdateState::Found { tag, url }
-                } else {
-                    UpdateState::Idle
-                };
-                *state.lock().unwrap() = next;
+                if is_newer(&tag) {
+                    *state.lock().unwrap() = UpdateState::Found { tag, url };
+                } else if manual {
+                    *state.lock().unwrap() = UpdateState::Idle;
+                }
             }
-            Err(e) => *state.lock().unwrap() = UpdateState::Failed(e),
+            Err(e) => {
+                if manual {
+                    *state.lock().unwrap() = UpdateState::Failed(e);
+                }
+            }
         }
     });
 }
@@ -675,12 +690,14 @@ fn new(
         let qr_alipay = i18n::load_image(include_bytes!("assets/donate/alipay.jpg"))
             .map(|img| cc.egui_ctx.load_texture("alipay", img, egui::TextureOptions::NEAREST));
 let update: Arc<Mutex<UpdateState>> = Default::default();
-        // Auto-check is user-controllable in Settings (on by default).
+        // Auto-check is user-controllable in Settings (on by default). It is
+        // silent: no window, no spinner, no error dialog — only a real newer
+        // release opens anything (see spawn_update_check).
         if settings.auto_check_update {
             let check = Arc::clone(&update);
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                spawn_update_check(check);
+                spawn_update_check(check, false);
             });
         }
         // Wake the UI when a later launch leaves a request in the queue: egui
@@ -1546,7 +1563,7 @@ let extract_enabled = self.archive.is_some();
                     let upd = self.update.lock().unwrap().clone();
                     if matches!(upd, UpdateState::Idle) {
                         if theme::ghost_button(ui, &self.t("update.check")).clicked() {
-                            spawn_update_check(Arc::clone(&self.update));
+                            spawn_update_check(Arc::clone(&self.update), true);
                         }
                     } else if matches!(upd, UpdateState::Checking) {
                         ui.add(egui::Spinner::new());

@@ -1,9 +1,9 @@
-﻿; ZipNest 0.4.9 native installer (NSIS Unicode)
+﻿; ZipNest 0.4.10 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.4.9"
+!define VERSION "0.4.10"
 ; This installer is a 32-bit process, so plain $PROGRAMFILES would resolve to
 ; "C:\Program Files (x86)" on 64-bit Windows. ZipNest ships as x64, so force
 ; the 64-bit location. InstallDirRegKey below still reads HKCU\...\ZipNest's
@@ -26,7 +26,7 @@ Unicode True
 !define ZN_BUSY_GIVEUP_MSG_EN "Some files are still in use and were not updated. Close ZipNest (or reboot) and run the installer again."
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.4.9_x64-setup.exe"
+OutFile "ZipNest_0.4.10_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -35,9 +35,21 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
-; Offer to reopen ZipNest on the finish page (checked by default).
+; Finish page: two checkboxes, both checked by default.
+;   - "运行 ZipNest" is MUI's own run checkbox.
+;   - "创建桌面快捷方式" rides on MUI's "show readme" checkbox: that is the only
+;     other checkbox MUI2 draws on this page, and with
+;     MUI_FINISHPAGE_SHOWREADME_FUNCTION set MUI calls that function instead of
+;     opening a file. MUI_FINISHPAGE_SHOWREADME itself still has to be defined
+;     (empty is fine) because the whole block in Finish.nsh -- including the
+;     FUNCTION branch -- sits inside `!ifdef MUI_FINISHPAGE_SHOWREADME`.
+; The shortcut is created by ZNCreateDesktopShortcut below, NOT in the install
+; section, so clearing this box really means "no desktop icon".
 !define MUI_FINISHPAGE_RUN "$INSTDIR\zipnest.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "运行 ZipNest"
+!define MUI_FINISHPAGE_SHOWREADME ""
+!define MUI_FINISHPAGE_SHOWREADME_TEXT "创建桌面快捷方式"
+!define MUI_FINISHPAGE_SHOWREADME_FUNCTION ZNCreateDesktopShortcut
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
@@ -86,6 +98,16 @@ SetCompressor /SOLID lzma
 
 Function CloseRunningZipNest
   !insertmacro ZN_TRY_CLOSE_RUNNING $1 zn_kill
+FunctionEnd
+
+; "创建桌面快捷方式" on the finish page, called by MUI only when the box is
+; still checked. An upgrade does not touch an existing shortcut, so clearing the
+; box skips creating one rather than deleting the one a user already has; the
+; uninstaller keeps removing "$DESKTOP\ZipNest.lnk" either way.
+Function ZNCreateDesktopShortcut
+  CreateShortCut "$DESKTOP\ZipNest.lnk" "$INSTDIR\zipnest.exe" "" "$INSTDIR\zipnest.exe" 0
+  ; Refresh the shell icon cache so the new shortcut icon shows immediately.
+  System::Call "shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)"
 FunctionEnd
 
 ; Same as above, for the uninstall section (which may only call un.* functions).
@@ -182,12 +204,11 @@ zn_copy_files:
   WriteRegDWORD HKCU "${UNINSTKEY}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINSTKEY}" "NoRepair" 1
 
-; Start menu shortcut
+; Start menu shortcut. The desktop shortcut is NOT created here -- the finish
+; page asks for it (see ZNCreateDesktopShortcut), so this stays a choice.
   CreateDirectory "$SMPROGRAMS\ZipNest"
   CreateShortCut "$SMPROGRAMS\ZipNest\ZipNest.lnk" "$INSTDIR\zipnest.exe" "" "$INSTDIR\zipnest.exe" 0
   CreateShortCut "$SMPROGRAMS\ZipNest\卸载 ZipNest.lnk" "$INSTDIR\uninstall.exe" "" "$INSTDIR\uninstall.exe" 0
-  ; Desktop shortcut
-  CreateShortCut "$DESKTOP\ZipNest.lnk" "$INSTDIR\zipnest.exe" "" "$INSTDIR\zipnest.exe" 0
   ; Refresh the shell icon cache so the new shortcut icon shows immediately.
   System::Call "shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)"
 
