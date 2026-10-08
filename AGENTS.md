@@ -62,9 +62,23 @@ older web UI and is NOT shipped.
    `ZipNest_<ver>_x64_portable.zip` (installer + zip are gitignored).
 6. Update the machine: close any running instance first (the file is locked),
    then copy the exe over `D:\ZipNest\zipnest.exe`.
-7. Commit (English message), push master, `git tag -f -a v<ver>`, push the tag
-   with `+refs/tags/v<ver>`, then `gh release create v<ver> <installer> <zip>
-   --title ... --notes-file ...`.
+7. Release (title and body have a fixed shape — do not append the summary):
+   - Title is exactly `ZipNest v<ver>`. The "solved what" line does NOT belong
+     here: the page shows the version, and the body below IS the changelog.
+     Putting the summary in both places was the v0.4.0–v0.4.9 habit and it read
+     as a duplicate.
+   - Notes file = the CHANGELOG section for this version **with its first
+     heading line removed** (that heading repeats the version + summary). So the
+     body starts straight at `### 修复` / `### 新增`.
+   - `gh release create v<ver> <installer> <zip> --title "ZipNest v<ver>"
+     --notes-file <notes>`. To fix a title afterwards it is
+     `gh release edit <tag> --title "..."` — `--name` does not exist, even
+     though `gh release view --json` calls the field `name`.
+   - Then `git tag -f -a v<ver>`, push with `+refs/tags/v<ver>`, `gh release
+     create`. If a release must be re-cut minutes later:
+     `gh release delete <tag> --yes --cleanup-tag`, re-tag, re-create.
+   - Local installers/portable zips are not kept: upload them and delete the
+     copies (the maintainer does not want them on disk).
 
 ## Known open items / gotchas (as of v0.4.9)
 

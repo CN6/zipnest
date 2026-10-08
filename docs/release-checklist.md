@@ -61,8 +61,11 @@
 - [ ] clippy 无本项目警告
 - [ ] 提交全部改动，推送 `master`
 - [ ] `gh release create vX.Y.Z` 挂上 `ZipNest_X.Y.Z_x64-setup.exe` 和便携 zip
-- [ ] Release notes 含 CHANGELOG 本次条目
-- [ ] 桌面安装包更新为最新版（清理旧版）
+- [ ] **标题只写 `ZipNest vX.Y.Z`，后面不要跟「解决了什么问题」**：下载页已经显示版本号，
+      正文本身就是更新日志，两边都写一遍就是重复（v0.4.0–v0.4.9 的老毛病，已统一改回）
+- [ ] **正文 = CHANGELOG 本次条目，但去掉第一行 `## vX.Y.Z — …` 标题**，让正文直接从 `### 修复` 开始
+- [ ] 改标题用 `gh release edit <tag> --title "..."`（没有 `--name`；只有 `--json` 里字段叫 `name`）
+- [ ] 本地不保留安装包与便携 zip：上传后把本地副本删掉
 
 ## 6. 已知环境限制（不算失败）
 
