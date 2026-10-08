@@ -171,9 +171,10 @@ fn open_shell_url(url: &str) {
 /// find a ready-made `user@domain` string to scrape.
 ///
 /// Changing the channel is this one line: put the new mailbox in
-/// [`FEEDBACK_EMAIL_USER`] / [`FEEDBACK_EMAIL_DOMAIN`].
-const FEEDBACK_EMAIL_USER: &str = "1106205793";
-const FEEDBACK_EMAIL_DOMAIN: &str = "qq.com";
+/// [`FEEDBACK_EMAIL_USER`] / [`FEEDBACK_EMAIL_DOMAIN`]. It must be a mailbox the
+/// maintainer actually reads — see the address checks in `feedback_tests`.
+const FEEDBACK_EMAIL_USER: &str = "zipnest";
+const FEEDBACK_EMAIL_DOMAIN: &str = "foxmail.com";
 
 fn feedback_email() -> String {
     format!("{FEEDBACK_EMAIL_USER}@{FEEDBACK_EMAIL_DOMAIN}")
