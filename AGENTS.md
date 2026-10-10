@@ -99,7 +99,7 @@ older web UI and is NOT shipped.
    - Local installers/portable zips are not kept: upload them and delete the
      copies (the maintainer does not want them on disk).
 
-## Known open items / gotchas (as of v0.4.13)
+## Known open items / gotchas (as of v0.4.14)
 
 - **Scripts and JSON this agent writes**: the editor tool drops a leading `#`
   from the first line (`#Requires -Version 5.1` came out as
@@ -144,16 +144,22 @@ older web UI and is NOT shipped.
     `LaunchAdvancedAssociationUI` returns E_INVALIDARG for every name on build
     28020. Sending users to `ms-settings:defaultapps` just moves the puzzle to
     them; v0.4.12 did that and v0.4.13 removed it.
-- **The Settings dialog is its own OS window** (v0.4.13), via
-  `Context::show_viewport_immediate`, because an embedded `egui::Window` is
-  clipped by the main window. Two eframe details cost real debugging time: a
-  secondary viewport is created **behind** the main window on Windows (raise it
-  once with `ViewportCommand::Focus` on its first frame, and re-arm that flag
-  whenever the dialog is reopened), and eframe clears immediate viewports with
-  `[0,0,0,0]` rather than the app's clear colour, so the panel has to paint its own
-  background. Leave room for the footer too: a top-down scrolling body takes the
-  full height and pushes the Save/Cancel row out of sight, hence the cap at
-  `available_height() - 44`.
+- **Settings is a page of the main window, not a window of its own** (v0.4.14).
+  `settings_page()` draws *instead of* the archive view: it reuses the toolbar's
+  and the status bar's panel ids (`TopBottomPanel::top("toolbar")` /
+  `bottom("status")`) so the Back row and the Save/Cancel footer take those seats
+  over instead of stacking extra bars, and `update()` branches on
+  `self.show_settings` around the three panels. The scroll body no longer caps its
+  own height (`available_height() - 44`) — the footer is a real panel now, so the
+  body cannot push it out of view.
+  The two dead ends this replaced, both worth remembering: an embedded
+  `egui::Window` is clipped by the archive list and can lose its bottom edge, and
+  v0.4.13's attempt to fix that with `Context::show_viewport_immediate` produced a
+  genuinely separate OS window — which users read as "a second program opened",
+  plus it is created **behind** the main window on Windows and needs
+  `ViewportCommand::Focus` and its own background fill (eframe clears immediate
+  viewports with `[0,0,0,0]`, not the app's clear colour). A page needs none of
+  that, which is why it won.
 - **`shell_register` refuses a `target/` exe path** (`error.shell.dev_path`), so a
   `cargo run` / `cargo test` build can never become the system handler. To exercise
   the real registration path by hand, copy the binary somewhere else first

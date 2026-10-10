@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.13";
+const CURRENT_VERSION: &str = "0.4.14";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 /// Derived from [`CURRENT_VERSION`] on purpose: a hand-typed string here sat at
 /// `0.4.0` for ten releases (the release checklist asked for it every time and
@@ -634,13 +634,8 @@ struct App {
     create_custom_volume: String,
     create_sfx: bool,
     show_settings: bool,
-    /// Whether the Settings window has already asked to be raised. A brand-new
-    /// OS window is created *behind* the main one on Windows, so the first frame
-    /// of each opening focuses it; without this the dialog appears underneath
-    /// the archive list, which is exactly the occlusion it exists to avoid.
-    settings_raised: bool,
     /// Per-extension state for the Settings status line (is Windows' recorded
-    /// handler ours?), re-read whenever the dialog opens, after a save, and
+    /// handler ours?), re-read whenever the page opens, after a save, and
     /// after a takeover.
     assoc_rows: Vec<zipnest_ipc::shell::AssocState>,
     show_donate: bool,
@@ -798,7 +793,6 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             create_custom_volume: String::new(),
             create_sfx: false,
             show_settings: false,
-            settings_raised: false,
             assoc_rows,
             show_donate: false,
             help_popup: None,
@@ -1266,9 +1260,6 @@ let extract_enabled = self.archive.is_some();
                     }
                     if theme::ghost_button(ui, &self.t("settings.title")).clicked() {
                         self.show_settings = true;
-                        // A fresh window, so it has to bring itself to the front
-                        // again.
-                        self.settings_raised = false;
                         // The user may have changed the default in Windows
                         // Settings since we last looked; refresh instead of
                         // showing a stale verdict.
@@ -1911,19 +1902,13 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
         self.show_create = open && !close && self.job.is_none();
     }
 
-    /// One settings window's contents: the body scrolls, the footer stays put.
+    /// The scrolling half of the Settings page.
     ///
-    /// Returns `(save, close)`.
-    fn settings_window_ui(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
-        let mut save = false;
-        let mut close = false;
-        // Room for the footer: a top-down scrolling body would happily take the
-        // whole window and push the Save/Cancel row out of sight. The embedded
-        // version hard-capped the body at 560 px, which a separate window must
-        // not do -- that would waste the height the user just resized.
-        let body_height = (ui.available_height() - 44.0).max(120.0);
+    /// It draws nothing else: the header and the Save/Cancel row are separate
+    /// panels of the same window, so this body may take every point left over
+    /// without pushing the footer out of sight.
+    fn settings_body(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
-            .max_height(body_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                         theme::section(ui, &self.t("settings.section.general"));
@@ -2079,146 +2064,152 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                             self.send_feedback_mail(ui.ctx());
                         }
             });
-        ui.separator();
-        ui.horizontal(|ui| {
-            if ui.button(self.t("settings.save")).clicked() {
-                save = true;
-            }
-            if ui.button(self.t("extract.cancel")).clicked() {
-                close = true;
-            }
+    }
+
+    /// The Settings page's header row: a Back button and the page title, drawn
+    /// in the same seat the toolbar occupies on the archive page.
+    ///
+    /// Returns `true` when the user asked to leave.
+    fn settings_header(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut back = false;
+        theme::top_bar(ui, |ui| {
+            ui.horizontal(|ui| {
+                if theme::ghost_button(ui, &self.t("settings.back")).clicked() {
+                    back = true;
+                }
+                ui.add(egui::Label::new(
+                    egui::RichText::new(self.t("settings.title")).strong(),
+                ));
+            });
         });
-        // Enter saves, Escape closes — what a window is expected to do.
-        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            save = true;
-        }
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            close = true;
-        }
+        back
+    }
+
+    /// The Settings page's footer: Save and Cancel, plus whatever the last save
+    /// had to report. Returns `(save, close)`.
+    fn settings_footer(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
+        let mut save = false;
+        let mut close = false;
+        theme::status_bar(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button(self.t("settings.save")).clicked() {
+                    save = true;
+                }
+                if ui.button(self.t("extract.cancel")).clicked() {
+                    close = true;
+                }
+                // Always right-aligned, even with nothing to say: that is what
+                // makes the strip span the whole panel like the archive page's
+                // status bar, instead of shrinking to a box around the buttons.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(text) = self.notice_text() {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(text)
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .truncate(),
+                        );
+                    }
+                });
+            });
+        });
         (save, close)
     }
 
-    /// The Settings window.
+    /// Write what the page edits back to the service and to Windows.
     ///
-    /// It is a **separate top-level OS window**, not an `egui::Window` drawn
-    /// inside the main one. An embedded dialog is trapped in the window that
-    /// hosts it: it gets clipped by the archive list behind it and its bottom
-    /// edge can fall outside the frame, so a long settings page ends up partly
-    /// invisible. A viewport of its own can be moved, resized, maximised and
-    /// covered independently, exactly like the settings of any other program.
-    ///
-    /// `show_viewport_immediate` falls back to an embedded `egui::Window` on a
-    /// backend without multi-viewport support (`ViewportClass::Embedded`), so
-    /// this still works everywhere.
-    fn settings_dialog(&mut self, ctx: &egui::Context) {
-        if !self.show_settings {
-            return;
-        }
+    /// Kept apart from the rendering so the Save button and the Enter key reach
+    /// exactly the same code.
+    fn save_settings(&mut self) {
         let svc = self.svc.clone();
-        let title = self.t("settings.title");
-        let builder = egui::ViewportBuilder::default()
-            .with_title(title.clone())
-            .with_inner_size([560.0, 700.0])
-            .with_min_inner_size([430.0, 320.0])
-            .with_resizable(true);
-        let (save, close) = ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("zipnest-settings"),
-            builder,
-            |ctx, class| {
-                // Windows creates the new window behind the main one; ask once
-                // per opening for it to come to the front.
-                if !self.settings_raised && class != egui::ViewportClass::Embedded {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    self.settings_raised = true;
-                }
-                // The window's own close button; not drawing it again closes it.
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    return (false, true);
-                }
-                if class == egui::ViewportClass::Embedded {
-                    egui::Window::new(title.clone())
-                        .collapsible(false)
-                        .resizable(false)
-                        .default_width(470.0)
-                        .show(ctx, |ui| self.settings_window_ui(ui))
-                        .and_then(|r| r.inner)
-                        .unwrap_or((false, false))
-                } else {
-                    // eframe clears an immediate viewport with `[0,0,0,0]`
-                    // rather than the app's clear colour, so anything this
-                    // window does not paint itself would be left transparent
-                    // (and would keep whatever the compositor put behind it).
-                    // Fill the whole viewport first, then let the panel paint on
-                    // top of a known, opaque background.
-                    let rect = ctx.screen_rect();
-                    ctx.layer_painter(egui::LayerId::background())
-                        .rect_filled(rect, 0.0, ctx.style().visuals.panel_fill);
-                    egui::CentralPanel::default()
-                        .show(ctx, |ui| self.settings_window_ui(ui))
-                        .inner
-                }
+        let assoc = self.settings.associate;
+        let menu = self.settings.context_menu;
+        let exe = std::env::current_exe().unwrap_or_default();
+        match svc.shell_register(
+            &exe,
+            ShellOptions {
+                associate: assoc,
+                context_menu: menu,
+                // The ticked extensions; unticked ones are released.
+                extensions: self.settings.assoc_extensions.clone(),
             },
-        );
-        if close {
-            self.show_settings = false;
-            // Next time the window is opened it must raise itself again.
-            self.settings_raised = false;
-        }
-        if save {
-            let assoc = self.settings.associate;
-            let menu = self.settings.context_menu;
-            let exe = std::env::current_exe().unwrap_or_default();
-            match svc.shell_register(
-                &exe,
-                ShellOptions {
-                    associate: assoc,
-                    context_menu: menu,
-                    // The ticked extensions; unticked ones are released.
-                    extensions: self.settings.assoc_extensions.clone(),
-                },
-                &zipnest_ipc::shell::WindowsRegistry,
-                &zipnest_ipc::shell::WindowsRegistry,
-            ) {
-                Ok(r) => {
-                    // Reflect what the OS actually accepted: a hardened
-                    // machine can deny one menu target and allow the
-                    // others, so the checkboxes must not claim more than
-                    // the registry holds.
-                    self.settings.associate = r.associate;
-                    self.settings.context_menu = r.context_menu;
-                    self.notice = r.warnings.first().cloned();
-                    // Registering `Classes` is only half of it: where Windows
-                    // has already recorded a handler for a format, the OS keeps
-                    // using that until the record itself is replaced.
-                    if assoc {
-                        let failed = claim_default_formats(&self.settings.assoc_extensions);
-                        if !failed.is_empty() && self.notice.is_none() {
-                            self.notice = Some("settings.shell.claim_partial".into());
-                        }
+            &zipnest_ipc::shell::WindowsRegistry,
+            &zipnest_ipc::shell::WindowsRegistry,
+        ) {
+            Ok(r) => {
+                // Reflect what the OS actually accepted: a hardened
+                // machine can deny one menu target and allow the
+                // others, so the checkboxes must not claim more than
+                // the registry holds.
+                self.settings.associate = r.associate;
+                self.settings.context_menu = r.context_menu;
+                self.notice = r.warnings.first().cloned();
+                // Registering `Classes` is only half of it: where Windows
+                // has already recorded a handler for a format, the OS keeps
+                // using that until the record itself is replaced.
+                if assoc {
+                    let failed = claim_default_formats(&self.settings.assoc_extensions);
+                    if !failed.is_empty() && self.notice.is_none() {
+                        self.notice = Some("settings.shell.claim_partial".into());
                     }
-                    // The rows are a snapshot of the registry: re-read them so
-                    // the status line reflects this very save.
-                    self.refresh_assoc_status();
                 }
-                Err(e) => self.notice = Some(e.key),
+                // The rows are a snapshot of the registry: re-read them so
+                // the status line reflects this very save.
+                self.refresh_assoc_status();
             }
-            let _ = svc.settings_set(SettingsPatch {
-                language: Some(self.settings.language.clone()),
-                default_extract_dir: Some(self.settings.default_extract_dir.clone()),
-                overwrite_policy: Some(self.settings.overwrite_policy.clone()),
-                preview_max_bytes: Some(self.settings.preview_max_bytes),
-                max_extract_bytes: Some(self.settings.max_extract_bytes),
-                theme_mode: Some(self.settings.theme_mode.clone()),
-                ui_zoom: Some(self.settings.ui_zoom),
-                auto_check_update: Some(self.settings.auto_check_update),
-                auto_close_after_job: Some(self.settings.auto_close_after_job),
-                ..Default::default()
-            });
-            if self.settings.language != "system" {
-                self.lang = self.settings.language.clone();
-            }
-            self.show_settings = false;
+            Err(e) => self.notice = Some(e.key),
         }
+        let _ = svc.settings_set(SettingsPatch {
+            language: Some(self.settings.language.clone()),
+            default_extract_dir: Some(self.settings.default_extract_dir.clone()),
+            overwrite_policy: Some(self.settings.overwrite_policy.clone()),
+            preview_max_bytes: Some(self.settings.preview_max_bytes),
+            max_extract_bytes: Some(self.settings.max_extract_bytes),
+            theme_mode: Some(self.settings.theme_mode.clone()),
+            ui_zoom: Some(self.settings.ui_zoom),
+            auto_check_update: Some(self.settings.auto_check_update),
+            auto_close_after_job: Some(self.settings.auto_close_after_job),
+            ..Default::default()
+        });
+        if self.settings.language != "system" {
+            self.lang = self.settings.language.clone();
+        }
+        self.show_settings = false;
+    }
+
+    /// Draw the Settings page, in the main window, instead of the archive view.
+    ///
+    /// It is a page rather than a dialog: the toolbar becomes the Back row, the
+    /// archive list gives way to the settings body, and the status bar becomes
+    /// the Save/Cancel footer. The application therefore keeps showing exactly
+    /// one window, and the page gets the whole frame instead of being clipped by
+    /// or floating above an archive list — which is what an embedded dialog did
+    /// wrong, and why it briefly grew a window of its own before this.
+    ///
+    /// Returns `(save, close)`.
+    fn settings_page(&mut self, ctx: &egui::Context) -> (bool, bool) {
+        // The panel ids are the archive page's own ("toolbar" / "status"): only
+        // one of the two branches draws per frame, so the page simply takes the
+        // seats over instead of stacking extra bars underneath them.
+        let back = egui::TopBottomPanel::top("toolbar")
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                let back = self.settings_header(ui);
+                ui.add_space(4.0);
+                back
+            })
+            .inner;
+        let (save, close) = egui::TopBottomPanel::bottom("status")
+            .show(ctx, |ui| self.settings_footer(ui))
+            .inner;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            theme::card(ui, |ui| self.settings_body(ui));
+        });
+        // Escape leaves, Enter saves — what a settings surface is expected to do.
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        (save || enter, close || back || escape)
     }
 
     fn donate_dialog(&mut self, ctx: &egui::Context) {
@@ -2647,31 +2638,42 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             self.go_up();
         }
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.add_space(4.0);
-            self.toolbar(ui);
-            ui.add_space(4.0);
-        });
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            self.statusbar(ui);
-        });
-egui::CentralPanel::default().show(ctx, |ui| {
-            // Browser only — the preview side panel was removed (it showed
-            // raw hex/text that users found noisy; not worth the space).
-            if self.archive.is_none() {
-                self.empty_state(ui);
-            } else if self.rows.is_empty() {
-                theme::card(ui, |ui| {
-                    // The navigation row stays: an empty folder is exactly
-                    // where a user needs a way back to its parent.
-                    self.nav_row(ui);
-                    ui.add_space(20.0);
-                    ui.vertical_centered(|ui| theme::hint(ui, &self.t("browser.empty_dir")));
-                });
-            } else {
-                self.browser(ui);
+        if self.show_settings {
+            // Settings is a page of this window, so it draws *instead of* the
+            // archive view rather than on top of it.
+            let (save, close) = self.settings_page(ctx);
+            if save {
+                self.save_settings();
+            } else if close {
+                self.show_settings = false;
             }
-        });
+        } else {
+            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+                ui.add_space(4.0);
+                self.toolbar(ui);
+                ui.add_space(4.0);
+            });
+            egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+                self.statusbar(ui);
+            });
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // Browser only — the preview side panel was removed (it showed
+                // raw hex/text that users found noisy; not worth the space).
+                if self.archive.is_none() {
+                    self.empty_state(ui);
+                } else if self.rows.is_empty() {
+                    theme::card(ui, |ui| {
+                        // The navigation row stays: an empty folder is exactly
+                        // where a user needs a way back to its parent.
+                        self.nav_row(ui);
+                        ui.add_space(20.0);
+                        ui.vertical_centered(|ui| theme::hint(ui, &self.t("browser.empty_dir")));
+                    });
+                } else {
+                    self.browser(ui);
+                }
+            });
+        }
 
         if self.open_picker {
             self.open_picker = false;
@@ -2686,7 +2688,6 @@ egui::CentralPanel::default().show(ctx, |ui| {
 
         self.extract_dialog(ctx);
         self.create_dialog(ctx);
-        self.settings_dialog(ctx);
         self.donate_dialog(ctx);
         self.help_window(ctx);
         self.job_window(ctx);
