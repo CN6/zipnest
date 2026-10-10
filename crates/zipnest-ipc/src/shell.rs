@@ -99,6 +99,41 @@ pub fn user_choice_key(ext: &str) -> String {
 /// same Default apps page and ignores the extra parameter.
 pub const DEFAULT_APPS_URI: &str = "ms-settings:defaultapps?registeredAppUser=ZipNest";
 
+/// Open Windows' own "set default programs" page **scoped to ZipNest** — the
+/// one-click path Bandizip and friends use.
+///
+/// Best-effort by design. `LaunchAdvancedAssociationUI` shows the classic *Set
+/// Program Associations* page with ZipNest preselected, which is the only way
+/// Windows lets the default change once a `UserChoice` already belongs to
+/// another program (we cannot write or delete that key — see
+/// [`user_choice_blocks`] — but the user can replace it there in one click).
+///
+/// It is also unreliable: measured on Windows 10 build 28020, it returns
+/// `E_INVALIDARG` (0x80070057) for *every* application name tried, including
+/// machine-wide ones such as "Microsoft Edge" — that build has no working
+/// classic page left. When it blocks, it blocks until the page is closed, so
+/// callers must not wait for it on the UI thread. Callers should therefore treat
+/// an `Err` as "use the `ms-settings:` page instead" rather than as a failure to
+/// report.
+///
+/// Requires the `RegisteredApplications` + `Capabilities` entries that
+/// [`assoc_ops`] writes, without which the page would not know ZipNest.
+///
+/// Returns `Ok(())` on success, or `Err(reason)` with the raw HRESULT so the
+/// caller can log it, fall back to [`DEFAULT_APPS_URI`] or to the plain Settings
+/// page. Call it off the UI thread: the Control Panel page it opens is modal in
+/// some builds.
+pub fn launch_default_apps_ui() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        win32::launch_advanced_association_ui()
+    }
+    #[cfg(not(windows))]
+    {
+        Err("not Windows".to_string())
+    }
+}
+
 /// Does the extension's `UserChoice` keep us from being the default?
 ///
 /// Once the user picks an app in the "打开方式" dialog, Windows writes
@@ -363,6 +398,115 @@ mod win32 {
     const REG_SZ: u32 = 1;
     const REG_EXPAND_SZ: u32 = 2;
     const REG_DWORD: u32 = 4;
+
+    // --- COM, for the "set as default" page -------------------------------
+    // {1968106D-F3B5-44CF-890E-116FCB9ECEF1}
+    const CLSID_APPLICATION_ASSOCIATION_REGISTRATION_UI: Guid = Guid {
+        data1: 0x1968_106d,
+        data2: 0xf3b5,
+        data3: 0x44cf,
+        data4: [0x89, 0x0e, 0x11, 0x6f, 0xcb, 0x9e, 0xce, 0xf1],
+    };
+    // {1F76A169-F994-40AC-8FC8-0959E8874710}
+    const IID_IAPPLICATION_ASSOCIATION_REGISTRATION_UI: Guid = Guid {
+        data1: 0x1f76_a169,
+        data2: 0xf994,
+        data3: 0x40ac,
+        data4: [0x8f, 0xc8, 0x09, 0x59, 0xe8, 0x87, 0x47, 0x10],
+    };
+    const CLSCTX_INPROC_SERVER: u32 = 1;
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    /// `CoInitializeEx` when COM was already initialized on this thread.
+    const S_FALSE: i32 = 1;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+
+    /// Minimal vtable of `IApplicationAssociationRegistrationUI`: three
+    /// `IUnknown` slots, then the one method we call. The repository does the
+    /// same thing for the 7-Zip interfaces in `archive-core::com`, and the
+    /// layouts are checked against the SDK headers there.
+    #[repr(C)]
+    struct ApplicationAssociationRegistrationUiVt {
+        query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        launch_advanced_association_ui: unsafe extern "system" fn(*mut c_void, *const u16) -> i32,
+    }
+
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(reserved: *const c_void, coinit: u32) -> i32;
+        fn CoUninitialize();
+        fn CoCreateInstance(
+            clsid: *const Guid,
+            outer: *mut c_void,
+            clsctx: u32,
+            iid: *const Guid,
+            out: *mut *mut c_void,
+        ) -> i32;
+    }
+
+    /// Open the per-app "Set program associations" page. `Err` carries the raw
+    /// HRESULT (hex) so the caller can report or log what the OS said.
+    pub fn launch_advanced_association_ui() -> Result<(), String> {
+        launch_advanced_association_ui_for(super::REGISTERED_APP_NAME)
+    }
+
+    /// Same, for an arbitrary registered-application name. Split out so the
+    /// smoke test can check the OS behaviour against names it knows are
+    /// registered machine-wide.
+    pub fn launch_advanced_association_ui_for(app_name: &str) -> Result<(), String> {
+        // The UI thread may already be STA (winit); S_FALSE means "already
+        // initialized, do not uninitialize on the way out".
+        let hr_init = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED) };
+        let we_initialized = hr_init >= 0 && hr_init != S_FALSE;
+        if hr_init < 0 {
+            return Err(format!("CoInitializeEx failed: 0x{:08X}", hr_init as u32));
+        }
+
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        let hr = unsafe {
+            CoCreateInstance(
+                &CLSID_APPLICATION_ASSOCIATION_REGISTRATION_UI,
+                std::ptr::null_mut(),
+                CLSCTX_INPROC_SERVER,
+                &IID_IAPPLICATION_ASSOCIATION_REGISTRATION_UI,
+                &mut raw,
+            )
+        };
+        if hr < 0 || raw.is_null() {
+            if we_initialized {
+                unsafe { CoUninitialize() };
+            }
+            return Err(format!(
+                "CoCreateInstance(ApplicationAssociationRegistrationUI) failed: 0x{:08X}",
+                hr as u32
+            ));
+        }
+
+        let vt = unsafe { *(raw as *mut *const ApplicationAssociationRegistrationUiVt) };
+        let mut name: Vec<u16> = app_name.encode_utf16().collect();
+        name.push(0);
+        let hr = unsafe { ((*vt).launch_advanced_association_ui)(raw, name.as_ptr()) };
+        unsafe {
+            ((*vt).release)(raw);
+        }
+        if we_initialized {
+            unsafe { CoUninitialize() };
+        }
+        if hr < 0 {
+            Err(format!("LaunchAdvancedAssociationUI failed: 0x{:08X}", hr as u32))
+        } else {
+            Ok(())
+        }
+    }
 
     #[link(name = "advapi32")]
     extern "system" {
@@ -916,8 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn real_registry_probe_classifies_the_environment_consistently() {
-        // Smoke test against the machine's real state. On a machine with no
+    fn real_registry_probe_classifies_the_environment_consistently() {        // Smoke test against the machine's real state. On a machine with no
         // `UserChoice` for these extensions it reports nothing; the point is
         // that the live probe and the pure classifier never disagree.
         let probe = WindowsRegistry;
@@ -929,6 +1072,84 @@ mod tests {
                 user_choice_blocks(ext, got.as_deref()),
                 "probe and classifier disagree for .{ext}"
             );
+        }
+    }
+
+    /// The one-click "make ZipNest the default" path, against the real OS.
+    ///
+    /// `#[ignore]`d because it *opens a window* (Windows' "Set program
+    /// associations" page, with ZipNest preselected) and therefore cannot run in
+    /// CI. Run it by hand when touching the COM plumbing:
+    ///
+    /// ```text
+    /// cargo test -p zipnest-ipc -- --ignored launch_default_apps_ui_opens
+    /// ```
+    ///
+    /// Which registrations does the classic API accept on this machine?
+    ///
+    /// A hand-run diagnostic, not a test of our code: it calls
+    /// `LaunchAdvancedAssociationUI` for a few names that are registered
+    /// machine-wide (and one that is per-user only) with a 5 s cap each, and
+    /// prints the verdict. A call that "times out" opened the modal page; a
+    /// printed HRESULT was refused.
+    ///
+    /// Measured on this box (Windows 10 26H1, build 28020) while building
+    /// v0.4.11: **every** name returns E_INVALIDARG (0x80070057), ours and
+    /// machine-registered ones alike, with and without the installer's HKLM
+    /// entry — the classic page is gone from that build. That is why the
+    /// Settings dialog treats the call as best-effort and falls back to the
+    /// `ms-settings:` page, which is also what Bandizip does on current Windows.
+    #[test]
+    #[ignore = "opens Control Panel windows; run by hand"]
+    fn probe_which_registered_apps_the_api_accepts() {
+        for name in [
+            "Microsoft Edge",
+            "Windows Photo Viewer",
+            "MPC-BE",
+            super::REGISTERED_APP_NAME,
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let owned = name.to_string();
+            std::thread::spawn(move || {
+                let _ = tx.send(super::win32::launch_advanced_association_ui_for(&owned));
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Ok(())) => println!("  {name}: returned Ok"),
+                Ok(Err(e)) => println!("  {name}: {e}"),
+                Err(_) => println!("  {name}: still running after 5 s -> page opened"),
+            }
+        }
+    }
+
+    /// The one-click "make ZipNest the default" path, against the real OS.
+    ///
+    /// `#[ignore]`d because it *opens* Windows' "Set program associations" page
+    /// (with ZipNest preselected) and that page is modal: the call blocks until
+    /// the user closes it. Run it by hand when touching the COM plumbing:
+    ///
+    /// ```text
+    /// cargo test -p zipnest-ipc -- --ignored --nocapture launch_default_apps_ui_opens
+    /// ```
+    ///
+    /// It runs the call on a worker thread and only waits a few seconds, so the
+    /// test never hangs: "still running after N s" IS the success signal (the
+    /// page is on screen and waiting), while a printed HRESULT is the failure.
+    /// Close the page the test opens.
+    #[test]
+    #[ignore = "opens a Control Panel window; run by hand"]
+    fn launch_default_apps_ui_opens_the_system_page() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(launch_default_apps_ui());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+            Ok(Ok(())) => println!("  returned Ok immediately (page may already have been open)"),
+            Ok(Err(e)) => panic!("the OS refused the call: {e}"),
+            Err(_) => println!(
+                "  still waiting after 6 s -> the page opened and is modal.\n  \
+                 Close it. (E_INVALIDARG here means HKLM\\SOFTWARE\\RegisteredApplications\n  \
+                 has no ZipNest entry: only the installer writes that half.)"
+            ),
         }
     }
 }

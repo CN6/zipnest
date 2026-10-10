@@ -105,12 +105,18 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "create.volume.100m" => "100 MB",
             "create.volume.1g" => "1 GB",
             "create.volume.custom" => "自定义",
-            "create.method" => "压缩方法",
             "create.password" => "密码",
             "create.encrypt_names" => "加密文件名（仅 7z）",
-            "create.volume" => "分卷大小",
             "create.sfx" => "自解压可执行文件（仅 7z）",
             "create.start" => "开始创建",
+            "pick.all" => "所有文件",
+            "pick.archives" => "压缩包",
+            "format.zip" => "ZIP 压缩包 (*.zip)",
+            "format.7z" => "7z 压缩包 (*.7z)",
+            "format.tar" => "TAR 归档 (*.tar)",
+            "format.tar.gz" => "TAR.GZ 归档 (*.tar.gz)",
+            "format.tar.bz2" => "TAR.BZ2 归档 (*.tar.bz2)",
+            "format.tar.xz" => "TAR.XZ 归档 (*.tar.xz)",
             "help.title" => "帮助",
             "help.format" => "压缩包格式。7z 压缩率最高；zip 兼容性最好（任何系统都能直接打开）；TAR 系列常用于 Unix/Linux，TAR 本身不压缩，配合 GZ/BZ2/XZ 才压缩。",
             "help.level" => "压缩等级：等级越高，压缩后文件越小，但打包越慢、越费 CPU。\n· 仅存储：不压缩，原样打包，最快\n· 最快：轻度压缩，速度快\n· 标准：速度和体积均衡（推荐）\n· 最大：压缩更小，速度较慢\n· 极致：体积最小，速度最慢",
@@ -163,8 +169,13 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "settings.overwrite.rename" => "自动重命名",
             "settings.shell.associate" => "默认用 ZipNest 打开压缩包",
             "settings.shell.assoc_hint" => "安装后自动注册为 ZIP / 7Z / RAR / TAR / GZ / BZ2 / XZ / ISO 的默认打开程序，不用去设置里找；取消勾选会立刻撤销。",
-            "settings.shell.blocked" => "系统已经为 {exts} 记住了别的默认程序。Windows 禁止程序自行改写「默认应用」（连删除都不允许），所以只能由你在系统设置里选一次 —— 打开后把 ZipNest 设为默认即可。",
+            "settings.shell.blocked" => "系统已经为 {exts} 记住了别的默认程序。Windows 禁止程序自行改写「默认应用」（连删除都不允许），所以只能由你选一次 —— 点下面的按钮，在弹出的系统页面里确认即可。",
             "settings.shell.open_default_apps" => "打开系统「默认应用」设置",
+            "settings.shell.set_default" => "一键设为默认解压软件",
+            "settings.shell.set_default.hint" => "点一下会打开 Windows 自带的「设置默认程序」页面，里面已经选中 ZipNest，再点一次「将此程序设为默认值」，这台电脑上所有压缩包格式就一次性全归 ZipNest。",
+            "settings.shell.set_default.opening" => "已打开系统的「默认程序」页面，在里面确认一下即可",
+            "settings.shell.status_ours" => "当前状态：ZipNest 就是压缩包的默认打开程序",
+            "settings.shell.status_off" => "当前状态：未启用默认关联（上面那个勾选框是关的）",
             "settings.shell.context_menu" => "右键菜单",
             "settings.save" => "保存",
             "update.check" => "检查更新",
@@ -254,12 +265,18 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "create.volume.100m" => "100 MB",
             "create.volume.1g" => "1 GB",
             "create.volume.custom" => "Custom",
-            "create.method" => "Method",
             "create.password" => "Password",
             "create.encrypt_names" => "Encrypt file names (7z only)",
-            "create.volume" => "Split into volumes",
 "create.sfx" => "Self-extracting (7z only)",
             "create.start" => "Create",
+            "pick.all" => "All files",
+            "pick.archives" => "Archives",
+            "format.zip" => "ZIP archive (*.zip)",
+            "format.7z" => "7z archive (*.7z)",
+            "format.tar" => "TAR archive (*.tar)",
+            "format.tar.gz" => "TAR.GZ archive (*.tar.gz)",
+            "format.tar.bz2" => "TAR.BZ2 archive (*.tar.bz2)",
+            "format.tar.xz" => "TAR.XZ archive (*.tar.xz)",
             "help.title" => "Help",
             "help.format" => "Archive format. 7z squeezes the most; zip opens everywhere; TAR is common on Unix/Linux and only packs (GZ/BZ2/XZ add compression).",
             "help.level" => "Compression level: higher = smaller file, slower & more CPU.\n· Store: no compression, fastest\n· Fastest: light compression, fast\n· Normal: balanced (recommended)\n· Maximum: smaller, slower\n· Ultra: smallest, slowest",
@@ -312,8 +329,13 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "settings.overwrite.rename" => "Rename automatically",
             "settings.shell.associate" => "Open archives with ZipNest by default",
             "settings.shell.assoc_hint" => "Registered as the default handler for ZIP / 7Z / RAR / TAR / GZ / BZ2 / XZ / ISO automatically on install; unticking removes it right away.",
-            "settings.shell.blocked" => "Windows already remembers another default app for {exts}. It blocks programs from changing Default apps (even deleting the entry), so pick ZipNest there once — the button below opens that page.",
+            "settings.shell.blocked" => "Windows already remembers another default app for {exts}. It blocks programs from changing Default apps (even deleting the entry), so pick ZipNest there once — the button below opens that page in one click.",
             "settings.shell.open_default_apps" => "Open Windows Default apps settings",
+            "settings.shell.set_default" => "Make ZipNest the default",
+            "settings.shell.set_default.hint" => "Opens Windows' own \"Set program associations\" page with ZipNest already selected; one more click there (\"Set this program as default\") gives ZipNest every archive format on this PC at once.",
+            "settings.shell.set_default.opening" => "Windows' default-programs page is open — confirm it there",
+            "settings.shell.status_ours" => "Current: ZipNest is the default for archives",
+            "settings.shell.status_off" => "Current: default associations are switched off (the box above is unticked)",
             "settings.shell.context_menu" => "Context menu",
             "settings.save" => "Save",
             "update.check" => "Check for updates",
@@ -327,5 +349,103 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "update.failed" => "Update check failed",
         }
     });
+
+#[cfg(test)]
+mod tests {
+    use super::{EN, ZH};
+    use std::ops::Deref;
+
+    /// Every error key the Rust side can hand to the UI (engine constants from
+    /// `archive-core/src/error.rs`, the IPC layer's own keys, and the shell
+    /// integration warnings). `tr()` falls back to printing the key itself, so
+    /// a missing one shows the user `error.io` — this list is the guard.
+    const ERROR_KEYS: [&str; 17] = [
+        "error.cancelled",
+        "error.dll_missing",
+        "error.engine",
+        "error.io",
+        "error.not_an_archive",
+        "error.password_incorrect",
+        "error.password_required",
+        "error.password_unsupported",
+        "error.quota_exceeded",
+        "error.security_blocked",
+        "error.settings.invalid",
+        "error.shell.associate",
+        "error.shell.background_menu",
+        "error.shell.dev_path",
+        "error.shell.directory_menu",
+        "error.shell.file_menu",
+        "error.title",
+    ];
+
+    #[test]
+    fn both_tables_carry_exactly_the_same_keys() {
+        // A key added to one language only used to be invisible: the missing
+        // side silently rendered the raw key.
+        let zh = ZH.deref();
+        let en = EN.deref();
+        let mut only_zh: Vec<_> = zh.keys().filter(|k| !en.contains_key(*k)).collect();
+        let mut only_en: Vec<_> = en.keys().filter(|k| !zh.contains_key(*k)).collect();
+        only_zh.sort();
+        only_en.sort();
+        assert!(only_zh.is_empty(), "only in zh-CN: {only_zh:?}");
+        assert!(only_en.is_empty(), "only in en-US: {only_en:?}");
+        assert!(zh.len() > 100, "the table looks truncated: {} keys", zh.len());
+    }
+
+    #[test]
+    fn every_error_key_is_translated_in_both_languages() {
+        for key in ERROR_KEYS {
+            assert!(ZH.deref().contains_key(key), "zh-CN is missing {key}");
+            assert!(EN.deref().contains_key(key), "en-US is missing {key}");
+        }
+    }
+
+    #[test]
+    fn the_dynamically_built_keys_all_exist() {
+        // These are assembled with `format!` at the call site, so a typo or a
+        // removed option shows up as a raw key rather than a compile error.
+        for level in ["store", "fastest", "normal", "maximum", "ultra"] {
+            let key = format!("create.level.{level}");
+            assert!(ZH.deref().contains_key(key.as_str()), "zh-CN lacks {key}");
+            assert!(EN.deref().contains_key(key.as_str()), "en-US lacks {key}");
+        }
+        for method in ["auto", "copy", "deflate", "lzma2", "bzip2"] {
+            let key = format!("create.method.{method}");
+            assert!(ZH.deref().contains_key(key.as_str()), "zh-CN lacks {key}");
+            assert!(EN.deref().contains_key(key.as_str()), "en-US lacks {key}");
+        }
+        for volume in ["off", "10m", "100m", "1g", "custom"] {
+            let key = format!("create.volume.{volume}");
+            assert!(ZH.deref().contains_key(key.as_str()), "zh-CN lacks {key}");
+            assert!(EN.deref().contains_key(key.as_str()), "en-US lacks {key}");
+        }
+        for policy in ["ask", "overwrite", "skip", "rename"] {
+            let key = format!("settings.overwrite.{policy}");
+            assert!(ZH.deref().contains_key(key.as_str()), "zh-CN lacks {key}");
+            assert!(EN.deref().contains_key(key.as_str()), "en-US lacks {key}");
+        }
+        for theme in ["system", "light", "dark"] {
+            let key = format!("settings.theme.{theme}");
+            assert!(ZH.deref().contains_key(key.as_str()), "zh-CN lacks {key}");
+            assert!(EN.deref().contains_key(key.as_str()), "en-US lacks {key}");
+        }
+        // The file-dialog filters (new in v0.4.11: they used to be English-only
+        // literals in main.rs).
+        for format in ["zip", "7z", "tar", "tar.gz", "tar.bz2", "tar.xz"] {
+            let key = format!("format.{format}");
+            assert!(ZH.deref().contains_key(key.as_str()), "zh-CN lacks {key}");
+            assert!(EN.deref().contains_key(key.as_str()), "en-US lacks {key}");
+        }
+    }
+
+    #[test]
+    fn a_missing_key_still_comes_back_as_itself() {
+        // Documented fallback: better a visible key than an empty label.
+        assert_eq!(super::tr("zh-CN", "nope.not.here"), "nope.not.here");
+        assert_eq!(super::tr("en-US", "nope.not.here"), "nope.not.here");
+    }
+}
 
 

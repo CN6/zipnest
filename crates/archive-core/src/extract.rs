@@ -657,18 +657,31 @@ unsafe fn disk_progress_gate(cb: *mut DiskExtractCallback) -> Hresult {
 //   * a half-written file never appears under the entry's real name.
 
 /// Temp sibling for `dest`: same directory, so the final rename stays on one
-/// volume and is atomic. Unique per process so a leftover from a crashed run
-/// is never mistaken for the real file.
+/// volume and is atomic.
+///
+/// The name is built from the raw `OsStr` (not a `&str`), so a destination that
+/// is not valid UTF-8 still gets a temp file instead of being silently skipped;
+/// and it carries a per-process counter so two entries in one archive whose
+/// names differ only through this suffix cannot collide.
 fn temp_sibling(dest: &std::path::Path) -> Option<PathBuf> {
-    let name = dest.file_name()?.to_str()?;
-    Some(dest.with_file_name(format!(
-        "{name}.zipnest-part-{}",
-        std::process::id()
-    )))
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = dest.file_name()?;
+    let mut tmp = std::ffi::OsString::from(name);
+    tmp.push(format!(
+        ".zipnest-part-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    Some(dest.with_file_name(tmp))
 }
 
 /// First free `name (n).ext` next to `dest`; used by [`OnConflict::Rename`].
-fn unique_dest(dest: &std::path::Path) -> PathBuf {
+///
+/// `None` when every candidate up to 9999 is taken. The old version fell back to
+/// `dest` itself in that case, i.e. the one policy whose whole point is "never
+/// overwrite" silently overwrote.
+fn unique_dest(dest: &std::path::Path) -> Option<PathBuf> {
     let parent = dest.parent().map(PathBuf::from).unwrap_or_default();
     let stem = dest
         .file_stem()
@@ -683,10 +696,10 @@ fn unique_dest(dest: &std::path::Path) -> PathBuf {
     for n in 2..10_000u32 {
         let cand = parent.join(format!("{stem} ({n}){ext}"));
         if !cand.exists() {
-            return cand;
+            return Some(cand);
         }
     }
-    dest.to_path_buf()
+    None
 }
 
 /// Move a finished temp file over its destination and restore the archived
@@ -694,16 +707,30 @@ fn unique_dest(dest: &std::path::Path) -> PathBuf {
 #[allow(clippy::permissions_set_readonly_false)]
 fn commit_pending(pw: &PendingWrite) -> std::io::Result<u64> {
     // A read-only destination makes the replace fail; clear the flag first so
-    // one read-only file cannot abort the whole extraction.
-    if let Ok(md) = std::fs::metadata(&pw.dest) {
-        let mut perm = md.permissions();
-        if perm.readonly() {
-            perm.set_readonly(false);
-            let _ = std::fs::set_permissions(&pw.dest, perm);
-        }
+    // one read-only file cannot abort the whole extraction. Remember what we
+    // changed: if the replace then fails (target locked by another process, a
+    // directory, disk full), the user's file must not silently come out of it
+    // with the read-only bit stripped while its content never changed.
+    let was_readonly = std::fs::metadata(&pw.dest)
+        .map(|md| md.permissions().readonly())
+        .unwrap_or(false);
+    if was_readonly {
+        let mut perm = std::fs::metadata(&pw.dest)?.permissions();
+        perm.set_readonly(false);
+        let _ = std::fs::set_permissions(&pw.dest, perm);
     }
     let len = std::fs::metadata(&pw.tmp).map(|m| m.len()).unwrap_or(0);
-    std::fs::rename(&pw.tmp, &pw.dest)?;
+    if let Err(e) = std::fs::rename(&pw.tmp, &pw.dest) {
+        if was_readonly {
+            // Put the attribute back exactly as we found it.
+            if let Ok(md) = std::fs::metadata(&pw.dest) {
+                let mut perm = md.permissions();
+                perm.set_readonly(true);
+                let _ = std::fs::set_permissions(&pw.dest, perm);
+            }
+        }
+        return Err(e);
+    }
     if let Some(mtime) = pw.mtime {
         if let Ok(f) = std::fs::File::options().write(true).open(&pw.dest) {
             let _ = f.set_modified(mtime);
@@ -787,7 +814,15 @@ unsafe extern "system" fn disk_get_stream(
                 st.record_skip(&meta.raw_path);
                 return S_OK; // null stream → the engine leaves the file alone
             }
-            OnConflict::Rename => unique_dest(&full),
+            OnConflict::Rename => match unique_dest(&full) {
+                Some(free) => free,
+                // Every `name (n).ext` up to 9999 exists. Skipping is the only
+                // honest answer for a policy that promises not to overwrite.
+                None => {
+                    st.record_skip(&meta.raw_path);
+                    return S_OK;
+                }
+            },
             OnConflict::Overwrite => full.clone(),
         }
     } else {

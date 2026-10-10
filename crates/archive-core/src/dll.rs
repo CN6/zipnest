@@ -33,9 +33,16 @@ impl SevenZip {
 
 /// The successfully loaded library, cached for the process.
 ///
-/// Only a *success* is cached. A failed attempt must stay retryable: the user
-/// can install 7-Zip or fix `engines/7z.dll` while the app is running, and the
-/// next open has to pick that up without a restart.
+/// Only a *success* is cached, and it is cached for good: `OnceLock` cannot be
+/// re-initialised. The retryable case is the failed one — the user installs
+/// 7-Zip or fixes `engines/7z.dll` while the app is running and the next open
+/// picks that up without a restart.
+///
+/// Swapping the DLL *after* a successful load is therefore not picked up until
+/// the process restarts (AGENTS.md: "let the user replace it" covers the
+/// missing/broken case, which is the one that actually blocks people). Reloading
+/// a live module is not something to do casually: archives already open hold
+/// vtable pointers into it.
 static INSTANCE: OnceLock<SevenZip> = OnceLock::new();
 
 /// Serializes load attempts so concurrent first calls load the library once.

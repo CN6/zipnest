@@ -44,13 +44,21 @@ pub fn mask_profile(path: &str, profile: Option<&str>) -> String {
     if profile.is_empty() {
         return path.to_string();
     }
-    let (p, dir) = (path.to_lowercase(), profile.to_lowercase());
-    if !p.starts_with(&dir) {
+    // Compare case-insensitively (Unicode-aware, as before), but cut with `get`
+    // so a byte offset that lands inside a character — a lower-case mapping can
+    // change a string's byte length, e.g. 'İ' -> "i̇" — yields `None` instead of
+    // panicking on the UI thread while the user is copying diagnostics.
+    let Some(head) = path.get(..profile.len()) else {
+        return path.to_string();
+    };
+    if head.to_lowercase() != profile.to_lowercase() {
         return path.to_string();
     }
     // Only a real directory boundary counts: `C:\Users\me2` must not be
     // truncated as if it were `C:\Users\me`.
-    let rest = &path[profile.len()..];
+    let Some(rest) = path.get(profile.len()..) else {
+        return path.to_string();
+    };
     if !rest.is_empty() && !rest.starts_with(['\\', '/']) {
         return path.to_string();
     }

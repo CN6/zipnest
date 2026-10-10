@@ -1,0 +1,113 @@
+name: ci
+
+# Until v0.4.11 this repository had no CI at all: `cargo test`, clippy and the
+# version checks were done by hand, and two of the last three releases shipped a
+# user-visible regression that one of these steps would have caught (v0.4.9 fixed
+# a stuck installer from v0.4.8; v0.4.10 fixed a flashing update window).
+#
+# The shipped app is `zipnest-native`; `apps/zipnest` is the older WebView2/Tauri
+# UI that is NOT shipped (AGENTS.md) and is deliberately not built here — it pulls
+# a whole second desktop stack into every run. Its frontend tests are run in the
+# `frontend` job.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test + clippy (shipped crates)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Only the shipped packages are built here, so cache them as such.
+          key: shipped
+
+      - name: cargo test (shipped crates)
+        run: >
+          cargo test
+          -p archive-core -p archive-security -p archive-jobs -p zipnest-ipc -p zipnest-native
+          -p zipnest-shell
+
+      - name: cargo clippy (shipped crates, warnings are errors)
+        run: >
+          cargo clippy
+          -p archive-core -p archive-security -p archive-jobs -p zipnest-ipc -p zipnest-native
+          -p zipnest-shell
+          --all-targets -- -D warnings
+
+  version-and-installer:
+    name: version strings + installer compiles
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: shipped
+
+      - name: every version string agrees
+        shell: pwsh
+        run: ./packaging/check-versions.ps1
+
+      - name: NSIS is available
+        shell: pwsh
+        run: |
+          choco install nsis --no-progress -y
+          "C:\Program Files (x86)\NSIS" | Out-File -Append $env:GITHUB_PATH
+
+      - name: emit the payload and compile the installer
+        shell: pwsh
+        run: |
+          # The Win11 shell package needs the code-signing key, which CI does not
+          # have: emit the rest and let installer.nsi prove its syntax against it.
+          cargo build -p zipnest-native --release
+          ./packaging/emit-portable.ps1 -SkipWin11Shell
+          # installer.nsi lists the Win11Shell files too, so placeholders stand in
+          # for them here; only compilation is being checked, not the payload.
+          New-Item -ItemType Directory -Force -Path dist-portable/ZipNest/Win11Shell | Out-Null
+          foreach ($f in 'ZipNestShell.msix','ZipNestCodesign.cer','install.ps1','uninstall.ps1') {
+            Set-Content -Path "dist-portable/ZipNest/Win11Shell/$f" -Value 'placeholder'
+          }
+          New-Item -ItemType Directory -Force -Path dist-portable/ZipNest/Win11Shell | Out-Null
+          Set-Content -Path dist-portable/ZipNest/zipnest_shell.dll -Value 'placeholder'
+          Push-Location packaging
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /V2 installer.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }
+          Pop-Location
+
+  frontend:
+    name: older web UI (not shipped) — tests only
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/zipnest/pnpm-lock.yaml
+
+      - name: pnpm test
+        working-directory: apps/zipnest
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm test

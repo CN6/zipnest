@@ -48,21 +48,34 @@ otherwise violate. Read it first, every session.
 older web UI and is NOT shipped.
 
 1. Bump `CURRENT_VERSION` in `apps/zipnest-native/src/main.rs`, `!define VERSION`
-   and `OutFile` in `packaging/installer.nsi`, and the version/file names in
+   and `OutFile` in `packaging/installer.nsi`, `Version` in
+   `packaging/win11-shell/AppxManifest.xml`, and the version/file names in
    `README.md`. Add a `CHANGELOG.md` section (Chinese, matching that file's style).
+   Then run `packaging\check-versions.ps1`: it fails loudly on any of the six
+   places disagreeing, which is how the Win11 manifest version sat at 0.4.0.0 for
+   ten releases unnoticed.
 2. `cargo test --workspace` (all suites green) + `cargo clippy --workspace
-   --all-targets` (no new warnings).
-3. `cargo build -p zipnest-native --release`, then copy
-   `target\release\zipnest-native.exe` over `dist-portable\ZipNest\zipnest.exe`.
-4. Installer: run `%LOCALAPPDATA%\tauri\NSIS\makensis.exe /V2 installer.nsi` from
+   --all-targets` (no new warnings). CI (`.github/workflows/ci.yml`) runs the
+   shipped crates only — `apps/zipnest` is the unshipped WebView2 UI and would
+   drag a second desktop stack into every run.
+3. Build both binaries: `cargo build -p zipnest-native --release` and
+   `cargo build -p zipnest-shell --release` (the shell DLL feeds the Win11 MSIX).
+4. Emit the payload: `packaging\emit-portable.ps1 -ThirdParty`. It assembles
+   `dist-portable\ZipNest\` from tracked sources (exe, `vendor\7zip-bin\7z.dll`,
+   the SFX stubs, license texts) and calls `stage-portable.ps1`, which builds and
+   signs `Win11Shell\ZipNestShell.msix` with the self-signed cert in
+   `Cert:\CurrentUser\My` (CN=ZipNest). Nothing else creates that directory: it is
+   gitignored, which before v0.4.11 meant a clean checkout could not build an
+   installer at all.
+5. Installer: run `%LOCALAPPDATA%\tauri\NSIS\makensis.exe /V2 installer.nsi` from
    `packaging\` (NSIS is the copy bundled with Tauri; there is no system install).
    `installer.nsi` must keep its UTF-8 BOM or makensis aborts with "Bad text
    encoding".
-5. Portable: `Compress-Archive dist-portable\ZipNest` into
+6. Portable: `Compress-Archive dist-portable\ZipNest` into
    `ZipNest_<ver>_x64_portable.zip` (installer + zip are gitignored).
-6. Update the machine: close any running instance first (the file is locked),
+7. Update the machine: close any running instance first (the file is locked),
    then copy the exe over `D:\ZipNest\zipnest.exe`.
-7. Release (title and body have a fixed shape — do not append the summary):
+8. Release (title and body have a fixed shape — do not append the summary):
    - Title is exactly `ZipNest v<ver>`. The "solved what" line does NOT belong
      here: the page shows the version, and the body below IS the changelog.
      Putting the summary in both places was the v0.4.0–v0.4.9 habit and it read
@@ -80,7 +93,46 @@ older web UI and is NOT shipped.
    - Local installers/portable zips are not kept: upload them and delete the
      copies (the maintainer does not want them on disk).
 
-## Known open items / gotchas (as of v0.4.10)
+## Known open items / gotchas (as of v0.4.11)
+
+- **Scripts and JSON this agent writes**: the editor tool drops a leading `#`
+  from the first line (`#Requires -Version 5.1` came out as
+  `Requires -Version 5.1` and PowerShell refused to parse it) and strips a UTF-8
+  BOM. Both matter here: PowerShell 5.1 reads a BOM-less `.ps1` as ANSI, so
+  Chinese literals/regexes silently break, and `installer.nsi` needs its BOM or
+  makensis aborts. After writing a script, check the first bytes and the first
+  line.
+- **A default handler is per extension and Windows guards it** (v0.4.11). The
+  app cannot take over an extension whose `UserChoice` names another program, so
+  the Settings dialog's 「一键设为默认」 calls `shell::launch_default_apps_ui()`
+  and falls back to `ms-settings:defaultapps?registeredAppUser=ZipNest`, which is
+  the route that actually works (verified: it launches SystemSettings). The
+  classic `IApplicationAssociationRegistrationUI::LaunchAdvancedAssociationUI`
+  is best-effort: measured on Windows 10 build 28020 it returns E_INVALIDARG
+  (0x80070057) for **every** application name, machine-registered ones like
+  "Microsoft Edge" included, and it blocks until its page is closed when it does
+  work — hence the worker thread and the silent fallback. The installer also
+  writes `HKLM\Software\RegisteredApplications\ZipNest` + `Capabilities` so the
+  manual 默认程序 list still shows ZipNest on systems that have that page; it is
+  not what makes the one-click button work. Never try to forge or delete
+  `UserChoice`.
+- **Opening an archive pins it until it is closed** (v0.4.11). `Archive` frees
+  its 7z handler, source file handle and password in `Drop`, and
+  `ArchiveRegistry` had no removal path at all — a browsing session leaked one
+  per opened file. The UI calls `IpcService::close_archive` when it replaces an
+  archive; anything else that opens archives must do the same.
+- **The installer must never wait on zipnest.exe** (v0.4.8 shipped exactly that
+  hang). `nsExec::ExecToLog` blocks until the child exits *and* closes its output
+  pipe; v0.4.8 ran `zipnest.exe --register-integration` through it, and on a
+  machine where the file copy was skipped (`SetOverwrite try` skips a locked file
+  silently) that child was a **stale build** that does not know the flag — it
+  treats it as "no arguments" and opens its main window, so the installer waited
+  forever on the shortcut screen. Now: `Exec` (start, never wait), a
+  `GetDLLVersion` guard so an unreplaced exe is not called at all, a registry
+  read-back that also checks `UserChoice` before claiming success, a
+  `DetailPrint` per step (so a screenshot of the Details pane names the stuck
+  step), `SetErrorLevel` on every failure path, and `cap_cli_runtime` makes both
+  CLI modes self-terminate after 20 s.
 
 - **The finish page owns the desktop shortcut** (v0.4.10). "创建桌面快捷方式"
   is MUI's *readme* checkbox repurposed through
@@ -96,17 +148,6 @@ older web UI and is NOT shipped.
   launch flashed the "正在检查更新" window and an offline machine got an error
   dialog.
 
-- **Never make the installer wait on zipnest.exe** (v0.4.8 shipped exactly that
-  hang). `nsExec::ExecToLog` blocks until the child exits *and* closes its output
-  pipe; v0.4.8 ran `zipnest.exe --register-integration` through it, and on a
-  machine where the file copy was skipped (`SetOverwrite try` skips a locked file
-  silently) that child was a **stale build** that does not know the flag — it
-  treats it as "no arguments" and opens its main window, so the installer waited
-  forever on the shortcut screen. Now: `Exec` (start, never wait), a
-  `GetDLLVersion` guard so an unreplaced exe is not called at all, a registry
-  read-back to report the real outcome, a `DetailPrint` per step (so a screenshot
-  of the Details pane names the stuck step), and `cap_cli_runtime` makes both CLI
-  modes self-terminate after 20 s.
 - **Feedback entry** (v0.4.9): 设置 → 帮助与反馈. `zipnest_ipc::diagnostics`
   renders the report (version, OS build, exe path with the account name masked to
   `%USERPROFILE%`, integration flags, engine state, last error key) and builds

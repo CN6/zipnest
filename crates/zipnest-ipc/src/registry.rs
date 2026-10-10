@@ -33,19 +33,46 @@ impl ArchiveRegistry {
     pub fn insert(&self, archive: Archive, password: Option<String>) -> (u64, SharedArchive) {
         let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         let shared = Arc::new(Mutex::new(SendArchive(archive)));
-        self.map.write().unwrap().insert(id, Arc::clone(&shared));
+        self.map.write().unwrap_or_else(|e| e.into_inner()).insert(id, Arc::clone(&shared));
         if let Some(pw) = password {
-            self.passwords.write().unwrap().insert(id, pw);
+            self.passwords.write().unwrap_or_else(|e| e.into_inner()).insert(id, pw);
         }
         (id, shared)
     }
 
     pub fn get(&self, id: u64) -> Option<SharedArchive> {
-        self.map.read().unwrap().get(&id).cloned()
+        self.map.read().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
+    }
+
+    /// Forget an archive the caller is done with, dropping the last strong
+    /// reference to it.
+    ///
+    /// Until this existed the map only ever grew: every archive opened during a
+    /// session kept its 7z handler, its source file handle and its plaintext
+    /// password alive until the process exited, because `Archive` releases all
+    /// of that in `Drop` and nothing ever dropped it. The UI shows one archive
+    /// at a time, so a browsing session leaked one per opened file.
+    ///
+    /// Idempotent: closing an id twice (or one that never existed) is a no-op.
+    /// If another strong reference is still held elsewhere the `Archive` stays
+    /// alive until that one goes too, which is the correct behaviour.
+    pub fn remove(&self, id: u64) -> Option<SharedArchive> {
+        self.passwords.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        self.map.write().unwrap_or_else(|e| e.into_inner()).remove(&id)
     }
 
     /// The password the archive was opened with, if any (memory only).
     pub fn password(&self, id: u64) -> Option<String> {
-        self.passwords.read().unwrap().get(&id).cloned()
+        self.passwords.read().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
+    }
+
+    /// How many archives are currently held. Used by the tests to pin the
+    /// "close really releases it" contract.
+    pub fn len(&self) -> usize {
+        self.map.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }

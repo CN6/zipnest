@@ -59,6 +59,51 @@ fn list_children_returns_dir_children() {
 }
 
 #[test]
+fn closing_an_archive_really_releases_it() {
+    // The UI closes the archive it is replacing; without that, every archive a
+    // session opened stayed alive (7z handler + file handle + password).
+    let (svc, _) = service();
+    let first = svc.open_archive(fx("plain.zip").to_string_lossy().into(), None).unwrap();
+    let second = svc.open_archive(fx("plain.zip").to_string_lossy().into(), None).unwrap();
+    assert_ne!(first.id, second.id, "each open gets its own id");
+
+    svc.close_archive(first.id);
+    // The closed id is gone: no listing, no read.
+    assert!(svc.list_children(first.id, String::new()).is_err());
+    assert!(svc.read_entry_bytes(first.id, "a.txt".into(), 1024).is_err());
+    // ... while the other archive is untouched.
+    assert!(!svc.list_children(second.id, String::new()).unwrap().is_empty());
+
+    // Closing twice, or an id that never existed, is a harmless no-op.
+    svc.close_archive(first.id);
+    svc.close_archive(9_999);
+}
+
+#[test]
+fn the_registry_does_not_grow_without_bound() {
+    // Regression guard for the leak: open/close in a loop must not accumulate
+    // archives, while two live opens must both be held.
+    let svc = zipnest_ipc::IpcService::with_settings_path(
+        Arc::new(|_: &str, _: serde_json::Value| {}),
+        std::time::Duration::ZERO,
+        std::env::temp_dir().join("zipnest-registry-len.json"),
+    );
+    for _ in 0..5 {
+        let r = svc.open_archive(fx("plain.zip").to_string_lossy().into(), None).unwrap();
+        svc.close_archive(r.id);
+    }
+    assert_eq!(svc.open_archive_count(), 0, "closed archives must not linger");
+
+    let a = svc.open_archive(fx("plain.zip").to_string_lossy().into(), None).unwrap();
+    let b = svc.open_archive(fx("nested.zip").to_string_lossy().into(), None).unwrap();
+    assert_eq!(svc.open_archive_count(), 2);
+    svc.close_archive(a.id);
+    assert_eq!(svc.open_archive_count(), 1);
+    svc.close_archive(b.id);
+    assert_eq!(svc.open_archive_count(), 0);
+}
+
+#[test]
 fn read_entry_bytes_roundtrip() {
     let (svc, _) = service();
     let r = svc

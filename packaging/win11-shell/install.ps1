@@ -45,8 +45,35 @@ $PackageDir = (Resolve-Path -LiteralPath $PackageDir).Path
 $msix = Join-Path $PackageDir 'ZipNestShell.msix'
 $manifest = Join-Path $PackageDir 'AppxManifest.xml'
 
-# Replace any previous registration (same version cannot be added twice).
-Get-AppxPackage -Name 'ZipNest.Shell' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue
+# Install (or upgrade) the package.
+#
+# This used to remove whatever was registered and then add the new one, so every
+# update had a window where the Win11 context menu did not exist at all — and if
+# the re-add failed (broken AppX deployment store, certificate import refused)
+# the user simply lost the menu, with only a warning dialog to show for it.
+#
+# A higher manifest version upgrades in place, so try that first. The old
+# remove-then-add path stays as the fallback, for the cases Windows refuses an
+# in-place add: 0x80073D06 (a newer version is already installed) and 0x80073CFB
+# (the package is already present with the same contents).
+function Install-ZipNestShellPackage {
+    param([string]$Path, [string]$ExternalLocation)
+    if (-not $ExternalLocation) {
+        Add-AppxPackage -Path $Path
+        return
+    }
+    try {
+        Add-AppxPackage -Path $Path -ExternalLocation $ExternalLocation
+        Write-Host 'Installed the shell package in place (upgrade).'
+    } catch {
+        $code = $_.Exception.HResult
+        Write-Host ("In-place install failed (0x{0:X8}); removing the old registration and retrying." -f $code)
+        Get-AppxPackage -Name 'ZipNest.Shell' -ErrorAction SilentlyContinue |
+            Remove-AppxPackage -ErrorAction SilentlyContinue
+        Add-AppxPackage -Path $Path -ExternalLocation $ExternalLocation
+        Write-Host 'Installed the shell package after replacing the old registration.'
+    }
+}
 
 if (Test-Path -LiteralPath $msix) {
     # Trust the shipped self-signed certificate (public key only) so the signed
@@ -59,9 +86,10 @@ if (Test-Path -LiteralPath $msix) {
             throw "Could not trust the signing certificate (administrator required): $($_.Exception.Message)"
         }
     }
-    Add-AppxPackage -Path $msix -ExternalLocation $InstallDir
-    Write-Host 'Registered ZipNest.Shell from the signed package.'
+    Install-ZipNestShellPackage -Path $msix -ExternalLocation $InstallDir
 } elseif (Test-Path -LiteralPath $manifest) {
+    Get-AppxPackage -Name 'ZipNest.Shell' -ErrorAction SilentlyContinue |
+        Remove-AppxPackage -ErrorAction SilentlyContinue
     Add-AppxPackage -Register $manifest -ExternalLocation $InstallDir
     Write-Host 'Registered ZipNest.Shell from the loose manifest (developer mode).'
 } else {

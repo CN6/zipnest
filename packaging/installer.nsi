@@ -1,9 +1,9 @@
-﻿; ZipNest 0.4.10 native installer (NSIS Unicode)
+﻿; ZipNest 0.4.11 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.4.10"
+!define VERSION "0.4.11"
 ; This installer is a 32-bit process, so plain $PROGRAMFILES would resolve to
 ; "C:\Program Files (x86)" on 64-bit Windows. ZipNest ships as x64, so force
 ; the 64-bit location. InstallDirRegKey below still reads HKCU\...\ZipNest's
@@ -25,8 +25,39 @@ Unicode True
 !define ZN_BUSY_GIVEUP_MSG "仍有文件被占用，这次没能更新它们。请关闭 ZipNest（或重启电脑）后重新运行安装包。"
 !define ZN_BUSY_GIVEUP_MSG_EN "Some files are still in use and were not updated. Close ZipNest (or reboot) and run the installer again."
 
+; Exit codes. NSIS exits 0 unless told otherwise, so every failure path used to
+; look like success to an unattended deployment (`/S` shows no dialog either).
+!define ZN_ERR_RUNNING 2
+!define ZN_ERR_FILES 3
+!define ZN_ERR_WIN11 4
+
+; Machine-wide "default programs" registration.
+;
+; The app itself only writes HKCU (it never asks for elevation) and that is what
+; actually decides the handler. This adds ZipNest to the system's classic
+; *Set Program Associations* list, which is what an older Windows reads when a
+; user goes looking for "默认程序" by hand — the same thing 7-Zip/WinRAR/Bandizip
+; installers do. This installer is elevated anyway.
+;
+; Measured on the maintainer's box (Windows 10 26H1, build 28020): the
+; IApplicationAssociationRegistrationUI API that ZipNest's 「一键设为默认」button
+; calls first returns E_INVALIDARG (0x80070057) for *every* name tried,
+; including machine-wide ones like Microsoft Edge — that build has no working
+; classic page at all. So this entry is for the manual route only; the button
+; falls back to the `ms-settings:` page, which is the path that works there (and
+; on Windows 11 the same link is scoped to ZipNest).
+;
+; One macro per extension, expanded explicitly below: NSIS has no arrays.
+!macro ZN_HKLM_CAPABILITIES ext
+  WriteRegStr HKLM "Software\RegisteredApplications" "ZipNest" "Software\ZipNest\Capabilities"
+  WriteRegStr HKLM "Software\ZipNest\Capabilities" "" "ZipNest"
+  WriteRegStr HKLM "Software\ZipNest\Capabilities" "ApplicationName" "ZipNest"
+  WriteRegStr HKLM "Software\ZipNest\Capabilities" "ApplicationDescription" "ZipNest archive manager"
+  WriteRegStr HKLM "Software\ZipNest\Capabilities\FileAssociations" ".${ext}" "ZipNest.${ext}"
+!macroend
+
 Name "${APPNAME}"
-OutFile "ZipNest_0.4.10_x64-setup.exe"
+OutFile "ZipNest_0.4.11_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -92,6 +123,9 @@ SetCompressor /SOLID lzma
   ; Phase 3: still running -- refuse to overwrite its files.
   ${label_prefix}_abort:
     MessageBox MB_OK|MB_ICONSTOP "${ZN_RUNNING_MSG}$\r$\n$\r$\n${ZN_RUNNING_MSG_EN}" /SD IDOK
+    ; Aborting is a failure: say so through the exit code, which is all a
+    ; silent/scripted install can observe.
+    SetErrorLevel ${ZN_ERR_RUNNING}
     Abort
   ${label_prefix}_gone:
 !macroend
@@ -170,6 +204,11 @@ zn_copy_files:
   File "..\dist-portable\ZipNest\engines\sfx\7zCon.sfx"
   SetOutPath "$INSTDIR\licenses"
   File "..\dist-portable\ZipNest\licenses\7zip.txt"
+  ; The SFX stubs are 7-Zip binaries too and carry a different license text
+  ; (LGPL/BSD-style, binary distribution) than the engine's; the third-party file
+  ; collects the Rust dependencies' texts.
+  File "..\dist-portable\ZipNest\licenses\7zip-sfx.txt"
+  File "..\dist-portable\ZipNest\licenses\THIRD-PARTY.txt"
 
   ; Windows 11 modern context menu: per-user signed sparse package.
   ; zipnest_shell.dll stays in the install dir (the package's external location);
@@ -192,6 +231,10 @@ zn_copy_files:
     Goto zn_copy_giveup
   zn_copy_giveup:
     MessageBox MB_OK|MB_ICONEXCLAMATION "${ZN_BUSY_GIVEUP_MSG}$\r$\n$\r$\n${ZN_BUSY_GIVEUP_MSG_EN}" /SD IDOK
+    ; Files are missing, so this install did NOT succeed. Without this the
+    ; process still exited 0 and an unattended deployment recorded a success.
+    SetErrorLevel ${ZN_ERR_FILES}
+    Goto zn_copy_ok
   zn_copy_ok:
 
   ; uninstaller
@@ -204,11 +247,22 @@ zn_copy_files:
   WriteRegDWORD HKCU "${UNINSTKEY}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINSTKEY}" "NoRepair" 1
 
-; Start menu shortcut. The desktop shortcut is NOT created here -- the finish
-; page asks for it (see ZNCreateDesktopShortcut), so this stays a choice.
+; Start menu shortcut, then the desktop one.
+;
+; The desktop shortcut is normally the finish page's optional step (see
+; ZNCreateDesktopShortcut). A silent install (/S) never shows that page, so
+; without the `IfSilent` branch below an unattended install produced a machine
+; with no desktop icon and no way to notice.
   CreateDirectory "$SMPROGRAMS\ZipNest"
   CreateShortCut "$SMPROGRAMS\ZipNest\ZipNest.lnk" "$INSTDIR\zipnest.exe" "" "$INSTDIR\zipnest.exe" 0
   CreateShortCut "$SMPROGRAMS\ZipNest\卸载 ZipNest.lnk" "$INSTDIR\uninstall.exe" "" "$INSTDIR\uninstall.exe" 0
+  ; Explicit labels, not `IfSilent 0 +2`: relative jumps are easy to get
+  ; backwards, and this branch must only run when the finish page is absent.
+  IfSilent zn_desktop_shortcut
+  Goto zn_desktop_shortcut_done
+zn_desktop_shortcut:
+  Call ZNCreateDesktopShortcut
+zn_desktop_shortcut_done:
   ; Refresh the shell icon cache so the new shortcut icon shows immediately.
   System::Call "shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)"
 
@@ -256,13 +310,43 @@ zn_assoc_new_enough:
   ; we would have to block for. 1.5 s is far more than the write takes.
   Sleep 1500
   ReadRegStr $0 HKCU "Software\Classes\.zip" ""
-  StrCmp $0 "ZipNest.zip" zn_assoc_registered zn_assoc_missing
+  StrCmp $0 "ZipNest.zip" zn_assoc_ours zn_assoc_missing
 zn_assoc_missing:
   DetailPrint "自动注册没有生效（可能是系统策略），可在 ZipNest 设置 → 集成里手动开启"
+  Goto zn_assoc_done
+zn_assoc_ours:
+  ; The Classes default is *our own* value, so on its own it proves only that
+  ; the write worked. What actually decides a double-click is Windows' locked-in
+  ; per-extension choice, which no program may change. Read it too, and do not
+  ; claim success we cannot back up.
+  ReadRegStr $1 HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.zip\UserChoice" "ProgId"
+  StrCmp $1 "" zn_assoc_registered
+  StrCmp $1 "ZipNest.zip" zn_assoc_registered
+  DetailPrint "已登记，但系统已把 .zip 记住给了别的程序（$1）：请在 ZipNest 设置 → 集成里点「一键设为默认解压软件」，或到系统「默认应用」里改一次"
   Goto zn_assoc_done
 zn_assoc_registered:
   DetailPrint "已把 ZipNest 登记为压缩包默认打开方式"
 zn_assoc_done:
+
+  ; Machine-wide capabilities, so the one-click "make ZipNest the default" button
+  ; in the app can reach the classic Set Program Associations page (see the
+  ; ZN_HKLM_CAPABILITIES comment). Failing here is not fatal: the per-user half
+  ; above already makes ZipNest the handler on machines with no competing choice,
+  ; and the app falls back to the Settings deep link.
+  ClearErrors
+  DetailPrint "登记系统「默认程序」条目…"
+  !insertmacro ZN_HKLM_CAPABILITIES zip
+  !insertmacro ZN_HKLM_CAPABILITIES 7z
+  !insertmacro ZN_HKLM_CAPABILITIES rar
+  !insertmacro ZN_HKLM_CAPABILITIES tar
+  !insertmacro ZN_HKLM_CAPABILITIES gz
+  !insertmacro ZN_HKLM_CAPABILITIES tgz
+  !insertmacro ZN_HKLM_CAPABILITIES bz2
+  !insertmacro ZN_HKLM_CAPABILITIES xz
+  !insertmacro ZN_HKLM_CAPABILITIES iso
+  IfErrors 0 zn_hklm_ok
+    DetailPrint "系统『默认程序』条目写入被拒绝（权限或策略），一键设为默认会退回到打开系统设置页面"
+  zn_hklm_ok:
 
 ; Register the Windows 11 context menu (per-user; ignored on Windows 10).
   Call RegisterWin11Shell
@@ -287,6 +371,9 @@ do_register:
   ; only the Win11 modern menu is missing.
   IntCmp $0 0 skip_register win11_register_failed skip_register
 win11_register_failed:
+  ; The Win11 menu is the only thing missing, but a scripted install still
+  ; deserves to see that in its exit code.
+  SetErrorLevel ${ZN_ERR_WIN11}
   MessageBox MB_OK|MB_ICONEXCLAMATION "${ZN_WIN11_MSG}$\r$\n$\r$\n${ZN_WIN11_MSG_EN}" /SD IDOK
 skip_register:
 FunctionEnd
@@ -327,6 +414,13 @@ zn_shell_unregister_failed:
   DetailPrint "右键菜单/文件关联清理失败（将记录残留项）"
 zn_shell_unregistered:
 
+  ; Remove the machine-wide registration the install section added, so an
+  ; uninstalled machine does not keep listing ZipNest in 设置 → 默认程序.
+  ; The uninstaller inherits the installer's elevation, so HKLM is writable here.
+  DeleteRegValue HKLM "Software\RegisteredApplications" "ZipNest"
+  DeleteRegKey HKLM "Software\ZipNest"
+  DetailPrint "已清理系统「默认程序」条目"
+
   ; Program files. ClearErrors/IfErrors records whether any file survived
   ; (e.g. a running instance or AV lock) so we can skip the recursive cleanup.
   ClearErrors
@@ -337,6 +431,8 @@ zn_shell_unregistered:
   Delete /REBOOTOK "$INSTDIR\engines\sfx\7z.sfx"
   Delete /REBOOTOK "$INSTDIR\engines\sfx\7zCon.sfx"
   Delete /REBOOTOK "$INSTDIR\licenses\7zip.txt"
+  Delete /REBOOTOK "$INSTDIR\licenses\7zip-sfx.txt"
+  Delete /REBOOTOK "$INSTDIR\licenses\THIRD-PARTY.txt"
   Delete /REBOOTOK "$INSTDIR\Win11Shell\ZipNestShell.msix"
   Delete /REBOOTOK "$INSTDIR\Win11Shell\ZipNestCodesign.cer"
   Delete /REBOOTOK "$INSTDIR\Win11Shell\install.ps1"

@@ -107,9 +107,14 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.10";
+const CURRENT_VERSION: &str = "0.4.11";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-const UPDATE_UA: &str = "ZipNest-Updater/0.4.0";
+/// Derived from [`CURRENT_VERSION`] on purpose: a hand-typed string here sat at
+/// `0.4.0` for ten releases (the release checklist asked for it every time and
+/// nobody could tell). `packaging\check-versions.ps1` fails the build if a
+/// literal version comes back.
+static UPDATE_UA: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("ZipNest-Updater/{CURRENT_VERSION}"));
 const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
 
 #[derive(Clone, Default)]
@@ -134,7 +139,7 @@ fn is_newer(tag: &str) -> bool {
 
 fn fetch_latest() -> Result<(String, String), String> {
     let body = ureq::get(UPDATE_API)
-        .set("User-Agent", UPDATE_UA)
+        .set("User-Agent", &UPDATE_UA)
         .call()
         .map_err(|e| e.to_string())?
         .into_string()
@@ -361,13 +366,6 @@ impl JobState {
     }
 }
 
-#[derive(Clone)]
-enum PreviewKind {
-    Text(String),
-    Hex(String),
-    Image(egui::TextureHandle),
-    None,
-}
 
 fn load_app_icon() -> Option<egui::IconData> {
     let img = image::load_from_memory(include_bytes!("assets/icon.png")).ok()?;
@@ -571,13 +569,9 @@ struct App {
     copied_at: Option<std::time::Instant>,
     lang: String,
     open_picker: bool,
-    // jobs / preview
+    // jobs
     jobs: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
     job: Option<JobState>,
-    preview: PreviewKind,
-    preview_for: String,
-    /// The preview we are showing is only the head of a larger entry.
-    preview_truncated: bool,
     // dialogs
     show_extract: bool,
     extract_dest: String,
@@ -739,9 +733,6 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             open_picker: false,
             jobs,
             job: None,
-            preview: PreviewKind::None,
-            preview_for: String::new(),
-            preview_truncated: false,
             show_extract: false,
             extract_dest: String::new(),
             extract_skipped: 0,
@@ -812,6 +803,58 @@ fn t(&self, key: &str) -> String {
 
     /// Status text for the last job. `job.ok_skipped` carries the count as
     /// `{count}`; native i18n has no interpolator, so it is substituted here.
+    /// The one-line verdict for Settings -> Integration.
+    ///
+    /// Three states a user can be in, and each needs different words: we are not
+    /// claiming anything (checkbox off), we are the default, or Windows has
+    /// already given these extensions to another program and only the user can
+    /// change that.
+    fn assoc_status(&self) -> (&'static str, Option<String>) {
+        if !self.settings.associate {
+            return ("settings.shell.status_off", None);
+        }
+        if self.assoc_blocked.is_empty() {
+            return ("settings.shell.status_ours", None);
+        }
+        let exts = self
+            .assoc_blocked
+            .iter()
+            .map(|e| format!(".{e}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        ("settings.shell.blocked", Some(exts))
+    }
+
+    /// Re-read what Windows currently resolves, so the verdict above is never a
+    /// stale guess (the user may have changed the default in Windows Settings
+    /// while ZipNest was open).
+    fn refresh_assoc_status(&mut self) {
+        self.assoc_blocked =
+            zipnest_ipc::shell::blocked_extensions(&zipnest_ipc::shell::WindowsRegistry);
+    }
+
+    /// "One click to default": hand the user Windows' own default-programs page
+    /// with ZipNest in it.
+    ///
+    /// Two routes, because only one of them is reliable: the classic
+    /// `LaunchAdvancedAssociationUI` page is preselected to ZipNest but has been
+    /// removed from recent Windows builds (it answers E_INVALIDARG for every app
+    /// name there -- see `shell::launch_default_apps_ui`), so an error falls
+    /// straight through to the Settings deep link, which on Windows 11 lands on
+    /// ZipNest's own page and on Windows 10 opens Default apps.
+    ///
+    /// Off the UI thread: the classic page is modal and blocks until closed.
+    fn set_default_now(&mut self) {
+        self.notice = Some("settings.shell.set_default.opening".into());
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            if zipnest_ipc::shell::launch_default_apps_ui().is_err() {
+                open_shell_url(zipnest_ipc::shell::DEFAULT_APPS_URI);
+            }
+            ctx.request_repaint();
+        });
+    }
+
     fn notice_text(&self) -> Option<String> {
         let key = self.notice.as_deref()?;
         let mut text = self.t(key);
@@ -983,6 +1026,12 @@ fn t(&self, key: &str) -> String {
     }
 
     fn open_archive(&mut self, path: &str) {
+        // Release whatever we are replacing first: the engine, the source file
+        // handle and the session password all live inside that archive, and
+        // nothing else closes it (see `IpcService::close_archive`).
+        if let Some(old) = self.archive.take() {
+            self.svc.close_archive(old.id);
+        }
         match self.svc.open_archive(path.to_string(), None) {
             Ok(res) => {
                 let id = res.id;
@@ -991,7 +1040,6 @@ fn t(&self, key: &str) -> String {
                 self.cwd = String::new();
                 self.rows = self.svc.list_children(id, String::new()).unwrap_or_default();
                 self.selected.clear();
-                self.preview = PreviewKind::None;
                 self.error = None;
             }
             Err(e) => self.error = Some(self.t(&e.key)),
@@ -1007,7 +1055,6 @@ fn t(&self, key: &str) -> String {
             self.rows = self.svc.list_children(a.id, dir.clone()).unwrap_or_default();
             self.cwd = dir;
             self.selected.clear();
-            self.preview = PreviewKind::None;
         }
     }
 
@@ -1087,53 +1134,7 @@ fn t(&self, key: &str) -> String {
         }
     }
 
-    fn selected_one(&self) -> Option<&EntryDto> {
-        if self.selected.len() == 1 {
-            self.rows.iter().find(|e| self.selected.contains(&e.path))
-        } else {
-            None
-        }
-    }
 
-    fn preview_selected(&mut self) {
-        let id = self.archive.as_ref().map(|a| a.id).unwrap_or(0);
-        let Some(entry) = self.selected_one().cloned() else {
-            self.preview = PreviewKind::None;
-            self.preview_truncated = false;
-            return;
-        };
-        if entry.is_dir {
-            self.preview = PreviewKind::None;
-            self.preview_truncated = false;
-            return;
-        }
-        let max_bytes = self.settings.preview_max_bytes.max(1);
-        let read = self.svc.read_entry_bytes(id, entry.path.clone(), max_bytes);
-        // The reader stops at the cap; say so instead of presenting the head of
-        // an entry as if it were the whole thing.
-        self.preview_truncated = read
-            .as_ref()
-            .map(|b| entry.size > b.len() as u64)
-            .unwrap_or(false);
-        let bytes = read.unwrap_or_default();
-        let name_lower = entry.name.to_lowercase();
-        if name_lower.ends_with(".png") || name_lower.ends_with(".jpg") || name_lower.ends_with(".jpeg") {
-            if let Some(img) = i18n::load_image(&bytes) {
-                let tex = self
-                    .ctx
-                    .load_texture("preview-img", img, egui::TextureOptions::LINEAR);
-                self.preview = PreviewKind::Image(tex);
-                return;
-            }
-            self.preview = PreviewKind::Hex(format_preview_hex(&bytes));
-            return;
-        }
-        if bytes.contains(&0) {
-            self.preview = PreviewKind::Hex(format_preview_hex(&bytes));
-        } else {
-            self.preview = PreviewKind::Text(String::from_utf8_lossy(&bytes).into_owned());
-        }
-    }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         theme::top_bar(ui, |ui| {
@@ -1214,6 +1215,10 @@ let extract_enabled = self.archive.is_some();
                     }
                     if theme::ghost_button(ui, &self.t("settings.title")).clicked() {
                         self.show_settings = true;
+                        // The user may have changed the default in Windows
+                        // Settings since we last looked; refresh instead of
+                        // showing a stale verdict.
+                        self.refresh_assoc_status();
                     }
                 });
             });
@@ -1451,10 +1456,12 @@ let extract_enabled = self.archive.is_some();
                     if let Some(d) = dbl.or(click_dir) {
                         self.navigate(&d);
                     } else if let Some(f) = click_file {
+                        // Select only. This used to also run the preview reader,
+                        // which pulled up to `preview_max_bytes` out of the
+                        // archive on the UI thread for a panel that no longer
+                        // exists.
                         self.selected.clear();
-                        self.selected.insert(f.clone());
-                        self.preview_for = f;
-                        self.preview_selected();
+                        self.selected.insert(f);
                     }
                 });
         });
@@ -1507,33 +1514,6 @@ let extract_enabled = self.archive.is_some();
             .clicked();
         if clicked {
             self.open_picker = true;
-        }
-    }
-    fn preview_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading(self.t("preview.title"));
-        match &self.preview {
-            PreviewKind::Text(s) => {
-                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.monospace(s);
-                });
-            }
-            PreviewKind::Hex(h) => {
-                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.monospace(h);
-                });
-            }
-            PreviewKind::Image(tex) => {
-                let tex_handle = tex.clone();
-                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.image((tex_handle.id(), egui::Vec2::new(280.0, 280.0)));
-                });
-            }
-            PreviewKind::None => {
-                ui.weak(self.t("preview.no_preview"));
-            }
-        }
-        if self.preview_truncated && !matches!(self.preview, PreviewKind::None) {
-            ui.weak(self.t("preview.truncated"));
         }
     }
 
@@ -1678,8 +1658,9 @@ let extract_enabled = self.archive.is_some();
         egui::Window::new(t).collapsible(false).open(&mut open).show(ctx, |ui| {
             ui.label(self.t("create.sources"));
             if ui.button(self.t("create.add_files")).clicked() {
+                let all = self.t("pick.all");
                 if let Some(files) = rfd::FileDialog::new()
-                    .add_filter("All", &["*"])
+                    .add_filter(all, &["*"])
                     .pick_files()
                 {
                     for f in files {
@@ -1726,7 +1707,8 @@ let extract_enabled = self.archive.is_some();
                 // name themselves — which reads as "browse cannot select
                 // anything". Pre-fill a sensible name and match the format.
                 let format = self.create_format.clone();
-                let (desc, exts) = format_filter(&format);
+                let (desc_key, exts) = format_filter(&format);
+                let desc = self.t(desc_key);
                 let picked = rfd::FileDialog::new()
                     .set_file_name(suggested_archive_name(&self.create_sources, &format))
                     .add_filter(desc, exts)
@@ -1976,23 +1958,34 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                         theme::hint(ui, &self.t("settings.shell.assoc_hint"));
                         let menu_label = self.t("settings.shell.context_menu");
                         ui.checkbox(&mut self.settings.context_menu, menu_label);
-                        if !self.assoc_blocked.is_empty() {
-                            // Windows' per-extension UserChoice beats every key
-                            // we can write, and it cannot be rewritten or
-                            // deleted by any program. Say so, and hand over the
-                            // one page that can change it.
-                            let exts = self
-                                .assoc_blocked
-                                .iter()
-                                .map(|e| format!(".{e}"))
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            let msg = self.t("settings.shell.blocked").replace("{exts}", &exts);
-                            theme::hint(ui, &msg);
-                            if ui.button(self.t("settings.shell.open_default_apps")).clicked() {
-                                open_default_apps_page();
+                        // What Windows currently resolves for archives, then the
+                        // one-click way to change it. Windows protects a
+                        // per-extension `UserChoice` against *programs* (it
+                        // cannot be written and cannot be deleted), but the user
+                        // can replace it in one click on the page below -- the
+                        // same route Bandizip and 7-Zip send people to.
+                        let (status_key, status_exts) = self.assoc_status();
+                        match status_exts {
+                            Some(exts) => {
+                                let msg = self.t(status_key).replace("{exts}", &exts);
+                                theme::hint(ui, &msg);
+                            }
+                            None => {
+                                ui.label(self.t(status_key));
                             }
                         }
+                        ui.horizontal(|ui| {
+                            if theme::primary_button(ui, &self.t("settings.shell.set_default")).clicked()
+                            {
+                                self.set_default_now();
+                            }
+                            if !self.assoc_blocked.is_empty()
+                                && ui.button(self.t("settings.shell.open_default_apps")).clicked()
+                            {
+                                open_default_apps_page();
+                            }
+                        });
+                        theme::hint(ui, &self.t("settings.shell.set_default.hint"));
 
                         theme::section(ui, &self.t("settings.section.about"));
                         let update_label = self.t("settings.auto_update");
@@ -2306,31 +2299,18 @@ fn entry_accent(ext: &str) -> (egui::Color32, Option<&'static str>) {
     }
 }
 
-fn format_preview_hex(bytes: &[u8]) -> String {
-    let cap = bytes.len().min(4096);
-    let mut s = String::new();
-    for (i, chunk) in bytes[..cap].chunks(16).enumerate() {
-        s.push_str(&format!("{i:04x}  "));
-        for b in chunk {
-            s.push_str(&format!("{b:02x} "));
-        }
-        s.push('\n');
-    }
-    if bytes.len() > cap {
-        s.push_str(&format!("… {} more bytes", bytes.len() - cap));
-    }
-    s
-}
-
-/// rfd filter for a create format: `(description, extensions)`.
+/// rfd filter for a create format: `(i18n key of the description, extensions)`.
+///
+/// The description is shown verbatim in the Windows file dialog, so it is a
+/// translation key the caller resolves -- it used to be English-only.
 fn format_filter(format: &str) -> (&'static str, &'static [&'static str]) {
     match format {
-        "7z" => ("7z archive", &["7z"]),
-        "tar" => ("TAR archive", &["tar"]),
-        "tar.gz" => ("TAR.GZ archive", &["gz"]),
-        "tar.bz2" => ("TAR.BZ2 archive", &["bz2"]),
-        "tar.xz" => ("TAR.XZ archive", &["xz"]),
-        _ => ("ZIP archive", &["zip"]),
+        "7z" => ("format.7z", &["7z"]),
+        "tar" => ("format.tar", &["tar"]),
+        "tar.gz" => ("format.tar.gz", &["gz"]),
+        "tar.bz2" => ("format.tar.bz2", &["bz2"]),
+        "tar.xz" => ("format.tar.xz", &["xz"]),
+        _ => ("format.zip", &["zip"]),
     }
 }
 
@@ -2572,8 +2552,9 @@ egui::CentralPanel::default().show(ctx, |ui| {
 
         if self.open_picker {
             self.open_picker = false;
+            let archives = self.t("pick.archives");
             if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Archives", &["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "iso"])
+                .add_filter(archives, &["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "iso"])
                 .pick_file()
             {
                 self.open_archive(path.to_str().unwrap_or(""));

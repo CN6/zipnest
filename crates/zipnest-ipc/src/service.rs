@@ -411,16 +411,44 @@ impl IpcService {
         Ok(OpenArchiveResult { id, encrypted, format, entries: root })
     }
 
+    /// Release an archive the UI has finished with.
+    ///
+    /// Every call to [`IpcService::open_archive`] used to pin an archive (7z
+    /// handler + source file handle + plaintext password) in the registry for
+    /// the rest of the process. The UI presents one archive at a time, so it
+    /// closes the previous one here as it opens the next.
+    ///
+    /// Idempotent, and never fails: an unknown id means it was already closed.
+    pub fn close_archive(&self, id: u64) {
+        if let Some(shared) = self.registry.remove(id) {
+            // Drop the last reference we hold outside the map here rather than
+            // at the end of the caller's scope, so the engine is released even
+            // if the caller keeps going.
+            drop(shared);
+        }
+    }
+
+    /// How many archives are currently held open.
+    ///
+    /// The UI keeps one at a time; this exists so the "closing really releases
+    /// it" contract can be pinned by a test instead of trusted.
+    pub fn open_archive_count(&self) -> usize {
+        self.registry.len()
+    }
+
     pub fn list_children(&self, id: u64, dir: String) -> Result<Vec<EntryDto>, IpcError> {
         let shared = self.lock_archive(id)?;
-        let guard = shared.lock().map_err(|_| IpcError::new("error.engine"))?;
+        let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
         let entries = guard.0.entries()?;
         Ok(children_of(&entries, &dir).into_iter().map(to_dto).collect())
     }
 
     pub fn read_entry_bytes(&self, id: u64, path: String, max_bytes: u64) -> Result<Vec<u8>, IpcError> {
         let shared = self.lock_archive(id)?;
-        let guard = shared.lock().map_err(|_| IpcError::new("error.engine"))?;
+        // A poisoned lock means a job runner panicked while holding it. The
+        // archive itself is still usable, so recover the guard instead of
+        // turning one panic into a permanent error for that archive.
+        let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
         let entries = guard.0.entries()?;
         let idx = entries
             .iter()
@@ -478,7 +506,10 @@ impl IpcService {
         let on_conflict = archive_core::OnConflict::from_policy(on_conflict.as_deref());
 
         let job_id = self.jobs.submit("extract", Box::new(move |ctx| {
-            let guard = shared.lock().map_err(|_| "error.engine".to_string())?;
+            // Poison-tolerant: a panic in an earlier job must not make this
+            // archive permanently unusable (the settings lock above already
+            // does the same).
+            let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
             let entries = guard.0.entries().map_err(|e| e.error_key().to_string())?;
 
             // Expand the selection: a directory contributes its subtree *and*
