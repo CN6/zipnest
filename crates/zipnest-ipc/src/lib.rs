@@ -10,6 +10,7 @@ pub mod registry;
 pub mod service;
 pub mod settings;
 pub mod shell;
+pub mod user_choice;
 
 pub use diagnostics::{mailto_url, Diagnostics};
 pub use error::IpcError;

@@ -99,7 +99,7 @@ older web UI and is NOT shipped.
    - Local installers/portable zips are not kept: upload them and delete the
      copies (the maintainer does not want them on disk).
 
-## Known open items / gotchas (as of v0.4.11)
+## Known open items / gotchas (as of v0.4.13)
 
 - **Scripts and JSON this agent writes**: the editor tool drops a leading `#`
   from the first line (`#Requires -Version 5.1` came out as
@@ -108,20 +108,62 @@ older web UI and is NOT shipped.
   Chinese literals/regexes silently break, and `installer.nsi` needs its BOM or
   makensis aborts. After writing a script, check the first bytes and the first
   line.
-- **A default handler is per extension and Windows guards it** (v0.4.11). The
-  app cannot take over an extension whose `UserChoice` names another program, so
-  the Settings dialog's 「一键设为默认」 calls `shell::launch_default_apps_ui()`
-  and falls back to `ms-settings:defaultapps?registeredAppUser=ZipNest`, which is
-  the route that actually works (verified: it launches SystemSettings). The
-  classic `IApplicationAssociationRegistrationUI::LaunchAdvancedAssociationUI`
-  is best-effort: measured on Windows 10 build 28020 it returns E_INVALIDARG
-  (0x80070057) for **every** application name, machine-registered ones like
-  "Microsoft Edge" included, and it blocks until its page is closed when it does
-  work — hence the worker thread and the silent fallback. The installer also
-  writes `HKLM\Software\RegisteredApplications\ZipNest` + `Capabilities` so the
-  manual 默认程序 list still shows ZipNest on systems that have that page; it is
-  not what makes the one-click button work. Never try to forge or delete
-  `UserChoice`.
+- **Never round-trip a repo file through PowerShell's text cmdlets**: `Get-Content`
+  / `Set-Content` default to ANSI here (GBK), so `(Get-Content x -Raw) -replace …
+  | Set-Content -Encoding UTF8 x` turned every em dash in `AGENTS.md` and
+  `user_choice.rs` into `鈥?`. Use the `edit`/`write` tools, or .NET with an
+  explicit `UTF8Encoding($true/$false)` and the BOM state you checked first.
+- **A default handler is per extension, and since v0.4.13 ZipNest takes it over
+  itself** — `crates/zipnest-ipc/src/user_choice.rs`. What the OS actually
+  follows is `HKCU\...\Explorer\FileExts\.<ext>\UserChoice`, which carries a
+  `Deny SetValue` ACE (writes fail) **and** a `Hash` Windows re-computes before
+  honouring the entry. The ACE does not deny `DELETE` and the user owns the key,
+  so the working recipe is the one Firefox ships: **delete the key, recreate it
+  with our `ProgId`, write a hash we compute from the key's own last-write time**
+  (salt `User Choice set via Windows User Experience {D18B6DD5-…}`, MD5 over the
+  lowercased UTF-16LE message including its NUL, then the bespoke scramble).
+  Measured on Windows 11 26H1 (build 28020): the computed hash reproduced the
+  stored hash of **every** `UserChoice` on the machine (8/8 here, 155/155 in an
+  independent port), and afterwards the shell opened `.zip`/`.7z` with ZipNest
+  and no dialog. Things that are easy to get wrong, all measured:
+  - the extension in the hash input **includes the dot** (`.tar`, not `tar`);
+    without it Windows rejects the entry and then *deletes* the whole key;
+  - only the key's **minute** matters, so re-read its last-write time after
+    writing and re-verify — a write that lands in the next minute produces a
+    value Windows throws away;
+  - `UserChoiceLatest` (a second, undocumented store some 26H1 builds add) holds
+    the choice in a `ProgId` **subkey**, so removing it needs `RegDeleteTreeW`,
+    not `RegDeleteKeyW`;
+  - never claim victory by comparing the value you just wrote: recompute;
+  - `UCPD.sys` ("User Choice Protection Driver") is running, and its v4.8
+    protected set covers http/https, `.pdf`, `.html`/`.htm` and the Office
+    formats — **none of our archive extensions**. Do not extend the takeover to
+    anything on that list;
+  - the "show the user a Windows page" route is dead: Microsoft documents that
+    `SHOpenWithDialog` cannot set a default since Windows 10, and
+    `LaunchAdvancedAssociationUI` returns E_INVALIDARG for every name on build
+    28020. Sending users to `ms-settings:defaultapps` just moves the puzzle to
+    them; v0.4.12 did that and v0.4.13 removed it.
+- **The Settings dialog is its own OS window** (v0.4.13), via
+  `Context::show_viewport_immediate`, because an embedded `egui::Window` is
+  clipped by the main window. Two eframe details cost real debugging time: a
+  secondary viewport is created **behind** the main window on Windows (raise it
+  once with `ViewportCommand::Focus` on its first frame, and re-arm that flag
+  whenever the dialog is reopened), and eframe clears immediate viewports with
+  `[0,0,0,0]` rather than the app's clear colour, so the panel has to paint its own
+  background. Leave room for the footer too: a top-down scrolling body takes the
+  full height and pushes the Save/Cancel row out of sight, hence the cap at
+  `available_height() - 44`.
+- **`shell_register` refuses a `target/` exe path** (`error.shell.dev_path`), so a
+  `cargo run` / `cargo test` build can never become the system handler. To exercise
+  the real registration path by hand, copy the binary somewhere else first
+  (`%TEMP%\…`) — that is also why `--register-integration` prints nothing and
+  exits 0 on a dev build.
+- **Packaging scripts must tolerate cargo's stderr**: `build-package.ps1` sets
+  `$ErrorActionPreference = 'Stop'`, and PowerShell 5.1 turns a native command's
+  stderr into a terminating error — so the benign LNK4104 linker warning on the
+  shell DLL's COM exports aborted the MSIX build and left the portable payload
+  incomplete. The cargo call is wrapped with a local `Continue` preference.
 - **Opening an archive pins it until it is closed** (v0.4.11). `Archive` frees
   its 7z handler, source file handle and password in `Drop`, and
   `ArchiveRegistry` had no removal path at all — a browsing session leaked one

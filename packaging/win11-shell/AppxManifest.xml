@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <!--
   ZipNest Windows 11 shell integration (sparse / packaging-with-external-location).
 
@@ -23,7 +23,7 @@
   <Identity
     Name="ZipNest.Shell"
     Publisher="CN=ZipNest"
-    Version="0.4.12.0"
+    Version="0.4.13.0"
     ProcessorArchitecture="neutral" />
 
   <Properties>

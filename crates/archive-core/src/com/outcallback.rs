@@ -29,7 +29,7 @@ pub struct SourceItem {
     pub mtime: Option<std::time::SystemTime>,
 }
 
-/// Progress closure slot 鈥?the `Box<&mut dyn FnMut>` fat pointer, plus a
+/// Progress closure slot — the `Box<&mut dyn FnMut>` fat pointer, plus a
 /// monomorphized trampoline to call it. Invoked while the `Mutex` is held.
 pub struct ProgressCell {
     pub cell: *mut c_void,

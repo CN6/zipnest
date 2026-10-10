@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.12";
+const CURRENT_VERSION: &str = "0.4.13";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 /// Derived from [`CURRENT_VERSION`] on purpose: a hand-typed string here sat at
 /// `0.4.0` for ten releases (the release checklist asked for it every time and
@@ -252,15 +252,6 @@ fn cap_cli_runtime() {
     });
 }
 
-/// Open Windows' own Default apps page, pre-selecting ZipNest where the OS
-/// supports it. This is the only supported way to hand ZipNest an extension
-/// whose `UserChoice` already belongs to another program: Windows protects that
-/// key (it cannot be written and cannot be deleted), so no amount of registry
-/// work can take it back by itself.
-fn open_default_apps_page() {
-    open_shell_url(zipnest_ipc::shell::DEFAULT_APPS_URI);
-}
-
 /// Which integration to apply when somebody asks for it.
 ///
 /// Split out from the registry work because it is the part that is easy to get
@@ -301,20 +292,61 @@ fn integration_plan(
     })
 }
 
-/// Claim the Explorer integration. Called by `--register-integration` (the
-/// installer runs it right after copying the files, `force = true`) and by the
-/// first UI launch (`force = false`, which also covers the portable zip).
+/// Claim the Explorer integration, then take the archive formats over as the
+/// default handler. Called by `--register-integration` (the installer runs it
+/// right after copying the files, `force = true`) and by the first UI launch
+/// (`force = false`, which also covers the portable zip).
+///
+/// The takeover is what finally makes a fresh install the default extractor:
+/// writing our `ProgId` into `HKCU\Software\Classes` is not enough once Windows
+/// has recorded somebody else's handler for `.zip`, so
+/// [`zipnest_ipc::user_choice::claim_all`] replaces that record with a valid one.
 fn apply_integration(svc: &IpcService, force: bool) -> Option<zipnest_ipc::shell::ShellRegisterResult> {
     let settings = svc.settings_get().ok()?;
     let opts = integration_plan(&settings, force)?;
     let exe = std::env::current_exe().unwrap_or_default();
-    svc.shell_register(
-        &exe,
-        opts,
-        &zipnest_ipc::shell::WindowsRegistry,
-        &zipnest_ipc::shell::WindowsRegistry,
-    )
-    .ok()
+    let result = svc
+        .shell_register(
+            &exe,
+            opts.clone(),
+            &zipnest_ipc::shell::WindowsRegistry,
+            &zipnest_ipc::shell::WindowsRegistry,
+        )
+        .ok()?;
+    if opts.associate {
+        claim_default_formats(&opts.extensions);
+    }
+    Some(result)
+}
+
+/// The extensions a [`ShellOptions`] actually claims: an empty list means
+/// "everything we ship a handler for".
+fn claimed_extensions(list: &[String]) -> Vec<String> {
+    let normalised = zipnest_ipc::shell::normalise_extensions(list);
+    if normalised.is_empty() {
+        zipnest_ipc::shell::SUPPORTED_EXTENSIONS
+            .iter()
+            .map(|ext| (*ext).to_string())
+            .collect()
+    } else {
+        normalised
+    }
+}
+
+/// Make ZipNest the default handler for every claimed archive format.
+///
+/// Returns the extensions that could not be taken over. Kept separate from
+/// [`apply_integration`] so the Settings button can run exactly the same work
+/// and report it.
+fn claim_default_formats(list: &[String]) -> Vec<String> {
+    let exts = claimed_extensions(list);
+    zipnest_ipc::user_choice::claim_all(exts.iter().map(String::as_str))
+        .into_iter()
+        .map(|(ext, reason)| {
+            eprintln!("ZipNest: could not take over .{ext}: {reason}");
+            ext
+        })
+        .collect()
 }
 
 /// Look for a newer release.
@@ -602,18 +634,15 @@ struct App {
     create_custom_volume: String,
     create_sfx: bool,
     show_settings: bool,
-    /// Extensions Windows has already assigned to another program (its
-    /// protected per-extension `UserChoice`). The writes succeeded, but the OS
-    /// keeps the other handler until the user changes it in the system Default
-    /// apps page, so the Settings dialog explains it and offers the deep link.
-    assoc_blocked: Vec<String>,
-    /// Per-extension state for the Settings table (registered? locked to
-    /// somebody else?), re-read whenever the dialog opens, after a save, and
-    /// when a system "open with" dialog has been dealt with.
+    /// Whether the Settings window has already asked to be raised. A brand-new
+    /// OS window is created *behind* the main one on Windows, so the first frame
+    /// of each opening focuses it; without this the dialog appears underneath
+    /// the archive list, which is exactly the occlusion it exists to avoid.
+    settings_raised: bool,
+    /// Per-extension state for the Settings status line (is Windows' recorded
+    /// handler ours?), re-read whenever the dialog opens, after a save, and
+    /// after a takeover.
     assoc_rows: Vec<zipnest_ipc::shell::AssocState>,
-    /// Set by the worker that opened a system association dialog once the user
-    /// has had time to answer it; the UI re-reads the table when it turns true.
-    assoc_rows_dirty: Arc<Mutex<bool>>,
     show_donate: bool,
     /// A help hint the user clicked on: `(field label, explanation)`.
     help_popup: Option<(String, String)>,
@@ -674,9 +703,6 @@ fn new(
             settings.context_menu = r.context_menu;
             settings.integration_applied = true;
         }
-        let assoc_blocked = boot.map(|r| r.blocked).unwrap_or_default();
-        // Read the per-extension table once up front: the Settings dialog also
-        // refreshes it when it opens, but it must never be blank on first look.
         let assoc_rows = zipnest_ipc::shell::assoc_states(&zipnest_ipc::shell::WindowsRegistry);
         // Theme: light, dark, or whatever the system is set to. Applied here
         // rather than next to install_fonts because it needs the settings.
@@ -772,9 +798,8 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             create_custom_volume: String::new(),
             create_sfx: false,
             show_settings: false,
-            assoc_blocked,
+            settings_raised: false,
             assoc_rows,
-            assoc_rows_dirty: Default::default(),
             show_donate: false,
             help_popup: None,
             qr_wechat,
@@ -834,117 +859,50 @@ fn t(&self, key: &str) -> String {
     /// claiming anything (checkbox off), we are the default, or Windows has
     /// already given these extensions to another program and only the user can
     /// change that.
+    /// What the takeover would have to fix: the formats Windows still records
+    /// as somebody else's.
     fn assoc_status(&self) -> (&'static str, Option<String>) {
         if !self.settings.associate {
             return ("settings.shell.status_off", None);
         }
-        if self.assoc_blocked.is_empty() {
+        let blocked: Vec<String> = self
+            .assoc_rows
+            .iter()
+            .filter(|row| row.needs_user_choice())
+            .map(|row| format!(".{}", row.ext))
+            .collect();
+        if blocked.is_empty() {
             return ("settings.shell.status_ours", None);
         }
-        let exts = self
-            .assoc_blocked
-            .iter()
-            .map(|e| format!(".{e}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        ("settings.shell.blocked", Some(exts))
+        ("settings.shell.blocked", Some(blocked.join(" ")))
     }
 
     /// Re-read what Windows currently resolves, so the verdict above is never a
     /// stale guess (the user may have changed the default in Windows Settings
     /// while ZipNest was open).
     fn refresh_assoc_status(&mut self) {
-        self.assoc_blocked =
-            zipnest_ipc::shell::blocked_extensions(&zipnest_ipc::shell::WindowsRegistry);
-        self.refresh_assoc_rows();
-    }
-
-    /// The per-extension table: registered? locked to somebody else?
-    fn refresh_assoc_rows(&mut self) {
         self.assoc_rows = zipnest_ipc::shell::assoc_states(&zipnest_ipc::shell::WindowsRegistry);
     }
 
-    /// Is this extension in the ticked set?
+    /// Take the archive formats over as the default handler, right now.
     ///
-    /// The list is explicit (all nine on a fresh profile), so "nothing ticked"
-    /// is a real state rather than an alias for "everything".
-    fn extension_ticked(&self, ext: &str) -> bool {
-        self.settings
-            .assoc_extensions
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case(ext))
-    }
-
-    fn set_extension_ticked(&mut self, ext: &str, ticked: bool) {
-        let mut list: Vec<String> = self
-            .settings
-            .assoc_extensions
-            .iter()
-            .filter(|e| !e.eq_ignore_ascii_case(ext))
-            .cloned()
-            .collect();
-        if ticked {
-            list.push(ext.to_string());
-        }
-        // Canonical order keeps the file and the dialog readable.
-        self.settings.assoc_extensions = zipnest_ipc::shell::normalise_extensions(&list);
-    }
-
-    /// Open the system's "你要如何打开此文件？" dialog for one extension.
+    /// This is the whole "one click to default" feature, and it needs no help
+    /// from Windows Settings: the recorded handler lives in a `UserChoice` key
+    /// that Windows denies *value writes* to but lets the owner delete, and the
+    /// hash that protects it is derivable — see [`zipnest_ipc::user_choice`].
+    /// So the work is quiet, instant, and cannot leave the user staring at a
+    /// page wondering what to click.
     ///
-    /// This is the route that works where a `UserChoice` already belongs to
-    /// another program: Windows protects that key against *programs* but accepts
-    /// the user's own choice in this dialog, hash and all, so nothing here
-    /// fights the OS.
-    ///
-    /// Off the UI thread (the dialog is modal), then re-read the table: if the
-    /// user ticked "始终", that extension flips to ours without a restart.
-    /// Falls back to the classic `OpenAs_RunDLL` entry point, and then to the
-    /// Settings page, when the shell refuses.
-    fn open_with_dialog_for(&mut self, ext: &str) {
-        self.notice = Some("settings.shell.pick_in_system.opening".into());
-        let ext = ext.to_string();
-        let ctx = self.ctx.clone();
-        let dirty = Arc::clone(&self.assoc_rows_dirty);
-        std::thread::spawn(move || {
-            let opened = zipnest_ipc::shell::open_with_dialog_for(&ext).is_ok();
-            if !opened {
-                match zipnest_ipc::shell::open_with_rundll_command(&ext) {
-                    Some((program, args)) => {
-                        let _ = std::process::Command::new(program).args(args).spawn();
-                    }
-                    None => open_default_apps_page(),
-                }
-            }
-            // The dialog is modal, and the worker cannot know when the user
-            // closes it: wait a little, then have the UI re-read the table so the
-            // row flips as soon as Windows recorded the choice.
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            *dirty.lock().unwrap_or_else(|e| e.into_inner()) = true;
-            ctx.request_repaint();
-        });
-        self.refresh_assoc_rows();
-    }
-
-    /// "One click to default": hand the user Windows' own default-programs page
-    /// with ZipNest in it.
-    ///
-    /// Two routes, because only one of them is reliable: the classic
-    /// `LaunchAdvancedAssociationUI` page is preselected to ZipNest but has been
-    /// removed from recent Windows builds (it answers E_INVALIDARG for every app
-    /// name there -- see `shell::launch_default_apps_ui`), so an error falls
-    /// straight through to the Settings deep link, which on Windows 11 lands on
-    /// ZipNest's own page and on Windows 10 opens Default apps.
-    ///
-    /// Off the UI thread: the classic page is modal and blocks until closed.
-    fn set_default_now(&mut self) {
-        self.notice = Some("settings.shell.set_default.opening".into());
-        let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
-            if zipnest_ipc::shell::launch_default_apps_ui().is_err() {
-                open_shell_url(zipnest_ipc::shell::DEFAULT_APPS_URI);
-            }
-            ctx.request_repaint();
+    /// Windows still wins the long game: if the user later picks another
+    /// archiver in "打开方式", that becomes the new default, and this button (or
+    /// a reinstall) takes it back.
+    fn force_default_now(&mut self) {
+        let failed = claim_default_formats(&self.settings.assoc_extensions);
+        self.refresh_assoc_status();
+        self.notice = Some(if failed.is_empty() {
+            "settings.shell.claim_ok".into()
+        } else {
+            "settings.shell.claim_partial".into()
         });
     }
 
@@ -1021,13 +979,6 @@ fn t(&self, key: &str) -> String {
 
     /// Drain job events emitted by the service into UI state.
     fn poll_jobs(&mut self) {
-        // A worker opened a system association dialog for us and the user has
-        // had time to answer it: re-read the per-extension table so a row turns
-        // into "ours" without restarting anything.
-        if *self.assoc_rows_dirty.lock().unwrap_or_else(|e| e.into_inner()) {
-            *self.assoc_rows_dirty.lock().unwrap_or_else(|e| e.into_inner()) = false;
-            self.refresh_assoc_status();
-        }
         let pending: Vec<_> = self.jobs.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
         for (name, payload) in pending {
             match name.as_str() {
@@ -1315,6 +1266,9 @@ let extract_enabled = self.archive.is_some();
                     }
                     if theme::ghost_button(ui, &self.t("settings.title")).clicked() {
                         self.show_settings = true;
+                        // A fresh window, so it has to bring itself to the front
+                        // again.
+                        self.settings_raised = false;
                         // The user may have changed the default in Windows
                         // Settings since we last looked; refresh instead of
                         // showing a stale verdict.
@@ -1957,23 +1911,21 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
         self.show_create = open && !close && self.job.is_none();
     }
 
-    fn settings_dialog(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_settings;
-        let svc = self.svc.clone();
+    /// One settings window's contents: the body scrolls, the footer stays put.
+    ///
+    /// Returns `(save, close)`.
+    fn settings_window_ui(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
         let mut save = false;
         let mut close = false;
-        egui::Window::new(self.t("settings.title"))
-            .collapsible(false)
-            .resizable(false)
-            .default_width(470.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                // The body scrolls and the buttons stay put, so adding a setting
-                // can never push them off the bottom edge of the dialog.
-                egui::ScrollArea::vertical()
-                    .max_height(560.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
+        // Room for the footer: a top-down scrolling body would happily take the
+        // whole window and push the Save/Cancel row out of sight. The embedded
+        // version hard-capped the body at 560 px, which a separate window must
+        // not do -- that would waste the height the user just resized.
+        let body_height = (ui.available_height() - 44.0).max(120.0);
+        egui::ScrollArea::vertical()
+            .max_height(body_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
                         theme::section(ui, &self.t("settings.section.general"));
                         ui.horizontal(|ui| {
                             ui.label(self.t("settings.language"));
@@ -1991,7 +1943,7 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                                 if ui.selectable_label(sel, self.t(k)).clicked() {
                                     self.settings.theme_mode = v.to_string();
                                     // Apply at once so the choice is visible.
-                                    theme::apply_setting(ctx, v);
+                                    theme::apply_setting(&self.ctx.clone(), v);
                                 }
                             }
                         });
@@ -2001,7 +1953,7 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                                 let sel = self.settings.ui_zoom == z;
                                 if ui.selectable_label(sel, self.t("settings.ui_zoom.percent").replace("{percent}", &z.to_string())).clicked() {
                                     self.settings.ui_zoom = z;
-                                    ctx.set_zoom_factor(z as f32 / 100.0);
+                                    self.ctx.set_zoom_factor(z as f32 / 100.0);
                                 }
                             }
                         });
@@ -2052,18 +2004,17 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
 
                         theme::section(ui, &self.t("settings.section.integration"));
                         // The label belongs *in* the checkbox: an empty label left
-                        // a stray ✓ floating above its own text.
+                        // a stray tick floating above its own text.
                         let associate_label = self.t("settings.shell.associate");
                         ui.checkbox(&mut self.settings.associate, associate_label);
                         theme::hint(ui, &self.t("settings.shell.assoc_hint"));
                         let menu_label = self.t("settings.shell.context_menu");
                         ui.checkbox(&mut self.settings.context_menu, menu_label);
-                        // What Windows currently resolves for archives, then the
-                        // one-click way to change it. Windows protects a
-                        // per-extension `UserChoice` against *programs* (it
-                        // cannot be written and cannot be deleted), but the user
-                        // can replace it in one click on the page below -- the
-                        // same route Bandizip and 7-Zip send people to.
+                        // Does Windows open archives with us? The button below is
+                        // the whole feature: it rewrites the OS's own recorded
+                        // handler for every format we claim -- hash and all -- so
+                        // nothing here sends the user off to a Settings page they
+                        // would have to work out by themselves.
                         let (status_key, status_exts) = self.assoc_status();
                         match status_exts {
                             Some(exts) => {
@@ -2074,79 +2025,13 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                                 ui.label(self.t(status_key));
                             }
                         }
-                        ui.horizontal(|ui| {
-                            if theme::primary_button(ui, &self.t("settings.shell.set_default")).clicked()
-                            {
-                                self.set_default_now();
-                            }
-                            if !self.assoc_blocked.is_empty()
-                                && ui.button(self.t("settings.shell.open_default_apps")).clicked()
-                            {
-                                open_default_apps_page();
-                            }
-                        });
-                        theme::hint(ui, &self.t("settings.shell.set_default.hint"));
-
-                        // Per-extension list, the way Bandizip's association
-                        // dialog works: a tick per format, what Windows currently
-                        // resolves for it, and -- where Windows has locked the
-                        // format to another program -- a button that opens the
-                        // system's own "你要如何打开此文件？" dialog. That dialog is
-                        // the only route that changes a locked choice, because the
-                        // *user* makes it there and Windows writes the protected
-                        // UserChoice itself.
-                        ui.add_space(4.0);
-                        ui.label(egui::RichText::new(self.t("settings.shell.per_ext")).strong());
-                        let mut open_dialog_for: Option<String> = None;
-                        egui::Grid::new("assoc-per-ext")
-                            .num_columns(3)
-                            .spacing([12.0, 4.0])
-                            .show(ui, |ui| {
-                                for i in 0..self.assoc_rows.len() {
-                                    let ext = self.assoc_rows[i].ext.clone();
-                                    let ours = self.assoc_rows[i].ours();
-                                    let blocked = self.assoc_rows[i].blocked_by.clone();
-                                    let mut ticked = self.extension_ticked(&ext);
-                                    if ui.checkbox(&mut ticked, format!(".{ext}")).changed() {
-                                        self.set_extension_ticked(&ext, ticked);
-                                    }
-                                    let state = if ours {
-                                        self.t("settings.shell.state_ours")
-                                    } else if let Some(prog) = &blocked {
-                                        self.t("settings.shell.state_blocked")
-                                            .replace("{progid}", prog)
-                                    } else if ticked {
-                                        self.t("settings.shell.state_pending")
-                                    } else {
-                                        self.t("settings.shell.state_off")
-                                    };
-                                    ui.label(state);
-                                    if blocked.is_some() {
-                                        if ui.button(self.t("settings.shell.pick_in_system")).clicked() {
-                                            open_dialog_for = Some(ext.clone());
-                                        }
-                                    } else {
-                                        ui.label("");
-                                    }
-                                    ui.end_row();
-                                }
-                            });
-                        ui.horizontal(|ui| {
-                            if ui.button(self.t("settings.shell.select_all")).clicked() {
-                                self.settings.assoc_extensions = zipnest_ipc::shell::SUPPORTED_EXTENSIONS
-                                    .iter()
-                                    .map(|e| (*e).to_string())
-                                    .collect();
-                            }
-                            if ui.button(self.t("settings.shell.select_none")).clicked() {
-                                self.settings.assoc_extensions.clear();
-                            }
-                            let hint = self.t("settings.shell.apply_hint");
-                            ui.label(egui::RichText::new(hint).weak());
-                        });
-                        if let Some(ext) = open_dialog_for {
-                            self.open_with_dialog_for(&ext);
+                        if self.settings.associate
+                            && theme::primary_button(ui, &self.t("settings.shell.set_default"))
+                                .clicked()
+                        {
+                            self.force_default_now();
                         }
+                        theme::hint(ui, &self.t("settings.shell.set_default.hint"));
 
                         theme::section(ui, &self.t("settings.section.about"));
                         let update_label = self.t("settings.auto_update");
@@ -2193,26 +2078,82 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                         if ui.button(self.t("settings.feedback.mail")).clicked() {
                             self.send_feedback_mail(ui.ctx());
                         }
-                    });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button(self.t("settings.save")).clicked() {
-                        save = true;
-                    }
-                    if ui.button(self.t("extract.cancel")).clicked() {
-                        close = true;
-                    }
-                });
-                // Enter saves, Escape closes — what a dialog is expected to do.
-                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    save = true;
-                }
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    close = true;
-                }
             });
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button(self.t("settings.save")).clicked() {
+                save = true;
+            }
+            if ui.button(self.t("extract.cancel")).clicked() {
+                close = true;
+            }
+        });
+        // Enter saves, Escape closes — what a window is expected to do.
+        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            save = true;
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
+        (save, close)
+    }
+
+    /// The Settings window.
+    ///
+    /// It is a **separate top-level OS window**, not an `egui::Window` drawn
+    /// inside the main one. An embedded dialog is trapped in the window that
+    /// hosts it: it gets clipped by the archive list behind it and its bottom
+    /// edge can fall outside the frame, so a long settings page ends up partly
+    /// invisible. A viewport of its own can be moved, resized, maximised and
+    /// covered independently, exactly like the settings of any other program.
+    ///
+    /// `show_viewport_immediate` falls back to an embedded `egui::Window` on a
+    /// backend without multi-viewport support (`ViewportClass::Embedded`), so
+    /// this still works everywhere.
+    fn settings_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let svc = self.svc.clone();
+        let title = self.t("settings.title");
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title.clone())
+            .with_inner_size([560.0, 700.0])
+            .with_min_inner_size([430.0, 320.0])
+            .with_resizable(true);
+        let (save, close) = ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("zipnest-settings"),
+            builder,
+            |ctx, class| {
+                // Windows creates the new window behind the main one; ask once
+                // per opening for it to come to the front.
+                if !self.settings_raised && class != egui::ViewportClass::Embedded {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.settings_raised = true;
+                }
+                // The window's own close button; not drawing it again closes it.
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    return (false, true);
+                }
+                if class == egui::ViewportClass::Embedded {
+                    egui::Window::new(title.clone())
+                        .collapsible(false)
+                        .resizable(false)
+                        .default_width(470.0)
+                        .show(ctx, |ui| self.settings_window_ui(ui))
+                        .and_then(|r| r.inner)
+                        .unwrap_or((false, false))
+                } else {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| self.settings_window_ui(ui))
+                        .inner
+                }
+            },
+        );
         if close {
             self.show_settings = false;
+            // Next time the window is opened it must raise itself again.
+            self.settings_raised = false;
         }
         if save {
             let assoc = self.settings.associate;
@@ -2236,13 +2177,19 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                     // the registry holds.
                     self.settings.associate = r.associate;
                     self.settings.context_menu = r.context_menu;
-                    // Extensions Windows keeps for another program stay
-                    // visibly unresolved instead of looking registered.
-                    self.assoc_blocked = r.blocked;
                     self.notice = r.warnings.first().cloned();
+                    // Registering `Classes` is only half of it: where Windows
+                    // has already recorded a handler for a format, the OS keeps
+                    // using that until the record itself is replaced.
+                    if assoc {
+                        let failed = claim_default_formats(&self.settings.assoc_extensions);
+                        if !failed.is_empty() && self.notice.is_none() {
+                            self.notice = Some("settings.shell.claim_partial".into());
+                        }
+                    }
                     // The rows are a snapshot of the registry: re-read them so
-                    // the table shows the result of this very save.
-                    self.refresh_assoc_rows();
+                    // the status line reflects this very save.
+                    self.refresh_assoc_status();
                 }
                 Err(e) => self.notice = Some(e.key),
             }
@@ -2262,8 +2209,6 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                 self.lang = self.settings.language.clone();
             }
             self.show_settings = false;
-        } else {
-            self.show_settings = open;
         }
     }
 

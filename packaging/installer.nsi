@@ -1,9 +1,9 @@
-﻿; ZipNest 0.4.12 native installer (NSIS Unicode)
+﻿; ZipNest 0.4.13 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.4.12"
+!define VERSION "0.4.13"
 ; This installer is a 32-bit process, so plain $PROGRAMFILES would resolve to
 ; "C:\Program Files (x86)" on 64-bit Windows. ZipNest ships as x64, so force
 ; the 64-bit location. InstallDirRegKey below still reads HKCU\...\ZipNest's
@@ -39,13 +39,15 @@ Unicode True
 ; user goes looking for "默认程序" by hand — the same thing 7-Zip/WinRAR/Bandizip
 ; installers do. This installer is elevated anyway.
 ;
-; Measured on the maintainer's box (Windows 10 26H1, build 28020): the
-; IApplicationAssociationRegistrationUI API that ZipNest's 「一键设为默认」button
-; calls first returns E_INVALIDARG (0x80070057) for *every* name tried,
-; including machine-wide ones like Microsoft Edge — that build has no working
-; classic page at all. So this entry is for the manual route only; the button
-; falls back to the `ms-settings:` page, which is the path that works there (and
-; on Windows 11 the same link is scoped to ZipNest).
+; Measured on the maintainer's box (Windows 11 26H1, build 28020): the classic
+; IApplicationAssociationRegistrationUI page was removed from that build (it
+; answers E_INVALIDARG for every name, including machine-wide ones such as
+; Microsoft Edge), and Windows' own "set default apps" page is a dead end for a
+; normal user. That is why v0.4.13 stopped sending people there: the app writes
+; the per-user association record itself (delete the protected key, recreate it
+; with a computed hash — see crates/zipnest-ipc/src/user_choice.rs). This
+; machine-wide entry stays so ZipNest is listed in Windows' 默认应用 page, which
+; remains the supported way for the *user* to hand a format back.
 ;
 ; One macro per extension, expanded explicitly below: NSIS has no arrays.
 !macro ZN_HKLM_CAPABILITIES ext
@@ -57,7 +59,7 @@ Unicode True
 !macroend
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.4.12_x64-setup.exe"
+OutFile "ZipNest_0.4.13_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -315,27 +317,27 @@ zn_assoc_new_enough:
   ReadRegStr $0 HKCU "Software\Classes\.zip" ""
   StrCmp $0 "ZipNest.zip" zn_assoc_ours zn_assoc_missing
 zn_assoc_missing:
-  DetailPrint "自动注册没有生效（可能是系统策略），可在 ZipNest 设置 → 集成里手动开启"
+  DetailPrint "自动注册没有生效（可能是系统策略），可在 ZipNest 设置 → 系统集成里手动开启"
   Goto zn_assoc_done
 zn_assoc_ours:
   ; The Classes default is *our own* value, so on its own it proves only that
-  ; the write worked. What actually decides a double-click is Windows' locked-in
-  ; per-extension choice, which no program may change. Read it too, and do not
-  ; claim success we cannot back up.
+  ; the write worked. What actually decides a double-click is Windows' per
+  ; extension record, which since v0.4.13 the app rewrites itself (delete the
+  ; protected key, recreate it with a computed hash). Read it back and report
+  ; the truth instead of claiming success we cannot back up.
   ReadRegStr $1 HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.zip\UserChoice" "ProgId"
-  StrCmp $1 "" zn_assoc_registered
-  StrCmp $1 "ZipNest.zip" zn_assoc_registered
-  DetailPrint "已登记，但系统已把 .zip 记住给了别的程序（$1）：请在 ZipNest 设置 → 集成里点「一键设为默认解压软件」，或到系统「默认应用」里改一次"
+  StrCmp $1 "ZipNest.zip" zn_assoc_registered zn_assoc_other
+zn_assoc_other:
+  DetailPrint "已登记，但 .zip 的默认程序仍是 $1；可在 ZipNest 设置 → 系统集成里点「设为默认解压软件」再试一次"
   Goto zn_assoc_done
 zn_assoc_registered:
-  DetailPrint "已把 ZipNest 登记为压缩包默认打开方式"
+  DetailPrint "已把 ZipNest 设为压缩包的默认打开程序"
 zn_assoc_done:
 
-  ; Machine-wide capabilities, so the one-click "make ZipNest the default" button
-  ; in the app can reach the classic Set Program Associations page (see the
-  ; ZN_HKLM_CAPABILITIES comment). Failing here is not fatal: the per-user half
-  ; above already makes ZipNest the handler on machines with no competing choice,
-  ; and the app falls back to the Settings deep link.
+  ; Machine-wide capabilities, so ZipNest shows up in Windows' own 默认应用
+  ; page (see the ZN_HKLM_CAPABILITIES comment) and the user always has a
+  ; supported way to hand a format back to another program. Failing here is not
+  ; fatal: the per-user half above is what makes ZipNest the handler.
   ClearErrors
   DetailPrint "登记系统「默认程序」条目…"
   !insertmacro ZN_HKLM_CAPABILITIES zip
@@ -348,7 +350,7 @@ zn_assoc_done:
   !insertmacro ZN_HKLM_CAPABILITIES xz
   !insertmacro ZN_HKLM_CAPABILITIES iso
   IfErrors 0 zn_hklm_ok
-    DetailPrint "系统『默认程序』条目写入被拒绝（权限或策略），一键设为默认会退回到打开系统设置页面"
+    DetailPrint "系统『默认程序』条目写入被拒绝（权限或策略），不影响压缩包默认打开方式"
   zn_hklm_ok:
 
 ; Register the Windows 11 context menu (per-user; ignored on Windows 10).

@@ -45,7 +45,18 @@ function Find-MakeAppx {
 Write-Host 'Building zipnest-shell (release)...'
 Push-Location $repo
 try {
-    cargo build -p zipnest-shell --release
+    # cargo writes progress and warnings to stderr, and PowerShell 5.1 turns a
+    # native command's stderr into a *terminating* error under the
+    # `$ErrorActionPreference = 'Stop'` above -- so a single benign linker
+    # warning (LNK4104 on the COM exports) aborted the whole packaging run and
+    # left the MSIX unbuilt. The exit code is what decides here.
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        cargo build -p zipnest-shell --release
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
 } finally {
     Pop-Location

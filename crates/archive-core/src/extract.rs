@@ -39,7 +39,7 @@ const BLOCK_NONE: u8 = 0;
 const BLOCK_QUOTA: u8 = 2;
 
 // ===========================================================================
-// In-memory output stream (ISequentialOutStream) 鈥?used by read_entry
+// In-memory output stream (ISequentialOutStream) — used by read_entry
 // ===========================================================================
 
 struct SinkState {
