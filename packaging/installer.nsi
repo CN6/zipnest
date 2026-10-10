@@ -203,12 +203,15 @@ zn_copy_files:
   File "..\dist-portable\ZipNest\engines\sfx\7z.sfx"
   File "..\dist-portable\ZipNest\engines\sfx\7zCon.sfx"
   SetOutPath "$INSTDIR\licenses"
-  File "..\dist-portable\ZipNest\licenses\7zip.txt"
+  ; /nonfatal: these three are documentation, not payload. A missing one must not
+  ; abort a release (CI's first run did exactly that, because the emit script had
+  ; skipped THIRD-PARTY.txt); emit-portable.ps1 now always writes it.
+  File /nonfatal "..\dist-portable\ZipNest\licenses\7zip.txt"
   ; The SFX stubs are 7-Zip binaries too and carry a different license text
   ; (LGPL/BSD-style, binary distribution) than the engine's; the third-party file
   ; collects the Rust dependencies' texts.
-  File "..\dist-portable\ZipNest\licenses\7zip-sfx.txt"
-  File "..\dist-portable\ZipNest\licenses\THIRD-PARTY.txt"
+  File /nonfatal "..\dist-portable\ZipNest\licenses\7zip-sfx.txt"
+  File /nonfatal "..\dist-portable\ZipNest\licenses\THIRD-PARTY.txt"
 
   ; Windows 11 modern context menu: per-user signed sparse package.
   ; zipnest_shell.dll stays in the install dir (the package's external location);

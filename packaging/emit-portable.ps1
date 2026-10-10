@@ -27,11 +27,10 @@
 .PARAMETER SkipWin11Shell
     Do not build/stage the Windows 11 shell package.
 
-.PARAMETER ThirdParty
-    Also write licenses\THIRD-PARTY.txt from the crate sources in the local
-    cargo registry. Skipped silently (with a warning) when the registry is not
-    present — the text is only reproducible on a machine that has built the
-    project once.
+.PARAMETER NoThirdParty
+    Skip generating licenses\THIRD-PARTY.txt from the local cargo registry. It is
+    written by default because installer.nsi packages it, and a missing file
+    abort the NSIS compile; this switch writes a short pointer file instead.
 
 .EXAMPLE
     powershell -File packaging\emit-portable.ps1
@@ -40,7 +39,7 @@
 param(
     [string]$RepoRoot,
     [switch]$SkipWin11Shell,
-    [switch]$ThirdParty
+    [switch]$NoThirdParty
 )
 
 $ErrorActionPreference = 'Stop'
@@ -72,6 +71,19 @@ function Copy-Payload {
     Write-Host ("  {0,-38} <- {1}" -f (Split-Path -Leaf $To), $From)
 }
 
+# installer.nsi packages licenses\THIRD-PARTY.txt, and NSIS aborts on a `File` it
+# cannot find, so the payload must always contain it - even when the license
+# texts themselves cannot be collected.
+function Write-PointerFile {
+    $note = @(
+        'The third-party license texts were not collected for this payload.',
+        'They are reproducible from the repository:',
+        '  packaging\emit-portable.ps1   writes this file from the local cargo registry',
+        '  Cargo.lock                    lists the exact crate versions'
+    ) -join "`r`n"
+    [System.IO.File]::WriteAllText((Join-Path $licenses 'THIRD-PARTY.txt'), $note, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 Copy-Payload $exe (Join-Path $portable 'zipnest.exe')
 Copy-Payload (Join-Path $repo 'vendor\7zip-bin\7z.dll') (Join-Path $engines '7z.dll')
 Copy-Payload (Join-Path $repo 'vendor\7zip-sfx\7z.sfx') (Join-Path $sfx '7z.sfx')
@@ -80,13 +92,18 @@ Copy-Payload (Join-Path $repo 'vendor\7zip-sfx\7zCon.sfx') (Join-Path $sfx '7zCo
 Copy-Payload (Join-Path $repo 'vendor\7zip-sdk\LICENSE') (Join-Path $licenses '7zip.txt')
 Copy-Payload (Join-Path $repo 'vendor\7zip-sfx\LICENSE.txt') (Join-Path $licenses '7zip-sfx.txt')
 
-if ($ThirdParty) {
+if ($NoThirdParty) {
+    Write-PointerFile
+    Write-Host '  licenses\THIRD-PARTY.txt  <- pointer only (-NoThirdParty)'
+} else {
     $registry = Join-Path $env:USERPROFILE '.cargo\registry\src'
     $lock = Join-Path $repo 'Cargo.lock'
     if (-not (Test-Path -LiteralPath $registry)) {
-        Write-Warning "no cargo registry at $registry; skipping licenses\THIRD-PARTY.txt"
+        Write-Warning "no cargo registry at $registry; writing a pointer file instead of the license texts"
+        Write-PointerFile
     } elseif (-not (Test-Path -LiteralPath $lock)) {
-        Write-Warning "no Cargo.lock; skipping licenses\THIRD-PARTY.txt"
+        Write-Warning "no Cargo.lock; writing a pointer file instead of the license texts"
+        Write-PointerFile
     } else {
         $out = Join-Path $licenses 'THIRD-PARTY.txt'
         $names = Select-String -Path $lock -Pattern '^name = "(.+)"$' |
