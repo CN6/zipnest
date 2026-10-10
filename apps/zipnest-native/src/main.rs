@@ -2144,6 +2144,15 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                         .and_then(|r| r.inner)
                         .unwrap_or((false, false))
                 } else {
+                    // eframe clears an immediate viewport with `[0,0,0,0]`
+                    // rather than the app's clear colour, so anything this
+                    // window does not paint itself would be left transparent
+                    // (and would keep whatever the compositor put behind it).
+                    // Fill the whole viewport first, then let the panel paint on
+                    // top of a known, opaque background.
+                    let rect = ctx.screen_rect();
+                    ctx.layer_painter(egui::LayerId::background())
+                        .rect_filled(rect, 0.0, ctx.style().visuals.panel_fill);
                     egui::CentralPanel::default()
                         .show(ctx, |ui| self.settings_window_ui(ui))
                         .inner
