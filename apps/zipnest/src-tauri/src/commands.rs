@@ -106,7 +106,7 @@ pub fn shell_register(
     let exe = std::env::current_exe().map_err(|_| IpcError::new("error.io"))?;
     svc.shell_register(
         &exe,
-        ShellOptions { associate, context_menu },
+        ShellOptions { associate, context_menu, extensions: Vec::new() },
         &zipnest_ipc::shell::WindowsRegistry,
         &zipnest_ipc::shell::WindowsRegistry,
     )

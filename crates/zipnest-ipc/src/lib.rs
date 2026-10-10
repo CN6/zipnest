@@ -15,7 +15,7 @@ pub use diagnostics::{mailto_url, Diagnostics};
 pub use error::IpcError;
 pub use service::{CreateRequest, EntryDto, IpcService, OpenArchiveResult};
 pub use settings::{Settings, SettingsPatch, SettingsStore};
-pub use shell::{ShellApplier, ShellOptions, ShellRegisterResult};
+pub use shell::{AssocState, ShellApplier, ShellOptions, ShellRegisterResult};
 
 /// Whether the unpacking engine can be loaded right now.
 ///

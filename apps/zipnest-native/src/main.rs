@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.11";
+const CURRENT_VERSION: &str = "0.4.12";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 /// Derived from [`CURRENT_VERSION`] on purpose: a hand-typed string here sat at
 /// `0.4.0` for ten releases (the release checklist asked for it every time and
@@ -282,9 +282,22 @@ fn integration_plan(
         return None;
     }
     Some(if settings.integration_applied {
-        ShellOptions { associate: settings.associate, context_menu: settings.context_menu }
+        ShellOptions {
+            associate: settings.associate,
+            context_menu: settings.context_menu,
+            // The user's per-extension ticks; the default is all nine.
+            extensions: settings.assoc_extensions.clone(),
+        }
     } else {
-        ShellOptions { associate: true, context_menu: true }
+        // Never claimed before: everything we ship a handler for.
+        ShellOptions {
+            associate: true,
+            context_menu: true,
+            extensions: zipnest_ipc::shell::SUPPORTED_EXTENSIONS
+                .iter()
+                .map(|e| (*e).to_string())
+                .collect(),
+        }
     })
 }
 
@@ -594,6 +607,13 @@ struct App {
     /// keeps the other handler until the user changes it in the system Default
     /// apps page, so the Settings dialog explains it and offers the deep link.
     assoc_blocked: Vec<String>,
+    /// Per-extension state for the Settings table (registered? locked to
+    /// somebody else?), re-read whenever the dialog opens, after a save, and
+    /// when a system "open with" dialog has been dealt with.
+    assoc_rows: Vec<zipnest_ipc::shell::AssocState>,
+    /// Set by the worker that opened a system association dialog once the user
+    /// has had time to answer it; the UI re-reads the table when it turns true.
+    assoc_rows_dirty: Arc<Mutex<bool>>,
     show_donate: bool,
     /// A help hint the user clicked on: `(field label, explanation)`.
     help_popup: Option<(String, String)>,
@@ -655,6 +675,9 @@ fn new(
             settings.integration_applied = true;
         }
         let assoc_blocked = boot.map(|r| r.blocked).unwrap_or_default();
+        // Read the per-extension table once up front: the Settings dialog also
+        // refreshes it when it opens, but it must never be blank on first look.
+        let assoc_rows = zipnest_ipc::shell::assoc_states(&zipnest_ipc::shell::WindowsRegistry);
         // Theme: light, dark, or whatever the system is set to. Applied here
         // rather than next to install_fonts because it needs the settings.
         theme::apply_setting(&cc.egui_ctx, &settings.theme_mode);
@@ -750,6 +773,8 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             create_sfx: false,
             show_settings: false,
             assoc_blocked,
+            assoc_rows,
+            assoc_rows_dirty: Default::default(),
             show_donate: false,
             help_popup: None,
             qr_wechat,
@@ -831,6 +856,74 @@ fn t(&self, key: &str) -> String {
     fn refresh_assoc_status(&mut self) {
         self.assoc_blocked =
             zipnest_ipc::shell::blocked_extensions(&zipnest_ipc::shell::WindowsRegistry);
+        self.refresh_assoc_rows();
+    }
+
+    /// The per-extension table: registered? locked to somebody else?
+    fn refresh_assoc_rows(&mut self) {
+        self.assoc_rows = zipnest_ipc::shell::assoc_states(&zipnest_ipc::shell::WindowsRegistry);
+    }
+
+    /// Is this extension in the ticked set?
+    ///
+    /// The list is explicit (all nine on a fresh profile), so "nothing ticked"
+    /// is a real state rather than an alias for "everything".
+    fn extension_ticked(&self, ext: &str) -> bool {
+        self.settings
+            .assoc_extensions
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(ext))
+    }
+
+    fn set_extension_ticked(&mut self, ext: &str, ticked: bool) {
+        let mut list: Vec<String> = self
+            .settings
+            .assoc_extensions
+            .iter()
+            .filter(|e| !e.eq_ignore_ascii_case(ext))
+            .cloned()
+            .collect();
+        if ticked {
+            list.push(ext.to_string());
+        }
+        // Canonical order keeps the file and the dialog readable.
+        self.settings.assoc_extensions = zipnest_ipc::shell::normalise_extensions(&list);
+    }
+
+    /// Open the system's "你要如何打开此文件？" dialog for one extension.
+    ///
+    /// This is the route that works where a `UserChoice` already belongs to
+    /// another program: Windows protects that key against *programs* but accepts
+    /// the user's own choice in this dialog, hash and all, so nothing here
+    /// fights the OS.
+    ///
+    /// Off the UI thread (the dialog is modal), then re-read the table: if the
+    /// user ticked "始终", that extension flips to ours without a restart.
+    /// Falls back to the classic `OpenAs_RunDLL` entry point, and then to the
+    /// Settings page, when the shell refuses.
+    fn open_with_dialog_for(&mut self, ext: &str) {
+        self.notice = Some("settings.shell.pick_in_system.opening".into());
+        let ext = ext.to_string();
+        let ctx = self.ctx.clone();
+        let dirty = Arc::clone(&self.assoc_rows_dirty);
+        std::thread::spawn(move || {
+            let opened = zipnest_ipc::shell::open_with_dialog_for(&ext).is_ok();
+            if !opened {
+                match zipnest_ipc::shell::open_with_rundll_command(&ext) {
+                    Some((program, args)) => {
+                        let _ = std::process::Command::new(program).args(args).spawn();
+                    }
+                    None => open_default_apps_page(),
+                }
+            }
+            // The dialog is modal, and the worker cannot know when the user
+            // closes it: wait a little, then have the UI re-read the table so the
+            // row flips as soon as Windows recorded the choice.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            *dirty.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            ctx.request_repaint();
+        });
+        self.refresh_assoc_rows();
     }
 
     /// "One click to default": hand the user Windows' own default-programs page
@@ -928,7 +1021,14 @@ fn t(&self, key: &str) -> String {
 
     /// Drain job events emitted by the service into UI state.
     fn poll_jobs(&mut self) {
-        let pending: Vec<_> = self.jobs.lock().unwrap().drain(..).collect();
+        // A worker opened a system association dialog for us and the user has
+        // had time to answer it: re-read the per-extension table so a row turns
+        // into "ours" without restarting anything.
+        if *self.assoc_rows_dirty.lock().unwrap_or_else(|e| e.into_inner()) {
+            *self.assoc_rows_dirty.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            self.refresh_assoc_status();
+        }
+        let pending: Vec<_> = self.jobs.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
         for (name, payload) in pending {
             match name.as_str() {
                 "job_progress" => {
@@ -1871,7 +1971,7 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                 // The body scrolls and the buttons stay put, so adding a setting
                 // can never push them off the bottom edge of the dialog.
                 egui::ScrollArea::vertical()
-                    .max_height(420.0)
+                    .max_height(560.0)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         theme::section(ui, &self.t("settings.section.general"));
@@ -1987,6 +2087,67 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                         });
                         theme::hint(ui, &self.t("settings.shell.set_default.hint"));
 
+                        // Per-extension list, the way Bandizip's association
+                        // dialog works: a tick per format, what Windows currently
+                        // resolves for it, and -- where Windows has locked the
+                        // format to another program -- a button that opens the
+                        // system's own "你要如何打开此文件？" dialog. That dialog is
+                        // the only route that changes a locked choice, because the
+                        // *user* makes it there and Windows writes the protected
+                        // UserChoice itself.
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(self.t("settings.shell.per_ext")).strong());
+                        let mut open_dialog_for: Option<String> = None;
+                        egui::Grid::new("assoc-per-ext")
+                            .num_columns(3)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                for i in 0..self.assoc_rows.len() {
+                                    let ext = self.assoc_rows[i].ext.clone();
+                                    let ours = self.assoc_rows[i].ours();
+                                    let blocked = self.assoc_rows[i].blocked_by.clone();
+                                    let mut ticked = self.extension_ticked(&ext);
+                                    if ui.checkbox(&mut ticked, format!(".{ext}")).changed() {
+                                        self.set_extension_ticked(&ext, ticked);
+                                    }
+                                    let state = if ours {
+                                        self.t("settings.shell.state_ours")
+                                    } else if let Some(prog) = &blocked {
+                                        self.t("settings.shell.state_blocked")
+                                            .replace("{progid}", prog)
+                                    } else if ticked {
+                                        self.t("settings.shell.state_pending")
+                                    } else {
+                                        self.t("settings.shell.state_off")
+                                    };
+                                    ui.label(state);
+                                    if blocked.is_some() {
+                                        if ui.button(self.t("settings.shell.pick_in_system")).clicked() {
+                                            open_dialog_for = Some(ext.clone());
+                                        }
+                                    } else {
+                                        ui.label("");
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            if ui.button(self.t("settings.shell.select_all")).clicked() {
+                                self.settings.assoc_extensions = zipnest_ipc::shell::SUPPORTED_EXTENSIONS
+                                    .iter()
+                                    .map(|e| (*e).to_string())
+                                    .collect();
+                            }
+                            if ui.button(self.t("settings.shell.select_none")).clicked() {
+                                self.settings.assoc_extensions.clear();
+                            }
+                            let hint = self.t("settings.shell.apply_hint");
+                            ui.label(egui::RichText::new(hint).weak());
+                        });
+                        if let Some(ext) = open_dialog_for {
+                            self.open_with_dialog_for(&ext);
+                        }
+
                         theme::section(ui, &self.t("settings.section.about"));
                         let update_label = self.t("settings.auto_update");
                         ui.checkbox(&mut self.settings.auto_check_update, update_label);
@@ -2059,7 +2220,12 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
             let exe = std::env::current_exe().unwrap_or_default();
             match svc.shell_register(
                 &exe,
-                ShellOptions { associate: assoc, context_menu: menu },
+                ShellOptions {
+                    associate: assoc,
+                    context_menu: menu,
+                    // The ticked extensions; unticked ones are released.
+                    extensions: self.settings.assoc_extensions.clone(),
+                },
                 &zipnest_ipc::shell::WindowsRegistry,
                 &zipnest_ipc::shell::WindowsRegistry,
             ) {
@@ -2074,8 +2240,11 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                     // visibly unresolved instead of looking registered.
                     self.assoc_blocked = r.blocked;
                     self.notice = r.warnings.first().cloned();
+                    // The rows are a snapshot of the registry: re-read them so
+                    // the table shows the result of this very save.
+                    self.refresh_assoc_rows();
                 }
-                Err(_) => self.notice = Some("error.io".into()),
+                Err(e) => self.notice = Some(e.key),
             }
             let _ = svc.settings_set(SettingsPatch {
                 language: Some(self.settings.language.clone()),
@@ -3400,6 +3569,7 @@ mod create_form_tests {
 #[cfg(test)]
 mod integration_tests {
     use super::{integration_plan, ShellOptions};
+
     fn settings(applied: bool, associate: bool, context_menu: bool) -> zipnest_ipc::Settings {
         zipnest_ipc::Settings {
             integration_applied: applied,
@@ -3409,13 +3579,24 @@ mod integration_tests {
         }
     }
 
+    /// Every extension we ship a handler for: what a fresh profile claims.
+    fn all_exts() -> Vec<String> {
+        zipnest_ipc::shell::SUPPORTED_EXTENSIONS
+            .iter()
+            .map(|e| (*e).to_string())
+            .collect()
+    }
+
     #[test]
     fn a_fresh_machine_is_claimed_even_if_the_flags_were_off() {
         // The v0.4.7 file on a real machine says `associate: false` because
         // that used to be the default. Treating it as a decision is exactly how
         // a fresh install stayed unclaimed; the first claim ignores it.
         let plan = integration_plan(&settings(false, false, false), false).unwrap();
-        assert_eq!(plan, ShellOptions { associate: true, context_menu: true });
+        assert_eq!(
+            plan,
+            ShellOptions { associate: true, context_menu: true, extensions: all_exts() }
+        );
     }
 
     #[test]
@@ -3432,13 +3613,32 @@ mod integration_tests {
         // missing, using the settings the user already has. Without this, a
         // reinstall could never bring the associations back.
         let plan = integration_plan(&settings(true, true, true), true).unwrap();
-        assert_eq!(plan, ShellOptions { associate: true, context_menu: true });
+        assert_eq!(
+            plan,
+            ShellOptions { associate: true, context_menu: true, extensions: all_exts() }
+        );
         // ... and an explicit opt-out still wins over the installer.
         let off = integration_plan(&settings(true, false, false), true).unwrap();
-        assert_eq!(off, ShellOptions { associate: false, context_menu: false });
+        assert_eq!(
+            off,
+            ShellOptions { associate: false, context_menu: false, extensions: all_exts() }
+        );
         // Half-registered is a state the user can legitimately choose.
         let partial = integration_plan(&settings(true, true, false), true).unwrap();
-        assert_eq!(partial, ShellOptions { associate: true, context_menu: false });
+        assert_eq!(
+            partial,
+            ShellOptions { associate: true, context_menu: false, extensions: all_exts() }
+        );
+    }
+
+    #[test]
+    fn a_per_extension_selection_is_reapplied_verbatim() {
+        // Someone who keeps .tar with their own tools must get exactly that
+        // back after a reinstall, not "all archives".
+        let mut s = settings(true, true, true);
+        s.assoc_extensions = vec!["zip".to_string(), "7z".to_string()];
+        let plan = integration_plan(&s, true).unwrap();
+        assert_eq!(plan.extensions, vec!["zip".to_string(), "7z".to_string()]);
     }
 }
 

@@ -351,7 +351,13 @@ impl IpcService {
 
         let mut blocked = Vec::new();
         let associate_ok = if opts.associate {
-            let ok = applier.run(&shell::assoc_ops(exe)).is_ok();
+            // The ticked set decides what we claim; "everything we ship a handler
+            // for" is the default (installer, first run, fresh profile). An
+            // explicitly empty list is a real state: claim nothing, but stay
+            // listed in 打开方式 so the user can pick ZipNest by hand.
+            let wanted = shell::normalise_extensions(&opts.extensions);
+            let wanted: Vec<&str> = wanted.iter().map(|e| e.as_str()).collect();
+            let ok = applier.run(&shell::assoc_ops_for(exe, &wanted)).is_ok();
             if !ok {
                 warnings.push("error.shell.associate".into());
             }
@@ -679,6 +685,11 @@ mod tests {
         fn user_choice_progid(&self, _ext: &str) -> Option<String> {
             None
         }
+        fn classes_default(&self, ext: &str) -> Option<String> {
+            // Pretend we registered everything, so `registered` is true and the
+            // rows differ only by `UserChoice`.
+            Some(format!("ZipNest.{ext}"))
+        }
     }
 
     /// A machine where `.zip` is locked to another archiver, the situation the
@@ -688,6 +699,9 @@ mod tests {
     impl AssocProbe for ZipLockedToAnother {
         fn user_choice_progid(&self, ext: &str) -> Option<String> {
             (ext == "zip").then(|| "Bandizip.zip".to_string())
+        }
+        fn classes_default(&self, ext: &str) -> Option<String> {
+            Some(format!("ZipNest.{ext}"))
         }
     }
 
@@ -729,7 +743,16 @@ mod tests {
         let out = svc
             .shell_register(
                 exe,
-                ShellOptions { associate: true, context_menu: false },
+                // The ticked set decides what is claimed; this test wants the
+                // usual "all archives" behaviour.
+                ShellOptions {
+                    associate: true,
+                    context_menu: false,
+                    extensions: crate::shell::SUPPORTED_EXTENSIONS
+                        .iter()
+                        .map(|e| (*e).to_string())
+                        .collect(),
+                },
                 &rec,
                 &NoChoice,
             )
@@ -773,7 +796,7 @@ mod tests {
         let out = svc
             .shell_register(
                 exe,
-                ShellOptions { associate: true, context_menu: false },
+                ShellOptions { associate: true, context_menu: false, extensions: Vec::new() },
                 &rec,
                 &ZipLockedToAnother,
             )
@@ -790,7 +813,7 @@ mod tests {
         let out = svc
             .shell_register(
                 exe,
-                ShellOptions { associate: true, context_menu: true },
+                ShellOptions { associate: true, context_menu: true, extensions: Vec::new() },
                 &PartialFail,
                 &NoChoice,
             )

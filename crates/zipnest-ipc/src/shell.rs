@@ -13,10 +13,15 @@ pub const SUPPORTED_EXTENSIONS: [&str; 9] =
     ["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "iso"];
 
 /// Which parts of the integration to (un)register.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ShellOptions {
     pub associate: bool,
     pub context_menu: bool,
+    /// Which extensions to claim as default. Empty means "all supported", which
+    /// is what the installer and the first-run bootstrap ask for; the Settings
+    /// dialog sends the ticked subset.
+    #[serde(default)]
+    pub extensions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +85,23 @@ const APP_EXE_NAME: &str = "zipnest.exe";
 
 fn prog_id(ext: &str) -> String {
     format!("ZipNest.{ext}")
+}
+
+/// Canonicalise a user-chosen extension list: lower case, only supported
+/// extensions, no duplicates, in [`SUPPORTED_EXTENSIONS`] order.
+///
+/// Used on the way in (settings) and on the way out (registry ops), so a
+/// hand-edited `settings.json` can never register something we do not ship a
+/// handler for.
+pub fn normalise_extensions(list: &[String]) -> Vec<String> {
+    SUPPORTED_EXTENSIONS
+        .iter()
+        .filter(|ext| {
+            list.iter()
+                .any(|want| want.trim().trim_start_matches('.').eq_ignore_ascii_case(ext))
+        })
+        .map(|ext| (*ext).to_string())
+        .collect()
 }
 
 /// `HKCU\Software\Classes\Applications\zipnest.exe` — what puts ZipNest in the
@@ -172,11 +194,22 @@ fn open_command(exe: &std::path::Path) -> String {
 ///   is the only place a user can hand it an extension whose `UserChoice`
 ///   already belongs to another program.
 pub fn assoc_ops(exe: &std::path::Path) -> Vec<RegOp> {
+    assoc_ops_for(exe, &SUPPORTED_EXTENSIONS)
+}
+
+/// Same, for a chosen subset of extensions.
+///
+/// The per-extension selection exists because "all archives" is not what
+/// everybody wants: someone may keep `.tar` with their dev tools and still want
+/// `.zip` to open here. The unregister direction always clears all nine, so a
+/// subset can never leave a stray handler behind.
+pub fn assoc_ops_for(exe: &std::path::Path, exts: &[&str]) -> Vec<RegOp> {
     let icon = format!("{},0", quoted(exe));
     let cmd = open_command(exe);
     let app = app_key();
     let mut ops = Vec::new();
-    for ext in SUPPORTED_EXTENSIONS {
+    for ext in exts {
+        let ext = *ext;
         let pid = prog_id(ext);
         ops.push(RegOp::set(
             format!(r"{CLASSES}\{pid}"),
@@ -208,10 +241,27 @@ pub fn assoc_ops(exe: &std::path::Path) -> Vec<RegOp> {
             "",
         ));
     }
+    // Extensions the caller did NOT tick: release the ones we still hold, so
+    // unticking a box really gives that extension back (only while the recorded
+    // default is ours -- never someone else's value). ZipNest stays listed in
+    // "打开方式" and in 默认应用 for them, which is how the user can come back.
+    for ext in SUPPORTED_EXTENSIONS {
+        if exts.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+            continue;
+        }
+        ops.push(RegOp::DeleteValueIfEquals {
+            key: format!(r"{CLASSES}\.{ext}"),
+            name: None,
+            expect: prog_id(ext),
+        });
+    }
     // The application entry itself: one key, shared by every extension.
     ops.push(RegOp::set(format!(r"{app}\FriendlyAppName"), None, "ZipNest"));
     ops.push(RegOp::set(format!(r"{app}\shell\open\command"), None, cmd));
     // Capabilities + the RegisteredApplications pointer that exposes them.
+    // Always all nine: this is the list Windows shows in "默认应用" and in the
+    // "open with" dialog, i.e. the way *back* to ZipNest even for an extension
+    // the user did not tick here.
     ops.push(RegOp::set(CAPABILITIES, None, REGISTERED_APP_NAME));
     ops.push(RegOp::set(
         format!(r"{CAPABILITIES}\ApplicationName"),
@@ -364,6 +414,116 @@ pub trait AssocProbe {
     /// The `UserChoice` ProgID locked in for `ext`. `None` means "no choice
     /// recorded" (our registration wins) or "unreadable".
     fn user_choice_progid(&self, ext: &str) -> Option<String>;
+
+    /// The ProgID recorded as the extension's default under
+    /// `HKCU\Software\Classes\.<ext>`, i.e. what we last wrote there.
+    fn classes_default(&self, ext: &str) -> Option<String>;
+}
+
+/// One row of the per-extension table the Settings dialog shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AssocState {
+    pub ext: String,
+    /// Our ProgID is still the recorded default in `HKCU\Software\Classes`.
+    pub registered: bool,
+    /// Windows has locked this extension to someone else (`UserChoice`). Only
+    /// the user can change that, from the OS dialog or Settings — which is what
+    /// the per-row button opens.
+    pub blocked_by: Option<String>,
+}
+
+impl AssocState {
+    /// Is ZipNest what Windows will actually use for this extension?
+    pub fn ours(&self) -> bool {
+        self.registered && self.blocked_by.is_none()
+    }
+
+    /// Does this row need the user to decide something in the OS?
+    pub fn needs_user_choice(&self) -> bool {
+        self.blocked_by.is_some()
+    }
+}
+
+/// The full per-extension picture, in [`SUPPORTED_EXTENSIONS`] order.
+///
+/// This is what makes the Settings dialog honest: a tick in a checkbox means
+/// "asked for", while this says what Windows actually resolved.
+pub fn assoc_states(probe: &dyn AssocProbe) -> Vec<AssocState> {
+    SUPPORTED_EXTENSIONS
+        .iter()
+        .map(|ext| {
+            let registered = probe
+                .classes_default(ext)
+                .map(|v| v.eq_ignore_ascii_case(&prog_id(ext)))
+                .unwrap_or(false);
+            let choice = probe.user_choice_progid(ext);
+            let blocked_by = if user_choice_blocks(ext, choice.as_deref()) {
+                choice
+            } else {
+                None
+            };
+            AssocState {
+                ext: (*ext).to_string(),
+                registered,
+                blocked_by,
+            }
+        })
+        .collect()
+}
+
+/// Open the system's **"你要如何打开此文件？"** dialog for one extension, which
+/// is the only route that changes a `UserChoice` that belongs to another program.
+///
+/// There is no API to set the default handler; Windows writes the protected
+/// `UserChoice` (hash and all) only when *the user* picks an app and ticks
+/// "始终". `SHOpenWithDialog` is exactly that dialog, so this is what Bandizip
+/// and friends do for the extensions they cannot claim directly: list them,
+/// and let the user confirm each one in the OS.
+///
+/// A zero-byte sample file is created for the extension so the dialog has
+/// something to be about; `OAIF_EXEC` is deliberately not set, so confirming
+/// does not launch an archiver on it. Returns `Err` with the reason when the
+/// shell refuses (the caller can fall back to `ms-settings:defaultapps`).
+pub fn open_with_dialog_for(ext: &str) -> Result<(), String> {
+    if !SUPPORTED_EXTENSIONS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+        return Err(format!("unsupported extension: {ext}"));
+    }
+    #[cfg(windows)]
+    {
+        win32::open_with_dialog(ext)
+    }
+    #[cfg(not(windows))]
+    {
+        Err("not Windows".to_string())
+    }
+}
+
+/// Bullet-proof fallback for [`open_with_dialog_for`]: the classic
+/// `OpenAs_RunDLL` entry point, which predates the documented API and still
+/// exists. Used when `SHOpenWithDialog` is unavailable (it needs shell32 6.0+).
+pub fn open_with_rundll_command(ext: &str) -> Option<(String, Vec<String>)> {
+    let sample = sample_file_for(ext)?;
+    Some((
+        "rundll32.exe".to_string(),
+        vec![
+            "shell32.dll,OpenAs_RunDLL".to_string(),
+            sample.to_string_lossy().into_owned(),
+        ],
+    ))
+}
+
+/// Path of the (created) zero-byte sample file the OS dialog is shown for.
+fn sample_file_for(ext: &str) -> Option<std::path::PathBuf> {
+    if !SUPPORTED_EXTENSIONS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+        return None;
+    }
+    let dir = std::env::temp_dir().join("zipnest-assoc");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("sample.{}", ext.to_ascii_lowercase()));
+    if !path.exists() {
+        std::fs::write(&path, b"").ok()?;
+    }
+    Some(path)
 }
 
 /// Extensions where Windows' locked-in choice names somebody else's handler,
@@ -451,6 +611,48 @@ mod win32 {
             iid: *const Guid,
             out: *mut *mut c_void,
         ) -> i32;
+    }
+
+    /// `OPENASINFO` from shellapi.h.
+    #[repr(C)]
+    struct OpenAsInfo {
+        file: *const u16,
+        class: *const u16,
+        flags: u32,
+    }
+
+    /// The "始终使用此应用" checkbox is what makes Windows write the protected
+    /// `UserChoice`; without `OAIF_REGISTER_EXT` the choice is not recorded.
+    /// `OAIF_EXEC` is deliberately absent: we do not want the chosen program
+    /// started on our empty sample file.
+    const OAIF_ALLOW_REGISTRATION: u32 = 0x0000_0001;
+    const OAIF_REGISTER_EXT: u32 = 0x0000_0002;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHOpenWithDialog(hwnd: isize, info: *const OpenAsInfo) -> i32;
+    }
+
+    /// Show the system "你要如何打开此文件？" dialog for
+    /// `<temp>\zipnest-assoc\sample.<ext>`, where the user can pick ZipNest and
+    /// tick "始终". That is the only way the protected `UserChoice` changes.
+    pub fn open_with_dialog(ext: &str) -> Result<(), String> {
+        let sample = super::sample_file_for(ext)
+            .ok_or_else(|| format!("could not create a sample file for .{ext}"))?;
+        let mut file: Vec<u16> = sample.to_string_lossy().encode_utf16().collect();
+        file.push(0);
+        let info = OpenAsInfo {
+            file: file.as_ptr(),
+            class: std::ptr::null(),
+            flags: OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT,
+        };
+        // A null owner window is fine; the dialog is modal to the desktop.
+        let hr = unsafe { SHOpenWithDialog(0, &info) };
+        if hr < 0 {
+            Err(format!("SHOpenWithDialog failed: 0x{:08X}", hr as u32))
+        } else {
+            Ok(())
+        }
     }
 
     /// Open the per-app "Set program associations" page. `Err` carries the raw
@@ -791,6 +993,18 @@ impl AssocProbe for WindowsRegistry {
             win32::read_sz(&user_choice_key(ext), Some("ProgId"))
         }
     }
+
+    fn classes_default(&self, ext: &str) -> Option<String> {
+        #[cfg(not(windows))]
+        {
+            let _ = ext;
+            None
+        }
+        #[cfg(windows)]
+        {
+            win32::read_sz(&format!(r"{CLASSES}\.{ext}"), None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1015,8 +1229,79 @@ mod tests {
             fn user_choice_progid(&self, ext: &str) -> Option<String> {
                 self.1.contains(&ext).then(|| self.0.to_string())
             }
+            fn classes_default(&self, ext: &str) -> Option<String> {
+                Some(format!("ZipNest.{ext}"))
+            }
         }
         Probe(choice, exts)
+    }
+
+    #[test]
+    fn the_per_extension_table_tells_ours_from_someone_elses() {
+        // Registered everywhere; Windows has locked .zip and .rar to Bandizip.
+        let probe = probe_with("Bandizip.zip", &["zip", "rar"]);
+        let states = assoc_states(&probe);
+        assert_eq!(states.len(), SUPPORTED_EXTENSIONS.len(), "one row per extension");
+        let zip = states.iter().find(|s| s.ext == "zip").unwrap();
+        assert!(zip.registered, "our Classes value is still in place");
+        assert!(!zip.ours(), "but Windows will not use it");
+        assert_eq!(zip.blocked_by.as_deref(), Some("Bandizip.zip"));
+        // A row nobody else claimed is simply ours.
+        let seven = states.iter().find(|s| s.ext == "7z").unwrap();
+        assert!(seven.ours() && !seven.needs_user_choice());
+    }
+
+    #[test]
+    fn a_row_with_no_registration_is_not_ours_even_when_unclaimed() {
+        // "Not blocked" is not the same as "ours": with the integration switched
+        // off there is no Classes value, and the table has to say so.
+        struct Nothing;
+        impl AssocProbe for Nothing {
+            fn user_choice_progid(&self, _ext: &str) -> Option<String> {
+                None
+            }
+            fn classes_default(&self, _ext: &str) -> Option<String> {
+                None
+            }
+        }
+        let states = assoc_states(&Nothing);
+        assert!(states.iter().all(|s| !s.registered && !s.ours()));
+        assert!(states.iter().all(|s| !s.needs_user_choice()));
+    }
+
+    #[test]
+    fn only_archive_extensions_get_a_dialog_sample() {
+        // The dialog needs a file of that extension; anything else is refused
+        // rather than creating junk in %TEMP%.
+        assert!(sample_file_for("zip").is_some());
+        let sample = sample_file_for("zip").unwrap();
+        assert_eq!(sample.extension().unwrap(), "zip");
+        assert!(sample.exists(), "the sample file is created on demand");
+        assert!(sample_file_for("exe").is_none());
+        assert!(sample_file_for("../evil").is_none());
+        assert!(open_with_rundll_command("7z").is_some());
+        assert!(open_with_rundll_command("exe").is_none());
+    }
+
+    #[test]
+    fn a_subset_registration_only_touches_the_ticked_extensions() {
+        // The whole point of per-extension ticks: .zip yes, .rar untouched.
+        let ops = assoc_ops_for(exe(), &["zip"]);
+        assert!(ops.iter().any(|o| matches!(
+            o,
+            RegOp::SetValue { key, name: None, value, .. }
+                if key == r"HKCU\Software\Classes\.zip" && value == "ZipNest.zip"
+        )));
+        assert!(
+            !ops.iter().any(|o| matches!(o, RegOp::SetValue { key, .. } if key == r"HKCU\Software\Classes\.rar")),
+            "an unticked extension must not be claimed"
+        );
+        // ... while the capabilities list still mentions all nine, so the user
+        // can find ZipNest in "默认应用" for any of them.
+        for ext in SUPPORTED_EXTENSIONS {
+            let key = format!(r"HKCU\Software\ZipNest\Capabilities\FileAssociations\.{ext}");
+            assert!(ops.iter().any(|o| matches!(o, RegOp::SetValue { key: k, .. } if k == &key)));
+        }
     }
 
     #[test]
@@ -1099,6 +1384,40 @@ mod tests {
     /// entry — the classic page is gone from that build. That is why the
     /// Settings dialog treats the call as best-effort and falls back to the
     /// `ms-settings:` page, which is also what Bandizip does on current Windows.
+    /// Open the per-extension system dialog for real.
+    ///
+    /// `#[ignore]`d because it puts a modal **"你要如何打开此文件？"** window on the
+    /// desktop and blocks until it is answered. Run it by hand when touching this
+    /// path:
+    ///
+    /// ```text
+    /// cargo test -p zipnest-ipc -- --ignored --nocapture open_with_dialog_for_zip
+    /// ```
+    ///
+    /// The call runs on a worker thread and the test only waits a few seconds, so
+    /// it never hangs: "still waiting" means the dialog is on screen. Close it
+    /// with Esc when done.
+    #[test]
+    #[ignore = "opens a modal shell dialog; run by hand"]
+    fn open_with_dialog_for_zip() {
+        let sample = sample_file_for("zip").expect("sample file");
+        println!(
+            "  sample: {} ({} bytes)",
+            sample.display(),
+            std::fs::metadata(&sample).map(|m| m.len()).unwrap_or(0)
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(super::open_with_dialog_for("zip"));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(8)) {
+            Ok(Ok(())) => println!("  returned Ok immediately (dialog already dismissed?)"),
+            Ok(Err(e)) => panic!("the shell refused the dialog: {e}"),
+            Err(_) => println!("  still waiting after 8 s -> the dialog is open and modal"),
+        }
+    }
+
     #[test]
     #[ignore = "opens Control Panel windows; run by hand"]
     fn probe_which_registered_apps_the_api_accepts() {

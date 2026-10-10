@@ -32,6 +32,12 @@ otherwise violate. Read it first, every session.
 
 ## Workflow
 
+- **CHANGELOG.md is written for users, not for us.** Every entry must be
+  something a user can perceive in the app: a bug they could hit, a feature they
+  can see, a behaviour change. Build tooling, tests, scripts, refactors,
+  duplicate keys, compiler warnings, CI — none of that belongs there; it goes in
+  the commit message. If a fix cannot be noticed from outside, leave it out. Keep
+  the plain-Chinese, "什么问题 → 现在怎样" voice the file already uses.
 - Plan first: for non-trivial work, brainstorm → write the plan under `docs/superpowers/plans/` → execute it.
 - Test first, per task. A task is done only when `cargo test --workspace` is green and `pnpm test` passes; clippy stays warning-free.
 - End each task with an English commit. Tag each finished milestone (`m1-engine`, `m2-ui`, …).

@@ -54,6 +54,12 @@ pub struct Settings {
     /// reason: an unused right-click menu is dead weight nobody goes looking
     /// for.
     pub context_menu: bool,
+    /// Which archive extensions ZipNest claims as the default handler.
+    ///
+    /// Empty means "all of them" (the fresh-profile and installer case); the
+    /// Settings dialog's per-extension checkboxes write this list, so a user can
+    /// keep `.tar` with their own tools and still have `.zip` open here.
+    pub assoc_extensions: Vec<String>,
     /// Set once the Explorer integration has been applied or explicitly
     /// refused. While it is `false` the app applies the current settings' 
     /// integration at startup (the fresh-install path); afterwards it never
@@ -91,6 +97,14 @@ impl Default for Settings {
             overwrite_policy: "ask".into(),
             associate: true,
             context_menu: true,
+            // Explicitly all nine rather than an empty "means everything" list:
+            // the Settings dialog has a "none" state too, and a missing field in
+            // an older settings.json has to keep the old behaviour (everything
+            // claimed) instead of releasing every association.
+            assoc_extensions: crate::shell::SUPPORTED_EXTENSIONS
+                .iter()
+                .map(|e| (*e).to_string())
+                .collect(),
             integration_applied: false,
             auto_close_after_job: false,
             preview_max_bytes: 8 * 1024 * 1024,
@@ -115,6 +129,7 @@ pub struct SettingsPatch {
     pub overwrite_policy: Option<String>,
     pub associate: Option<bool>,
     pub context_menu: Option<bool>,
+    pub assoc_extensions: Option<Vec<String>>,
     pub integration_applied: Option<bool>,
     pub auto_close_after_job: Option<bool>,
     pub preview_max_bytes: Option<u64>,
@@ -157,6 +172,11 @@ impl Settings {
         }
         if let Some(v) = patch.context_menu {
             self.context_menu = v;
+        }
+        if let Some(v) = patch.assoc_extensions {
+            // Canonicalised, never stored raw: a hand-edited file cannot make us
+            // register a handler we do not ship.
+            self.assoc_extensions = crate::shell::normalise_extensions(&v);
         }
         if let Some(v) = patch.integration_applied {
             self.integration_applied = v;
@@ -210,6 +230,7 @@ impl Settings {
         if !THEMES.contains(&self.theme_mode.as_str()) {
             self.theme_mode = "system".into();
         }
+        self.assoc_extensions = crate::shell::normalise_extensions(&self.assoc_extensions);
         self.preview_max_bytes =
             self.preview_max_bytes.clamp(PREVIEW_MAX_BYTES.0, PREVIEW_MAX_BYTES.1);
         self.ui_zoom = self.ui_zoom.clamp(UI_ZOOM.0, UI_ZOOM.1);
