@@ -1325,7 +1325,7 @@ let extract_enabled = self.archive.is_some();
             }
             let sep_y = ui.cursor().top();
             ui.painter()
-                .hline(ui.max_rect().x_range(), sep_y, egui::Stroke::new(1.0, hairline));
+                .hline(ui.max_rect().x_range(), sep_y, egui::Stroke::new(1.0_f32, hairline));
             ui.add_space(4.0);
 
             // ---- rows ----
@@ -2686,7 +2686,7 @@ fn paint_entry_icon(p: &egui::Painter, icon_rect: egui::Rect, e: &EntryDto, dark
         )
     };
     p.rect_filled(page, egui::Rounding::same(2.0), fill);
-    p.rect_stroke(page, egui::Rounding::same(2.0), egui::Stroke::new(1.0, outline));
+    p.rect_stroke(page, egui::Rounding::same(2.0), egui::Stroke::new(1.0_f32, outline));
     p.rect_filled(
         egui::Rect::from_min_size(page.min + egui::vec2(2.0, 2.0), egui::vec2(10.0, 4.0)),
         egui::Rounding::same(1.0),
@@ -3011,7 +3011,7 @@ fn paint_lock(p: &egui::Painter, center: egui::Pos2) {
         egui::Rounding::same(1.0),
         red,
     );
-    p.circle_stroke(center + egui::vec2(0.0, -4.0), 3.0, egui::Stroke::new(1.5, red));
+    p.circle_stroke(center + egui::vec2(0.0, -4.0), 3.0, egui::Stroke::new(1.5_f32, red));
 }
 
 /// One line of text inside `rect`, ellipsised when it does not fit.
@@ -3062,7 +3062,7 @@ fn paint_elided(
 /// A dashed rectangle: egui has no dashed stroke, so the edges are drawn as
 /// short segments.
 fn dashed_rect(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let stroke = egui::Stroke::new(1.5, color);
+    let stroke = egui::Stroke::new(1.5_f32, color);
     let (dash, gap) = (7.0_f32, 5.0_f32);
     for (from, to) in [
         (rect.left_top(), rect.right_top()),

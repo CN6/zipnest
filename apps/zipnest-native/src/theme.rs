@@ -69,7 +69,7 @@ fn visuals(mode: Mode) -> egui::Visuals {
 
     v.panel_fill = if dark { rgb(32, 32, 32) } else { rgb(250, 250, 250) };
     v.window_fill = if dark { rgb(43, 43, 43) } else { rgb(255, 255, 255) };
-    v.window_stroke = Stroke::new(1.0, if dark { rgb(62, 62, 62) } else { rgb(230, 230, 230) });
+    v.window_stroke = Stroke::new(1.0_f32, if dark { rgb(62, 62, 62) } else { rgb(230, 230, 230) });
     v.window_rounding = Rounding::same(10.0);
     v.window_shadow = egui::epaint::Shadow {
         offset: egui::vec2(0.0, 8.0),
@@ -80,7 +80,7 @@ fn visuals(mode: Mode) -> egui::Visuals {
     v.faint_bg_color = if dark { rgb(45, 45, 45) } else { rgb(245, 245, 245) };
     v.extreme_bg_color = if dark { rgb(26, 26, 26) } else { rgb(255, 255, 255) };
     v.selection.bg_fill = if dark { rgb(38, 79, 120) } else { rgb(205, 229, 255) };
-    v.selection.stroke = Stroke::new(1.0, accent);
+    v.selection.stroke = Stroke::new(1.0_f32, accent);
     v.hyperlink_color = accent;
     v
 }
@@ -140,11 +140,11 @@ fn tune(style: &mut egui::Style, mode: Mode) {
     style.visuals.widgets.active.rounding = Rounding::same(6.0);
     let dark = mode.is_dark();
     style.visuals.widgets.inactive.bg_stroke =
-        Stroke::new(1.0, if dark { rgb(78, 78, 78) } else { rgb(222, 222, 222) });
+        Stroke::new(1.0_f32, if dark { rgb(78, 78, 78) } else { rgb(222, 222, 222) });
     style.visuals.widgets.hovered.bg_fill =
         if dark { rgb(58, 58, 58) } else { rgb(238, 242, 248) };
     style.visuals.widgets.hovered.bg_stroke =
-        Stroke::new(1.0, if dark { ACCENT_DARK } else { ACCENT_LIGHT });
+        Stroke::new(1.0_f32, if dark { ACCENT_DARK } else { ACCENT_LIGHT });
     style.visuals.widgets.inactive.weak_bg_fill =
         if dark { rgb(48, 48, 48) } else { rgb(255, 255, 255) };
     style.visuals.widgets.hovered.weak_bg_fill =
@@ -194,7 +194,7 @@ pub fn status_bar(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none()
         .fill(fill)
         .inner_margin(Margin::symmetric(14.0, 6.0))
-        .stroke(Stroke::new(1.0, stroke))
+        .stroke(Stroke::new(1.0_f32, stroke))
         .show(ui, add_contents);
 }
 
@@ -206,7 +206,7 @@ pub fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
         .fill(fill)
         .inner_margin(Margin::symmetric(8.0, 6.0))
         .rounding(Rounding::same(8.0))
-        .stroke(Stroke::new(1.0, stroke))
+        .stroke(Stroke::new(1.0_f32, stroke))
         .show(ui, add_contents);
 }
 
