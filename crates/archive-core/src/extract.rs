@@ -656,6 +656,32 @@ unsafe fn disk_progress_gate(cb: *mut DiskExtractCallback) -> Hresult {
 //     was already there (`File::create` on the real path used to do just that);
 //   * a half-written file never appears under the entry's real name.
 
+/// Is any directory strictly between `root` and `path` a symlink or directory
+/// junction?
+///
+/// `path`'s own last component is deliberately not checked: replacing a symlink
+/// with a real file is harmless, writing *through* one is what escapes the
+/// destination. Walking up from the entry costs one `symlink_metadata` call per
+/// path component and nothing at all for a flat archive (no parent to check).
+fn has_link_ancestor(root: &std::path::Path, path: &std::path::Path) -> bool {
+    let mut dir = path.parent();
+    while let Some(current) = dir {
+        if current == root {
+            return false;
+        }
+        // `is_symlink` covers Windows symlinks *and* mount points (junctions):
+        // both are name-surrogate reparse points, and both redirect a write.
+        if std::fs::symlink_metadata(current)
+            .map(|md| md.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        dir = current.parent();
+    }
+    false
+}
+
 /// Temp sibling for `dest`: same directory, so the final rename stays on one
 /// volume and is atomic.
 ///
@@ -837,6 +863,18 @@ unsafe extern "system" fn disk_get_stream(
             st.record_skip(&meta.raw_path);
             return S_OK;
         }
+    }
+    // The sanitizer vets the entry *name* only. An archive can still ship a link
+    // entry (`d` -> somewhere else) and then write through it: the lexical
+    // `starts_with(dest)` check passes, `create_dir_all` is a no-op because the
+    // link already exists, and the real file lands outside the destination.
+    // Refuse to write through a symlink or directory junction anywhere between
+    // the destination root and this entry. (On Windows creating a symlink needs
+    // SeCreateSymbolicLinkPrivilege, so this is defence in depth rather than an
+    // open door; junctions need no privilege.)
+    if has_link_ancestor(&st.dest, &target) {
+        st.record_skip(&meta.raw_path);
+        return S_OK;
     }
     let Some(tmp) = temp_sibling(&target) else {
         st.record_skip(&meta.raw_path);
@@ -1060,4 +1098,52 @@ pub(crate) fn extract_to_disk(
 #[allow(unused)]
 fn _future_use(_: &PropVariant, _: fn() -> ZipnestError) {
     let _ = E_NOTIMPL;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_link_ancestor;
+
+    /// `has_link_ancestor` is the guard that stops an archive from writing
+    /// *through* a link entry and out of the destination.
+    ///
+    /// Creating a symlink on Windows needs SeCreateSymbolicLinkPrivilege, so the
+    /// test skips the positive case where the platform refuses (CI) instead of
+    /// failing on an environment property; the negative case always runs.
+    #[test]
+    fn a_link_between_the_destination_and_the_entry_is_detected() {
+        let root = std::env::temp_dir().join(format!("zipnest-link-{}", std::process::id()));
+        let plain = root.join("plain");
+        let linked = root.join("linked");
+        let outside = root.join("outside");
+        for dir in [&plain, &linked, &outside] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        // No link anywhere: the entry is written normally.
+        assert!(!has_link_ancestor(&root, &plain.join("a.txt")));
+        // The root itself is never treated as an escape.
+        assert!(!has_link_ancestor(&root, &root.join("b.txt")));
+        // A path outside the root is not "under a link" either -- the caller
+        // already refuses those, and guessing here would be worse.
+        assert!(!has_link_ancestor(&root, &outside.join("c.txt")));
+
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(&outside, &linked).is_ok();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&outside, &linked).is_ok();
+        #[cfg(not(any(windows, unix)))]
+        let made = false;
+
+        if made {
+            // `linked` now redirects to `outside`: a write to linked/x lands in
+            // outside, even though the path starts with the destination root.
+            assert!(has_link_ancestor(&root, &linked.join("x.txt")));
+            assert!(has_link_ancestor(&root, &linked.join("deep/x.txt")));
+        } else {
+            eprintln!("note: this platform refused to create a symlink; positive case skipped");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
