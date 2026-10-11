@@ -8,6 +8,7 @@ otherwise violate. Read it first, every session.
 
 - `docs/superpowers/specs/2026-09-30-zipnest-design.md` — architecture, IPC contract, scope per milestone.
 - `docs/superpowers/plans/` — the active milestone's step-by-step plan (read the current one before coding).
+- `docs/handoff-2026-10-12.md` — dated handoff snapshot (standing user requirements, release recipe). AGENTS.md wins wherever the two disagree.
 - `README.md` — build/test commands, fixtures, current status.
 
 ## Invariants
@@ -227,13 +228,18 @@ older web UI and is NOT shipped.
   with defaults whatever the old flags hold; recorded → apply as-is; the
   installer's flag forces a re-apply, a normal launch never does (that is what
   makes an opt-out stick).
-- **A foreign `UserChoice` cannot be taken over — do not try.** Measured on
-  Windows 10 26H1: `HKCU\...\Explorer\FileExts\.<ext>\UserChoice` carries a
-  Deny-SetValue ACE for the user, so writing `ProgId` fails ("不允许所请求的
-  注册表访问权") and `reg delete /f` on the key reports access denied. Only the
-  user can change it, via 设置 → 默认应用. `shell::user_choice_blocks` /
-  `blocked_extensions` report those extensions and the Settings dialog deep-links
-  to `ms-settings:defaultapps?registeredAppUser=ZipNest`. Never forge the hash.
+- **A foreign `UserChoice` IS taken over, and it happens in code — not by sending
+  the user to Settings.** The v0.4.12 note that this was impossible is obsolete:
+  `crate::user_choice::claim_all` deletes the subkey and recreates it with a hash
+  we compute (measured details are in the section above). Two things produced that
+  wrong conclusion and are still worth knowing: the `Deny SetValue` ACE stops
+  *writes* only, so `reg delete /f` on the key still reports access denied even
+  though the Win32 delete with DELETE access succeeds — the two are not
+  interchangeable here; and `shell::user_choice_blocks` / `blocked_extensions`
+  are now only a *status classifier* (they feed `blocked` in the associate result
+  and the `settings.shell.blocked` line, whose text says the button below fixes
+  it). They are not a verdict that the extension is out of reach. The
+  `ms-settings:` deep link is gone from the tree.
 - **`assoc:double-click` smoke test**: `cmd /c start "" x.7z` must launch
   `zipnest.exe` from an extension with no `UserChoice`. Shell-level probes are
   unreliable on this box: `assoc .ext` says "not found" and
