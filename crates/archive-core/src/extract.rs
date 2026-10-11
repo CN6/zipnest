@@ -18,8 +18,11 @@ use crate::com::{
     IID_IARCHIVE_EXTRACT_CALLBACK, IID_IPROGRESS, IID_ISEQ_OUT_STREAM, IID_IUNKNOWN,
 };
 use crate::error::ZipnestError;
-use crate::types::{ArchiveEntry, ExtractOptions, ExtractProgress, ExtractStats, OnConflict};
-use archive_security::{sanitize_entry_path, ExtractQuota};
+use crate::types::{
+    ArchiveEntry, EntryFailure, ExtractOptions, ExtractProgress, ExtractStats, OnConflict,
+    RenamedEntry,
+};
+use archive_security::{plan_entry_paths, EntryPathFix, ExtractQuota};
 use std::ffi::c_void;
 use std::os::raw::c_void as RawCVoid;
 use std::path::PathBuf;
@@ -342,6 +345,12 @@ pub(crate) fn read_entry(
 struct EntryMeta {
     index: u32,
     raw_path: String,
+    /// Safe relative path this entry is written to. Computed once for the whole
+    /// selection by [`plan_entry_paths`], so a weird name costs the user a
+    /// renamed file and never a missing file.
+    plan: String,
+    /// How `plan` differs from `raw_path` (empty when identical).
+    fixes: Vec<EntryPathFix>,
     is_dir: bool,
     mtime: Option<std::time::SystemTime>,
 }
@@ -382,6 +391,9 @@ struct DiskState {
     blocked: AtomicU8,    // BLOCK_*
     cancelled: AtomicU8,  // 1 when the user closure asked to stop
     skipped: Mutex<Vec<String>>,
+    /// Entries that could not be written. Non-empty ⇒ the run failed; the
+    /// caller reports a failure instead of pretending the extraction worked.
+    failed: Mutex<Vec<EntryFailure>>,
     io_error: Mutex<Option<std::io::Error>>,
     first_op_res: AtomicI32,
     done_bytes: AtomicU64,
@@ -399,6 +411,9 @@ struct PendingWrite {
     tmp: PathBuf,
     dest: PathBuf,
     mtime: Option<std::time::SystemTime>,
+    /// The archive's own name for this entry, so a failed commit can be
+    /// reported with the name the user sees in the archive.
+    raw: String,
 }
 
 impl DiskState {
@@ -409,18 +424,31 @@ impl DiskState {
             .map(|i| &self.entries[i])
     }
 
-    /// Record an entry that was not written: unsafe/escaping name, an existing
-    /// destination under the `skip` policy, or a destination we could not
-    /// create. Reported to the user so nothing looks silently lost.
+    /// Record an entry the user's own conflict policy leaves alone (an existing
+    /// destination under `skip`). Deliberate, so it is reported separately from
+    /// a failure.
     fn record_skip(&self, raw: &str) {
         if let Ok(mut s) = self.skipped.lock() {
             s.push(raw.to_string());
         }
     }
 
+    /// Record an entry that is **not on disk**. Every one of these turns the run
+    /// into a failure: the UI lists them with their reason instead of showing a
+    /// "done" message over missing files.
+    fn record_failure(&self, raw: &str, reason: &'static str, detail: Option<String>) {
+        if let Ok(mut f) = self.failed.lock() {
+            f.push(EntryFailure {
+                path: raw.to_string(),
+                reason,
+                detail,
+            });
+        }
+    }
+
     /// Record a fatal write error (disk full, device failure, …). Only the
     /// first one is kept; per-entry open failures stay non-fatal and go to
-    /// `skipped` instead.
+    /// `failed` instead.
     fn record_io_error(&self, e: &std::io::Error) {
         if let Ok(mut slot) = self.io_error.lock() {
             if slot.is_none() {
@@ -551,13 +579,7 @@ unsafe extern "system" fn fos_write(
             S_OK
         }
         Err(e) => {
-            let mut slot = match st.io_error.lock() {
-                Ok(s) => s,
-                Err(_) => return E_FAIL,
-            };
-            if slot.is_none() {
-                *slot = Some(e);
-            }
+            st.record_io_error(&e);
             E_FAIL
         }
     }
@@ -656,6 +678,48 @@ unsafe fn disk_progress_gate(cb: *mut DiskExtractCallback) -> Hresult {
 //     was already there (`File::create` on the real path used to do just that);
 //   * a half-written file never appears under the entry's real name.
 
+/// The path to hand to the operating system.
+///
+/// Windows refuses any path past `MAX_PATH` (260) unless it carries the
+/// verbatim `\\?\` prefix, which in turn requires an absolute, normalized path
+/// with backslash separators. Archive entry names can be 255 bytes long and the
+/// destination can be deep, so the limit is easy to cross — a 300-character
+/// entry used to fail with `os error 123` ("the filename, directory name, or
+/// volume label syntax is incorrect") and the file was silently never written.
+#[cfg(windows)]
+fn os_path(p: &std::path::Path) -> PathBuf {
+    /// Below this length nothing needs the prefix; keeping short paths plain
+    /// keeps error messages and the existing behaviour unchanged.
+    const LIMIT: usize = 240;
+    let s = p.as_os_str().to_string_lossy();
+    if s.len() < LIMIT || !p.is_absolute() || s.starts_with(r"\\?\") {
+        return p.to_path_buf();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    match s.strip_prefix(r"\\") {
+        // A UNC path needs the `UNC\` form, not `\\?\` + `\\`.
+        Some(rest) => {
+            out.push_str(r"\\?\UNC\");
+            out.push_str(rest);
+        }
+        None => {
+            out.push_str(r"\\?\");
+            out.push_str(&s);
+        }
+    }
+    PathBuf::from(out.replace('/', "\\"))
+}
+
+#[cfg(not(windows))]
+fn os_path(p: &std::path::Path) -> PathBuf {
+    p.to_path_buf()
+}
+
+/// `Path::exists`, but able to see past `MAX_PATH` on Windows.
+fn os_exists(p: &std::path::Path) -> bool {
+    std::fs::metadata(os_path(p)).is_ok()
+}
+
 /// Is any directory strictly between `root` and `path` a symlink or directory
 /// junction?
 ///
@@ -671,7 +735,7 @@ fn has_link_ancestor(root: &std::path::Path, path: &std::path::Path) -> bool {
         }
         // `is_symlink` covers Windows symlinks *and* mount points (junctions):
         // both are name-surrogate reparse points, and both redirect a write.
-        if std::fs::symlink_metadata(current)
+        if std::fs::symlink_metadata(os_path(current))
             .map(|md| md.file_type().is_symlink())
             .unwrap_or(false)
         {
@@ -689,16 +753,31 @@ fn has_link_ancestor(root: &std::path::Path, path: &std::path::Path) -> bool {
 /// is not valid UTF-8 still gets a temp file instead of being silently skipped;
 /// and it carries a per-process counter so two entries in one archive whose
 /// names differ only through this suffix cannot collide.
+///
+/// The *whole* component has to fit in 255 characters, so the base name is cut
+/// when the suffix would push it over: an entry name may itself be 255 bytes
+/// long, and `name + suffix` would then be rejected by the filesystem
+/// (`os error 123`) and that file would never be written.
 fn temp_sibling(dest: &std::path::Path) -> Option<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
+    const MAX_COMPONENT: usize = 255;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = dest.file_name()?;
-    let mut tmp = std::ffi::OsString::from(name);
-    tmp.push(format!(
+    let suffix = format!(
         ".zipnest-part-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    );
+    let mut base = name.to_string_lossy().into_owned();
+    if base.len() + suffix.len() > MAX_COMPONENT {
+        let mut cut = MAX_COMPONENT.saturating_sub(suffix.len());
+        while cut > 0 && !base.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        base.truncate(cut);
+    }
+    let mut tmp = std::ffi::OsString::from(base);
+    tmp.push(suffix);
     Some(dest.with_file_name(tmp))
 }
 
@@ -721,7 +800,7 @@ fn unique_dest(dest: &std::path::Path) -> Option<PathBuf> {
         .unwrap_or_default();
     for n in 2..10_000u32 {
         let cand = parent.join(format!("{stem} ({n}){ext}"));
-        if !cand.exists() {
+        if !os_exists(&cand) {
             return Some(cand);
         }
     }
@@ -737,28 +816,30 @@ fn commit_pending(pw: &PendingWrite) -> std::io::Result<u64> {
     // changed: if the replace then fails (target locked by another process, a
     // directory, disk full), the user's file must not silently come out of it
     // with the read-only bit stripped while its content never changed.
-    let was_readonly = std::fs::metadata(&pw.dest)
+    let dest = os_path(&pw.dest);
+    let tmp = os_path(&pw.tmp);
+    let was_readonly = std::fs::metadata(&dest)
         .map(|md| md.permissions().readonly())
         .unwrap_or(false);
     if was_readonly {
-        let mut perm = std::fs::metadata(&pw.dest)?.permissions();
+        let mut perm = std::fs::metadata(&dest)?.permissions();
         perm.set_readonly(false);
-        let _ = std::fs::set_permissions(&pw.dest, perm);
+        let _ = std::fs::set_permissions(&dest, perm);
     }
-    let len = std::fs::metadata(&pw.tmp).map(|m| m.len()).unwrap_or(0);
-    if let Err(e) = std::fs::rename(&pw.tmp, &pw.dest) {
+    let len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
         if was_readonly {
             // Put the attribute back exactly as we found it.
-            if let Ok(md) = std::fs::metadata(&pw.dest) {
+            if let Ok(md) = std::fs::metadata(&dest) {
                 let mut perm = md.permissions();
                 perm.set_readonly(true);
-                let _ = std::fs::set_permissions(&pw.dest, perm);
+                let _ = std::fs::set_permissions(&dest, perm);
             }
         }
         return Err(e);
     }
     if let Some(mtime) = pw.mtime {
-        if let Ok(f) = std::fs::File::options().write(true).open(&pw.dest) {
+        if let Ok(f) = std::fs::File::options().write(true).open(&dest) {
             let _ = f.set_modified(mtime);
         }
     }
@@ -805,36 +886,28 @@ unsafe extern "system" fn disk_get_stream(
         return E_ABORT;
     }
 
-    // Security: sanitize the RAW archive path before it touches the disk. An
-    // unsafe or path-escaping entry is skipped — never written — but it does
-    // not abort the whole extraction, so unrelated files still land. Skipped
-    // names are reported back in `ExtractStats::skipped`.
-    let rel = match sanitize_entry_path(&meta.raw_path) {
-        Ok(r) => r,
-        Err(_) => {
-            st.record_skip(&meta.raw_path);
-            return S_OK; // null stream → engine skips this entry and continues
-        }
-    };
-    let full: PathBuf = st.dest.join(&rel);
+    // The path was mapped from the RAW archive name before `Extract` started
+    // (`plan_entry_paths`): odd names are rewritten, never dropped, so no entry
+    // reaches this point without a safe relative path.
+    let full: PathBuf = st.dest.join(&meta.plan);
     if !full.starts_with(&st.dest) {
         // Double insurance (symlink-style escapes cannot happen here, but
         // never write outside dest even if join semantics change).
-        st.record_skip(&meta.raw_path);
+        st.record_failure(&meta.raw_path, "error.entry_path", None);
         return S_OK;
     }
 
     if meta.is_dir {
         // Directories are idempotent and never conflict. One we cannot create
-        // is reported like any other skipped entry instead of aborting the run.
-        if std::fs::create_dir_all(&full).is_err() {
-            st.record_skip(&meta.raw_path);
+        // is a real failure: its files cannot land either.
+        if let Err(e) = std::fs::create_dir_all(os_path(&full)) {
+            st.record_failure(&meta.raw_path, "error.entry_io", Some(e.to_string()));
         }
         return S_OK;
     }
 
     // Existing destination: apply the conflict policy.
-    let target = if full.exists() {
+    let target = if os_exists(&full) {
         match st.on_conflict {
             OnConflict::Skip => {
                 st.record_skip(&meta.raw_path);
@@ -842,10 +915,11 @@ unsafe extern "system" fn disk_get_stream(
             }
             OnConflict::Rename => match unique_dest(&full) {
                 Some(free) => free,
-                // Every `name (n).ext` up to 9999 exists. Skipping is the only
-                // honest answer for a policy that promises not to overwrite.
+                // Every `name (n).ext` up to 9999 exists. The policy promises
+                // never to overwrite, so this entry cannot be written — which is
+                // a failure to report, not something to hide behind "done".
                 None => {
-                    st.record_skip(&meta.raw_path);
+                    st.record_failure(&meta.raw_path, "error.entry_conflict", None);
                     return S_OK;
                 }
             },
@@ -855,16 +929,16 @@ unsafe extern "system" fn disk_get_stream(
         full.clone()
     };
 
-    // Per-entry failures below stay non-fatal: one unwritable path must not
-    // throw away every other file in the archive. They land in `stats.skipped`
-    // so the UI can say how many entries did not make it.
+    // Per-entry failures below stay non-fatal for the *run*: one unwritable
+    // path must not throw away every other file in the archive. They land in
+    // `stats.failed`, which makes the job report a failure with these names.
     if let Some(parent) = target.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            st.record_skip(&meta.raw_path);
+        if let Err(e) = std::fs::create_dir_all(os_path(parent)) {
+            st.record_failure(&meta.raw_path, "error.entry_io", Some(e.to_string()));
             return S_OK;
         }
     }
-    // The sanitizer vets the entry *name* only. An archive can still ship a link
+    // The planner vets the entry *name* only. An archive can still ship a link
     // entry (`d` -> somewhere else) and then write through it: the lexical
     // `starts_with(dest)` check passes, `create_dir_all` is a no-op because the
     // link already exists, and the real file lands outside the destination.
@@ -873,17 +947,17 @@ unsafe extern "system" fn disk_get_stream(
     // SeCreateSymbolicLinkPrivilege, so this is defence in depth rather than an
     // open door; junctions need no privilege.)
     if has_link_ancestor(&st.dest, &target) {
-        st.record_skip(&meta.raw_path);
+        st.record_failure(&meta.raw_path, "error.entry_link", None);
         return S_OK;
     }
     let Some(tmp) = temp_sibling(&target) else {
-        st.record_skip(&meta.raw_path);
+        st.record_failure(&meta.raw_path, "error.entry_path", None);
         return S_OK;
     };
-    let file = match std::fs::File::create(&tmp) {
+    let file = match std::fs::File::create(os_path(&tmp)) {
         Ok(f) => f,
-        Err(_) => {
-            st.record_skip(&meta.raw_path);
+        Err(e) => {
+            st.record_failure(&meta.raw_path, "error.entry_io", Some(e.to_string()));
             return S_OK;
         }
     };
@@ -897,12 +971,13 @@ unsafe extern "system" fn disk_get_stream(
         // Defensive: a handler that opened a second stream for the same entry
         // must not leak the first temp file.
         if let Some(old) = slot.take() {
-            let _ = std::fs::remove_file(&old.tmp);
+            let _ = std::fs::remove_file(os_path(&old.tmp));
         }
         *slot = Some(PendingWrite {
             tmp,
             dest: target,
             mtime: meta.mtime,
+            raw: meta.raw_path.clone(),
         });
     }
 
@@ -943,13 +1018,15 @@ unsafe extern "system" fn disk_op_result(this: *mut c_void, op_res: i32) -> Hres
                     st.bytes_committed.fetch_add(len, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    let _ = std::fs::remove_file(&pw.tmp);
-                    st.record_io_error(&e);
-                    return E_FAIL;
+                    // The entry's bytes never reached their destination (target
+                    // locked, path is a directory, disk full). Keep going with
+                    // the remaining entries, but this run is a failure.
+                    let _ = std::fs::remove_file(os_path(&pw.tmp));
+                    st.record_failure(&pw.raw, "error.entry_io", Some(e.to_string()));
                 }
             }
         } else {
-            let _ = std::fs::remove_file(&pw.tmp);
+            let _ = std::fs::remove_file(os_path(&pw.tmp));
         }
     }
 
@@ -986,13 +1063,33 @@ pub(crate) fn extract_to_disk(
     selected.dedup_by_key(|e| e.index);
 
     let total_bytes: u64 = selected.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+    // Resolve every name before a single byte is written. This is what makes
+    // the promise "success means every entry is on disk" hold: a hostile or
+    // merely Windows-unfriendly name is rewritten here (and reported), so the
+    // write path never has to give up on an entry.
+    let names: Vec<(String, bool)> = selected
+        .iter()
+        .map(|e| (e.path.clone(), e.is_dir))
+        .collect();
+    let planned = plan_entry_paths(&names);
     let entries: Vec<EntryMeta> = selected
         .iter()
-        .map(|e| EntryMeta {
+        .zip(planned)
+        .map(|(e, p)| EntryMeta {
             index: e.index,
             raw_path: e.path.clone(),
+            plan: p.path,
+            fixes: p.fixes,
             is_dir: e.is_dir,
             mtime: e.mtime,
+        })
+        .collect();
+    let renamed: Vec<RenamedEntry> = entries
+        .iter()
+        .filter(|e| !e.fixes.is_empty())
+        .map(|e| RenamedEntry {
+            from: e.raw_path.clone(),
+            to: e.plan.clone(),
         })
         .collect();
 
@@ -1004,6 +1101,7 @@ pub(crate) fn extract_to_disk(
         blocked: AtomicU8::new(BLOCK_NONE),
         cancelled: AtomicU8::new(0),
         skipped: Mutex::new(Vec::new()),
+        failed: Mutex::new(Vec::new()),
         io_error: Mutex::new(None),
         first_op_res: AtomicI32::new(0),
         done_bytes: AtomicU64::new(0),
@@ -1055,7 +1153,7 @@ pub(crate) fn extract_to_disk(
             Err(p) => p.into_inner().take(),
         };
         if let Some(pw) = leftover {
-            let _ = std::fs::remove_file(&pw.tmp);
+            let _ = std::fs::remove_file(os_path(&pw.tmp));
         }
     }
 
@@ -1087,10 +1185,22 @@ pub(crate) fn extract_to_disk(
         .lock()
         .map(|mut s| std::mem::take(&mut *s))
         .unwrap_or_default();
+    let failed = state
+        .failed
+        .lock()
+        .map(|mut f| std::mem::take(&mut *f))
+        .unwrap_or_default();
     Ok(ExtractStats {
         files: state.files_committed.load(Ordering::Relaxed),
         bytes: state.bytes_committed.load(Ordering::Relaxed),
         skipped,
+        // Only names that really changed. A planned path that happens to equal
+        // the raw name (the overwhelmingly common case) is not a rename.
+        renamed: renamed
+            .into_iter()
+            .filter(|r| r.from != r.to && r.from.replace('\\', "/") != r.to)
+            .collect(),
+        failed,
     })
 }
 

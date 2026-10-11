@@ -317,7 +317,7 @@ fn extract_quota_enforced() {
 }
 
 #[test]
-fn zip_slip_entry_is_skipped_and_other_files_extract() {
+fn zip_slip_entry_lands_inside_the_destination_instead_of_being_dropped() {
     use std::io::Write as _;
     // Craft an archive with a malicious relative path followed by a safe file.
     let evil = std::env::temp_dir().join(format!("zn-slip-{}.zip", std::process::id()));
@@ -340,16 +340,22 @@ fn zip_slip_entry_is_skipped_and_other_files_extract() {
     };
     let stats = arc
         .extract(&opts, None, &mut |_p| true)
-        .expect("one bad entry must not fail the whole extraction");
-    // double insurance: nothing may land outside dest
+        .expect("one odd entry must not fail the whole extraction");
+    // Double insurance: nothing may land outside dest ...
     let escaped = std::env::temp_dir().join("evil.txt");
     assert!(!escaped.exists(), "must not escape temp");
-    assert!(!dest.join("evil.txt").exists());
-    assert!(
-        stats.skipped.iter().any(|p| p.ends_with("evil.txt")),
-        "the escapee must be reported as skipped: {:?}",
-        stats.skipped
+    // ... and the entry is not thrown away either: the `..` is dropped and the
+    // file lands inside the destination.
+    assert_eq!(
+        std::fs::read_to_string(dest.join("evil.txt")).unwrap(),
+        "pwned"
     );
+    assert!(
+        stats.renamed.iter().any(|r| r.to == "evil.txt"),
+        "the rewritten name must be reported: {:?}",
+        stats.renamed
+    );
+    assert!(stats.failed.is_empty(), "{:?}", stats.failed);
     // the safe file listed after it still lands
     assert_eq!(std::fs::read_to_string(dest.join("ok.txt")).unwrap(), "safe");
     let _ = std::fs::remove_dir_all(&dest);
@@ -357,7 +363,7 @@ fn zip_slip_entry_is_skipped_and_other_files_extract() {
 }
 
 #[test]
-fn reserved_name_is_skipped_and_others_still_extract() {
+fn reserved_name_is_renamed_and_others_still_extract() {
     use std::io::Write as _;
     let z = std::env::temp_dir().join(format!("zn-reserved-{}.zip", std::process::id()));
     {
@@ -379,15 +385,22 @@ fn reserved_name_is_skipped_and_others_still_extract() {
     };
     let stats = arc
         .extract(&opts, None, &mut |_p| true)
-        .expect("one bad name must not fail the whole extraction");
+        .expect("one odd name must not fail the whole extraction");
     assert_eq!(std::fs::read_to_string(dest.join("good1.txt")).unwrap(), "one");
     assert_eq!(
         std::fs::read_to_string(dest.join("good2.txt")).unwrap(),
         "two",
-        "files after the hostile name must still extract"
+        "files after the device name must still extract"
     );
+    // `aux.txt` cannot exist on Windows, so it is written as `aux_.txt` — with
+    // its content, not dropped.
     assert!(!dest.join("aux.txt").exists());
-    assert!(stats.skipped.iter().any(|p| p.ends_with("aux.txt")));
+    assert_eq!(
+        std::fs::read_to_string(dest.join("aux_.txt")).unwrap(),
+        "aux"
+    );
+    assert!(stats.renamed.iter().any(|r| r.to == "aux_.txt"));
+    assert_eq!(stats.files, 3);
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_file(&z);
 }

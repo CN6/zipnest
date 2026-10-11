@@ -577,12 +577,40 @@ impl IpcService {
                         serde_json::json!({ "archive_id": id }),
                     );
                 }
+                // A fatal local I/O error (disk full, device failure) carries
+                // the operating system's own words. Pass them along so the
+                // failure dialog can say *why*, not just "读写失败".
+                if let archive_core::ZipnestError::Io(io) = &e {
+                    emit(
+                        "extract_failed",
+                        serde_json::json!({
+                            "count": 0,
+                            "detail": io.to_string(),
+                            "entries": [],
+                        }),
+                    );
+                }
                 key
             })?;
+            if !stats.renamed.is_empty() {
+                // Weird names were rewritten so the entries could be written at
+                // all. Every one of them is on disk; tell the user which name
+                // changed instead of letting it look like a different file.
+                emit(
+                    "extract_renamed",
+                    serde_json::json!({
+                        "count": stats.renamed.len(),
+                        "entries": stats.renamed
+                            .iter()
+                            .map(|r| serde_json::json!({ "from": r.from, "to": r.to }))
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+            }
             if !stats.skipped.is_empty() {
-                // Some entries could not be written safely (hostile/Windows-
-                // reserved names). The safe ones are all extracted; tell the UI
-                // so the skips are visible instead of looking like data loss.
+                // Entries the user's own conflict policy left alone (an
+                // existing file under "skip"). Deliberate, so this is not a
+                // failure — but it is counted out loud.
                 emit(
                     "extract_skipped",
                     serde_json::json!({
@@ -590,6 +618,28 @@ impl IpcService {
                         "names": stats.skipped,
                     }),
                 );
+            }
+            if !stats.failed.is_empty() {
+                // Files are missing. This run must NOT come back as success:
+                // the UI shows these entries and their reasons in a dialog.
+                emit(
+                    "extract_failed",
+                    serde_json::json!({
+                        "count": stats.failed.len(),
+                        "detail": serde_json::Value::Null,
+                        "entries": stats.failed
+                            .iter()
+                            .map(|f| {
+                                serde_json::json!({
+                                    "path": f.path,
+                                    "reason": f.reason,
+                                    "detail": f.detail,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+                return Err("error.entries_failed".into());
             }
             Ok(())
         }));

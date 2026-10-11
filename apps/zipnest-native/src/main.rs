@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.14";
+const CURRENT_VERSION: &str = "0.4.15";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 /// Derived from [`CURRENT_VERSION`] on purpose: a hand-typed string here sat at
 /// `0.4.0` for ten releases (the release checklist asked for it every time and
@@ -393,9 +393,11 @@ struct JobState {
     ok: bool,
     finished: bool,
     error_key: Option<String>,
-    /// Entries the last job could not write (unsafe name, skipped conflict,
-    /// destination not creatable).
+    /// Entries the last job left alone because the user's own conflict policy
+    /// said so (an existing file under "skip").
     skipped: u64,
+    /// Entries written under a rewritten name. All of them are on disk.
+    renamed: u64,
     title: String,
 }
 
@@ -621,6 +623,12 @@ struct App {
     show_extract: bool,
     extract_dest: String,
     extract_skipped: u64,
+    /// `(name in the archive, name on disk)` for entries the last extraction
+    /// had to rewrite so they could be written at all.
+    renamed_entries: Vec<(String, String)>,
+    /// Extra lines under an error message: which entries failed and why. Kept
+    /// apart from `error` so a failure dialog can list them.
+    error_detail: Vec<String>,
     overwrite: bool,
     show_create: bool,
     create_sources: Vec<String>,
@@ -780,6 +788,8 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             show_extract: false,
             extract_dest: String::new(),
             extract_skipped: 0,
+            renamed_entries: Vec::new(),
+            error_detail: Vec::new(),
             overwrite: true,
             show_create: false,
             create_sources: Vec::new(),
@@ -907,6 +917,10 @@ fn t(&self, key: &str) -> String {
             let n = self.job.as_ref().map(|j| j.skipped).unwrap_or(0);
             text = text.replace("{count}", &n.to_string());
         }
+        if key == "job.ok_renamed" {
+            let n = self.job.as_ref().map(|j| j.renamed).unwrap_or(0);
+            text = text.replace("{count}", &n.to_string());
+        }
         Some(text)
     }
 
@@ -994,6 +1008,54 @@ fn t(&self, key: &str) -> String {
                 "extract_skipped" => {
                     self.extract_skipped = payload["count"].as_u64().unwrap_or(0);
                 }
+                "extract_renamed" => {
+                    // The entries are on disk under a different name. Keep the
+                    // pairs so the job window can show exactly what changed.
+                    let pairs: Vec<(String, String)> = payload["entries"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(|e| {
+                                    (
+                                        e["from"].as_str().unwrap_or_default().to_string(),
+                                        e["to"].as_str().unwrap_or_default().to_string(),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let count = payload["count"].as_u64().unwrap_or(0);
+                    if let Some(j) = self.job.as_mut() {
+                        j.renamed = count;
+                    }
+                    self.renamed_entries = pairs;
+                }
+                "extract_failed" => {
+                    // Files are missing. Build the lines the error dialog shows:
+                    // the OS's own words (when it had any) plus one line per
+                    // entry with the reason it could not be written.
+                    let mut lines: Vec<String> = Vec::new();
+                    if let Some(d) = payload["detail"].as_str() {
+                        if !d.trim().is_empty() {
+                            lines.push(d.to_string());
+                        }
+                    }
+                    for e in payload["entries"].as_array().into_iter().flatten() {
+                        let path = e["path"].as_str().unwrap_or_default();
+                        let reason = e["reason"].as_str().unwrap_or("error.io");
+                        let reason_text = self.t(reason);
+                        let detail = e["detail"].as_str().unwrap_or_default();
+                        // The OS's own words go on their own line: "(被占用 /
+                        // 无权限)" followed by "(os error 183)" reads badly.
+                        lines.push(match (path.is_empty(), detail.trim().is_empty()) {
+                            (true, true) => reason_text,
+                            (true, false) => format!("{reason_text}\n    {detail}"),
+                            (false, true) => format!("{path}    {reason_text}"),
+                            (false, false) => format!("{path}    {reason_text}\n    {detail}"),
+                        });
+                    }
+                    self.error_detail = lines;
+                }
                 "job_finished" => {
                     let ok = payload["ok"].as_bool().unwrap_or(false);
                     let err_key = payload["error_key"].as_str().map(|s| s.to_string());
@@ -1007,8 +1069,17 @@ fn t(&self, key: &str) -> String {
                     }
                     let cancelled = !ok && err_key.as_deref() == Some("error.cancelled");
                     if ok {
-                        self.notice =
-                            Some(if skipped > 0 { "job.ok_skipped" } else { "job.ok" }.into());
+                        let renamed = self.job.as_ref().map(|j| j.renamed).unwrap_or(0);
+                        self.notice = Some(
+                            if renamed > 0 {
+                                "job.ok_renamed"
+                            } else if skipped > 0 {
+                                "job.ok_skipped"
+                            } else {
+                                "job.ok"
+                            }
+                            .into(),
+                        );
                     } else {
                         let key = err_key
                             .filter(|k| k.starts_with("error."))
@@ -1664,6 +1735,9 @@ let extract_enabled = self.archive.is_some();
                     title: self.t("extract.title"),
                     ..Default::default()
                 });
+                // Last job's rename/failure lists belong to the last job.
+                self.renamed_entries.clear();
+                self.error_detail.clear();
                 match svc.extract(
                     arch_id,
                     srcs.iter().cloned().collect(),
@@ -2304,15 +2378,33 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
             let mut open = true;
             egui::Window::new(self.t("error.title"))
                 .collapsible(false)
+                .resizable(false)
                 .open(&mut open)
+                .default_width(430.0)
                 .show(ctx, |ui| {
                     ui.colored_label(error_color(ui), err);
-                    if ui.button(self.t("extract.cancel")).clicked() {
+                    // Which entries were not written, and why. A failure that
+                    // only says "something failed" is not good enough when files
+                    // are missing.
+                    if !self.error_detail.is_empty() {
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .id_salt("zipnest-error-detail")
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for line in &self.error_detail {
+                                    ui.label(line);
+                                }
+                            });
+                    }
+                    if ui.button(self.t("job.close")).clicked() {
                         self.error = None;
+                        self.error_detail.clear();
                     }
                 });
             if !open {
                 self.error = None;
+                self.error_detail.clear();
             }
         }
     }
@@ -2339,6 +2431,21 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                             ok_color(ui),
                             self.notice_text().unwrap_or_else(|| self.t("job.ok")),
                         );
+                        // Entries whose archived name could not be stored as-is.
+                        // They *are* on disk — under the name on the right — so
+                        // this is information, not a warning.
+                        if !self.renamed_entries.is_empty() {
+                            ui.separator();
+                            ui.label(self.t("job.renamed.header"));
+                            egui::ScrollArea::vertical()
+                                .id_salt("zipnest-renamed-list")
+                                .max_height(140.0)
+                                .show(ui, |ui| {
+                                    for (from, to) in &self.renamed_entries {
+                                        ui.label(format!("{from}  →  {to}"));
+                                    }
+                                });
+                        }
                     } else {
                         let k = j.error_key.clone().unwrap_or_else(|| "error.engine".into());
                         ui.colored_label(error_color(ui), self.t(&k));

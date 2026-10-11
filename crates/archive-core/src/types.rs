@@ -81,17 +81,45 @@ pub struct ExtractProgress {
     pub current_path: String,
 }
 
+/// An entry that was written under a different name because the archived name
+/// is not usable on this filesystem (device name, illegal characters, `..`,
+/// over-long component, a collision after cleaning). The content is complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenamedEntry {
+    /// The name as the archive carried it.
+    pub from: String,
+    /// The name it was written as, relative to the destination.
+    pub to: String,
+}
+
+/// An entry that could **not** be written at all.
+///
+/// A non-empty `failed` list means the extraction did *not* succeed: the caller
+/// must report a failure, never a success, because files are missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryFailure {
+    /// The name as the archive carried it.
+    pub path: String,
+    /// Stable reason key (`error.*`) for the UI.
+    pub reason: &'static str,
+    /// The operating system's own words, when it gave any (never localized).
+    pub detail: Option<String>,
+}
+
 /// Summary of a completed extraction.
 #[derive(Debug, Default, Clone)]
 pub struct ExtractStats {
     pub files: u32,
     pub bytes: u64,
-    /// Archive paths that were not written: unsafe names (path escape, Windows
-    /// reserved name, …), entries whose destination already existed under the
-    /// `skip` policy, and entries whose destination could not be created.
-    /// Everything else still extracts; the caller surfaces these so nothing
-    /// looks silently lost.
+    /// Entries the user's own conflict policy asked to leave alone (an existing
+    /// destination under `OnConflict::Skip`, or one that cannot be renamed
+    /// because the policy forbids overwriting). Deliberate, not a defect.
     pub skipped: Vec<String>,
+    /// Entries that were written under a changed name. Everything in here is on
+    /// disk with complete content.
+    pub renamed: Vec<RenamedEntry>,
+    /// Entries that are *not* on disk. Non-empty ⇒ the run failed.
+    pub failed: Vec<EntryFailure>,
 }
 
 // ---------------------------------------------------------------------------
