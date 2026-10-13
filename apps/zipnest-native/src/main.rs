@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.15";
+const CURRENT_VERSION: &str = "0.4.16";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 /// Derived from [`CURRENT_VERSION`] on purpose: a hand-typed string here sat at
 /// `0.4.0` for ten releases (the release checklist asked for it every time and
