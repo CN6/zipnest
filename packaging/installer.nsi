@@ -65,6 +65,18 @@ InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 
+; The setup .exe's own icon, the MUI page icon, and the embedded uninstaller's
+; icon. None of these existed before, so NSIS shipped its generic icon: that is
+; why Explorer and third-party uninstall tools showed a blank/default icon for
+; ZipNest_<ver>_x64-setup.exe. The app's exe already carries this icon (app.rc);
+; these make the installer and its uninstaller match it.
+; Path is relative to this script, and makensis runs from packaging\.
+!define ZN_ICON "..\apps\zipnest-native\src\assets\zipnest.ico"
+Icon "${ZN_ICON}"
+UninstallIcon "${ZN_ICON}"
+!define MUI_ICON "${ZN_ICON}"
+!define MUI_UNICON "${ZN_ICON}"
+
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
@@ -249,6 +261,9 @@ zn_copy_files:
   WriteRegStr HKCU "${UNINSTKEY}" "Publisher" "ZipNest contributors"
   WriteRegStr HKCU "${UNINSTKEY}" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "${UNINSTKEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
+  ; Without this, Apps & Features / uninstall managers fall back to a generic
+  ; icon for the ZipNest entry instead of the app icon.
+  WriteRegStr HKCU "${UNINSTKEY}" "DisplayIcon" "$\"$INSTDIR\zipnest.exe$\",0"
   WriteRegDWORD HKCU "${UNINSTKEY}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINSTKEY}" "NoRepair" 1
 
