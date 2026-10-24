@@ -26,6 +26,12 @@
 //! Windows' own Default apps page afterwards (Windows simply replaces the same
 //! key again).
 //!
+//! Because the delete is what makes the write possible, it is also what would
+//! silently cost the user their handler if the write then failed. So the old
+//! values are read out first and written back — with a freshly derived hash —
+//! whenever the write or the hash check fails, and a claim that could not be
+//! undone says so in its error instead of claiming success.
+//!
 //! Measured on Windows 11 26H1 (build 28020), where the older "send the user to
 //! Settings" approach had stopped working entirely: the computed hash reproduced
 //! the stored hash for every key on the machine that had one (8/8), and after
@@ -616,23 +622,205 @@ pub fn recorded_handler(ext: &str) -> Option<String> {
     }
 }
 
-/// Make ZipNest the default handler for one extension.
+// ---------------------------------------------------------------------------
+// Claiming, with an undo path
+// ---------------------------------------------------------------------------
+
+/// The registry operations a claim needs.
 ///
-/// Deleting and recreating the key is what makes this work where writing into it
-/// cannot: Windows keeps the *user's* key modifiable, it only denies value
-/// writes. A stale `UserChoiceLatest` (an undocumented second store some 26H1
-/// builds add) is dropped so it cannot compete with the entry we write.
-#[cfg(windows)]
-pub fn claim_default(ext: &str, exe_prog_id: &str) -> Result<String, String> {
-    let sid = win32::sid_string().ok_or_else(|| "cannot read the current user SID".to_string())?;
-    let dotted = dotted_extension(ext);
-    let ext = dotted.as_str();
+/// Behind a trait so the undo path -- the part that has to be right while
+/// something else is already failing -- can be driven against a fake hive.
+trait ChoiceReg {
+    fn get_string(&self, path: &str, name: &str) -> Option<String>;
+    fn set_string(&self, path: &str, name: &str, value: &str) -> Result<(), String>;
+    fn delete_subkey(&self, parent: &str, sub: &str) -> u32;
+    fn last_write(&self, path: &str) -> Option<u64>;
+    fn write_dword(&self, path: &str, name: &str, value: u32) -> Result<(), String>;
+}
+
+/// What a protected key held before it was replaced.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ChoiceBackup {
+    prog_id: Option<String>,
+    hash: Option<String>,
+}
+
+impl ChoiceBackup {
+    fn is_empty(&self) -> bool {
+        self.prog_id.is_none() && self.hash.is_none()
+    }
+}
+
+/// `RegDeleteTreeW`/`RegDeleteKeyW` report "not there" separately; that is the
+/// state we were aiming for, so it counts as success.
+fn delete_left_nothing(rc: u32) -> bool {
+    // 0, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND -- plus u32::MAX, which is
+    // what `win32::delete_subkey` returns when the *parent* key could not be
+    // opened: a parent that is not there holds no default either.
+    matches!(rc, 0 | 2 | 3 | u32::MAX)
+}
+
+/// Recompute the hash for whatever the key's last-write time is right now.
+fn derive_hash_with(
+    reg: &dyn ChoiceReg,
+    ext: &str,
+    sid: &str,
+    prog_id: &str,
+    choice_key: &str,
+) -> String {
+    let ticks = reg.last_write(choice_key).unwrap_or(0);
+    user_choice_hash(ext, sid, prog_id, ticks)
+}
+
+/// Put `UserChoice` back for the handler the user had.
+///
+/// The old `Hash` cannot simply be written back: it covers the key's own
+/// last-write time, and recreating the key gives it a new one, so Windows would
+/// ignore the entry. The ProgId is rewritten and the hash derived again for
+/// whatever time the recreated key ended up with.
+fn restore_user_choice(
+    reg: &dyn ChoiceReg,
+    ext: &str,
+    sid: &str,
+    parent: &str,
+    backup: &ChoiceBackup,
+) -> Result<(), String> {
+    let choice = format!("{parent}\\UserChoice");
+    let Some(prog_id) = backup.prog_id.as_deref() else {
+        // A Hash without a ProgId identifies nothing; leave the key absent
+        // rather than invent an entry.
+        return if backup.hash.is_some() {
+            Err(format!("{choice} recorded a Hash but no ProgId"))
+        } else {
+            Ok(())
+        };
+    };
+    reg.set_string(&choice, "ProgId", prog_id)
+        .map_err(|e| format!("cannot rewrite {choice}\\ProgId: {e}"))?;
+    if backup.hash.is_some() {
+        let mut hash = derive_hash_with(reg, ext, sid, prog_id, &choice);
+        reg.set_string(&choice, "Hash", &hash)
+            .map_err(|e| format!("cannot rewrite {choice}\\Hash: {e}"))?;
+        let reverified = derive_hash_with(reg, ext, sid, prog_id, &choice);
+        if reverified != hash {
+            hash = reverified;
+            reg.set_string(&choice, "Hash", &hash)
+                .map_err(|e| format!("cannot rewrite {choice}\\Hash: {e}"))?;
+            if derive_hash_with(reg, ext, sid, prog_id, &choice) != hash {
+                return Err(format!("the restored hash for {ext} did not verify"));
+            }
+        }
+    }
+    match reg.get_string(&choice, "ProgId") {
+        Some(now) if now == prog_id => Ok(()),
+        other => Err(format!(
+            "{choice}\\ProgId reads back as {other:?}, expected {prog_id:?}"
+        )),
+    }
+}
+
+/// Put `UserChoiceLatest` back exactly as it was read.
+///
+/// The store is undocumented and validated by Windows itself, so its values are
+/// restored verbatim instead of being recomputed.
+fn restore_latest(reg: &dyn ChoiceReg, parent: &str, backup: &ChoiceBackup) -> Result<(), String> {
+    if backup.is_empty() {
+        return Ok(());
+    }
+    let path = format!("{parent}\\UserChoiceLatest\\ProgId");
+    if let Some(value) = backup.prog_id.as_deref() {
+        reg.set_string(&path, "ProgId", value)
+            .map_err(|e| format!("cannot rewrite {path}\\ProgId: {e}"))?;
+    }
+    if let Some(value) = backup.hash.as_deref() {
+        reg.set_string(&path, "Hash", value)
+            .map_err(|e| format!("cannot rewrite {path}\\Hash: {e}"))?;
+    }
+    match (backup.prog_id.as_deref(), reg.get_string(&path, "ProgId")) {
+        (None, _) => Ok(()),
+        (Some(want), Some(now)) if now == want => Ok(()),
+        (Some(want), other) => Err(format!(
+            "{path}\\ProgId reads back as {other:?}, expected {want:?}"
+        )),
+    }
+}
+
+/// Claim one extension, restoring the previous handler if any step fails.
+///
+/// `ext` must already be dotted.
+fn claim_default_with(
+    reg: &dyn ChoiceReg,
+    ext: &str,
+    exe_prog_id: &str,
+    sid: &str,
+) -> Result<String, String> {
     let parent = file_exts_path(ext);
     let choice = format!("{parent}\\UserChoice");
+    let latest = format!("{parent}\\UserChoiceLatest\\ProgId");
 
-    win32::delete_subkey(&parent, "UserChoice");
-    win32::delete_subkey(&parent, "UserChoiceLatest");
-    win32::write_string(&choice, "ProgId", exe_prog_id)?;
+    // Read before deleting: the delete is only safe because everything it
+    // removes has been copied here first.
+    let backup = ChoiceBackup {
+        prog_id: reg.get_string(&choice, "ProgId"),
+        hash: reg.get_string(&choice, "Hash"),
+    };
+    let latest_backup = ChoiceBackup {
+        prog_id: reg.get_string(&latest, "ProgId"),
+        hash: reg.get_string(&latest, "Hash"),
+    };
+
+    // Undo a half-finished claim. Half of a ProgId/Hash pair is worse than no
+    // entry at all -- Windows ignores it, but `release_default` would still read
+    // the ProgId and believe the extension is ours -- so both keys are cleared
+    // before being rebuilt.
+    let undo = |why: String| -> String {
+        let mut problems: Vec<String> = Vec::new();
+        let rc = reg.delete_subkey(&parent, "UserChoice");
+        if !delete_left_nothing(rc) {
+            problems.push(format!("cannot clear {choice} to undo ({rc})"));
+        }
+        if let Err(e) = restore_user_choice(reg, ext, sid, &parent, &backup) {
+            problems.push(e);
+        }
+        let rc = reg.delete_subkey(&parent, "UserChoiceLatest");
+        if !delete_left_nothing(rc) {
+            problems.push(format!("cannot clear {parent}\\UserChoiceLatest to undo ({rc})"));
+        }
+        if let Err(e) = restore_latest(reg, &parent, &latest_backup) {
+            problems.push(e);
+        }
+        if problems.is_empty() {
+            format!("{why} (the previous handler was restored)")
+        } else {
+            format!(
+                "{why} (and the previous handler could NOT be restored: {})",
+                problems.join("; ")
+            )
+        }
+    };
+
+    // Nothing has been read that could be written back if this fails, and an
+    // entry Windows already ignores is not worth writing over anyway.
+    let rc = reg.delete_subkey(&parent, "UserChoice");
+    if !delete_left_nothing(rc) {
+        return Err(format!(
+            "cannot remove the existing {ext} default (RegDeleteTreeW -> {rc})"
+        ));
+    }
+    // A stale `UserChoiceLatest` (an undocumented second store some 26H1 builds
+    // add) is dropped so it cannot compete with the entry we write.
+    let rc = reg.delete_subkey(&parent, "UserChoiceLatest");
+    if !delete_left_nothing(rc) {
+        return Err(undo(format!(
+            "cannot remove the stale UserChoiceLatest for {ext} ({rc})"
+        )));
+    }
+
+    if let Err(e) = reg.set_string(&choice, "ProgId", exe_prog_id) {
+        return Err(undo(format!(
+            "writing {exe_prog_id} as the {ext} handler failed: {e}"
+        )));
+    }
 
     // The hash covers the key's own last-write time (truncated to the minute),
     // so it is derived from the key *after* the ProgId write -- and then
@@ -640,32 +828,72 @@ pub fn claim_default(ext: &str, exe_prog_id: &str) -> Result<String, String> {
     // Writing `Hash` re-stamps the key, so a minute rollover in between would
     // leave a value Windows rejects; it reacts by deleting the whole entry, so
     // verifying like this is not optional.
-    let mut hash = derive_hash(ext, &sid, exe_prog_id, &choice);
-    win32::write_string(&choice, "Hash", &hash)?;
-    let reverified = derive_hash(ext, &sid, exe_prog_id, &choice);
+    let mut hash = derive_hash_with(reg, ext, sid, exe_prog_id, &choice);
+    if let Err(e) = reg.set_string(&choice, "Hash", &hash) {
+        return Err(undo(format!("writing the {ext} hash failed: {e}")));
+    }
+    let reverified = derive_hash_with(reg, ext, sid, exe_prog_id, &choice);
     if reverified != hash {
         // The write above landed in a new minute: the retry converges, because
         // this write stamps the key again inside the minute just entered.
         hash = reverified;
-        win32::write_string(&choice, "Hash", &hash)?;
-        if derive_hash(ext, &sid, exe_prog_id, &choice) != hash {
-            return Err(format!("hash did not verify for {ext}"));
+        if let Err(e) = reg.set_string(&choice, "Hash", &hash) {
+            return Err(undo(format!("rewriting the {ext} hash failed: {e}")));
+        }
+        if derive_hash_with(reg, ext, sid, exe_prog_id, &choice) != hash {
+            return Err(undo(format!("the hash written for {ext} did not verify")));
         }
     }
 
     // Windows shows "you have a new app" toasts when a handler changes; PS-SFTA
     // writes the same marker to keep the takeover quiet.
     let toasts = "Software\\Microsoft\\Windows\\CurrentVersion\\ApplicationAssociationToasts";
-    let _ = win32::write_dword(toasts, &format!("{exe_prog_id}_{ext}"), 0);
+    let _ = reg.write_dword(toasts, &format!("{exe_prog_id}_{ext}"), 0);
 
     Ok(hash)
 }
 
-/// Recompute the hash for whatever the key's last-write time is right now.
 #[cfg(windows)]
-fn derive_hash(ext: &str, sid: &str, prog_id: &str, choice_key: &str) -> String {
-    let ticks = win32::last_write(choice_key).unwrap_or(0);
-    user_choice_hash(ext, sid, prog_id, ticks)
+struct Registry;
+
+#[cfg(windows)]
+impl ChoiceReg for Registry {
+    fn get_string(&self, path: &str, name: &str) -> Option<String> {
+        win32::get_string(path, name)
+    }
+
+    fn set_string(&self, path: &str, name: &str, value: &str) -> Result<(), String> {
+        win32::write_string(path, name, value)
+    }
+
+    fn delete_subkey(&self, parent: &str, sub: &str) -> u32 {
+        win32::delete_subkey(parent, sub)
+    }
+
+    fn last_write(&self, path: &str) -> Option<u64> {
+        win32::last_write(path)
+    }
+
+    fn write_dword(&self, path: &str, name: &str, value: u32) -> Result<(), String> {
+        win32::write_dword(path, name, value)
+    }
+}
+
+/// Make ZipNest the default handler for one extension.
+///
+/// Deleting and recreating the key is what makes this work where writing into it
+/// cannot: Windows keeps the *user's* key modifiable, it only denies value
+/// writes. A stale `UserChoiceLatest` (an undocumented second store some 26H1
+/// builds add) is dropped so it cannot compete with the entry we write.
+///
+/// Since the delete is what makes the write possible, it is also what would cost
+/// the user their handler if the write then failed: the previous values are read
+/// first and written back whenever a later step fails. A claim that could not be
+/// undone says so in its error instead of reporting success.
+#[cfg(windows)]
+pub fn claim_default(ext: &str, exe_prog_id: &str) -> Result<String, String> {
+    let sid = win32::sid_string().ok_or_else(|| "cannot read the current user SID".to_string())?;
+    claim_default_with(&Registry, &dotted_extension(ext), exe_prog_id, &sid)
 }
 
 #[cfg(not(windows))]
@@ -866,6 +1094,298 @@ mod tests {
             file_exts_path("zip"),
             "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.zip"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The undo path
+    //
+    // `claim_default` deletes the user's key before it writes the new one, so a
+    // failed write would leave them with no handler at all. These drive the
+    // sequence against an in-memory hive -- including the minute rollover that
+    // makes a hash stop verifying -- because that window is unobservable on a
+    // real machine.
+    // -----------------------------------------------------------------------
+
+    /// `FILETIME` for the `.zip` vector, used as the fake clock's origin.
+    const BASE_TICKS: u64 = 134361285656161523;
+
+    /// An in-memory stand-in for `HKCU`. Values live under (key path, value
+    /// name); every write re-stamps that key's last-write time, exactly like
+    /// `RegSetValueExW` does.
+    #[derive(Default)]
+    struct FakeHive {
+        values: std::cell::RefCell<std::collections::BTreeMap<(String, String), String>>,
+        stamps: std::cell::RefCell<std::collections::BTreeMap<String, u64>>,
+        /// (key, value, remaining failures)
+        fail_writes: std::cell::RefCell<Vec<(String, String, usize)>>,
+        /// subkey names whose delete fails
+        fail_deletes: std::cell::RefCell<Vec<String>>,
+        /// stamps handed out before the stored one is used again
+        stamp_script: std::cell::RefCell<std::collections::VecDeque<u64>>,
+        clock: std::cell::Cell<u64>,
+    }
+
+    impl FakeHive {
+        fn new() -> Self {
+            Self {
+                clock: std::cell::Cell::new(BASE_TICKS),
+                ..Self::default()
+            }
+        }
+
+        fn seed(&self, path: &str, name: &str, value: &str) {
+            self.values
+                .borrow_mut()
+                .insert((path.to_string(), name.to_string()), value.to_string());
+            self.stamp(path);
+        }
+
+        fn read(&self, path: &str, name: &str) -> Option<String> {
+            self.values
+                .borrow()
+                .get(&(path.to_string(), name.to_string()))
+                .cloned()
+        }
+
+        fn stamp(&self, path: &str) -> u64 {
+            let ticks = self.clock.get();
+            self.clock.set(ticks + 1);
+            self.stamps.borrow_mut().insert(path.to_string(), ticks);
+            ticks
+        }
+
+        /// Make the next `times` writes of this value fail.
+        fn fail_writes(&self, path: &str, name: &str, times: usize) {
+            self.fail_writes
+                .borrow_mut()
+                .push((path.to_string(), name.to_string(), times));
+        }
+
+        fn fail_delete(&self, sub: &str) {
+            self.fail_deletes.borrow_mut().push(sub.to_string());
+        }
+
+        /// Report these last-write times for the next `last_write` calls, so a
+        /// hash can be made to stop verifying without touching the clock.
+        fn script_stamps(&self, ticks: impl IntoIterator<Item = u64>) {
+            self.stamp_script.borrow_mut().extend(ticks);
+        }
+
+        fn stamp_of(&self, path: &str) -> Option<u64> {
+            self.stamps.borrow().get(path).copied()
+        }
+    }
+
+    impl ChoiceReg for FakeHive {
+        fn get_string(&self, path: &str, name: &str) -> Option<String> {
+            self.read(path, name)
+        }
+
+        fn set_string(&self, path: &str, name: &str, value: &str) -> Result<(), String> {
+            let mut failures = self.fail_writes.borrow_mut();
+            if let Some(slot) = failures
+                .iter_mut()
+                .find(|(p, n, left)| *left > 0 && p == path && n == name)
+            {
+                slot.2 -= 1;
+                return Err(format!("injected write failure for {path}\\{name}"));
+            }
+            drop(failures);
+            self.values
+                .borrow_mut()
+                .insert((path.to_string(), name.to_string()), value.to_string());
+            self.stamp(path);
+            Ok(())
+        }
+
+        fn delete_subkey(&self, parent: &str, sub: &str) -> u32 {
+            if self.fail_deletes.borrow().iter().any(|s| s == sub) {
+                return 5; // ERROR_ACCESS_DENIED
+            }
+            let prefix = format!("{parent}\\{sub}");
+            self.values.borrow_mut().retain(|(path, _), _| {
+                path != &prefix && !path.starts_with(&format!("{prefix}\\"))
+            });
+            self.stamps
+                .borrow_mut()
+                .retain(|path, _| path != &prefix && !path.starts_with(&format!("{prefix}\\")));
+            // u32::MAX is what the real helper returns when the parent itself
+            // is absent, which the caller must treat as "nothing there".
+            u32::MAX
+        }
+
+        fn last_write(&self, path: &str) -> Option<u64> {
+            if let Some(ticks) = self.stamp_script.borrow_mut().pop_front() {
+                return Some(ticks);
+            }
+            self.stamp_of(path)
+        }
+
+        fn write_dword(&self, _path: &str, _name: &str, _value: u32) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn ext_paths() -> (String, String, String) {
+        let parent = file_exts_path(".zip");
+        let choice = format!("{parent}\\UserChoice");
+        let latest = format!("{parent}\\UserChoiceLatest\\ProgId");
+        (parent, choice, latest)
+    }
+
+    /// The user had 7-Zip before; the new ProgId cannot be written. Their
+    /// handler has to come back, with a hash valid for the recreated key.
+    #[test]
+    fn a_failed_prog_id_write_puts_the_previous_handler_back() {
+        let hive = FakeHive::new();
+        let (_, choice, _) = ext_paths();
+        hive.seed(&choice, "ProgId", "7-Zip.zip");
+        hive.seed(&choice, "Hash", "c3RhbGU=");
+        hive.fail_writes(&choice, "ProgId", 1);
+
+        let err = claim_default_with(&hive, ".zip", "ZipNest.zip", SID).unwrap_err();
+
+        assert!(err.contains("was restored"), "{err}");
+        assert!(
+            !err.contains("could NOT be restored"),
+            "the undo must succeed: {err}"
+        );
+        assert_eq!(hive.read(&choice, "ProgId").as_deref(), Some("7-Zip.zip"));
+        // The old hash covered the old key's last-write time, so it cannot be
+        // copied back verbatim -- it is derived again for the recreated key.
+        let ticks = hive.stamp_of(&choice).expect("a last-write time");
+        assert_eq!(
+            hive.read(&choice, "Hash"),
+            Some(user_choice_hash(".zip", SID, "7-Zip.zip", ticks))
+        );
+    }
+
+    /// A hash that stops verifying (the minute rolled over between the writes)
+    /// is the other half of the same bug: nothing was written to fall back on,
+    /// and the old entry is already gone.
+    #[test]
+    fn a_hash_that_does_not_verify_puts_the_previous_handler_back() {
+        let hive = FakeHive::new();
+        let (_, choice, _) = ext_paths();
+        hive.seed(&choice, "ProgId", "7-Zip.zip");
+        hive.seed(&choice, "Hash", "c3RhbGU=");
+
+        // First derive sees one minute, the re-derive sees the next, and the
+        // retry's re-derive keeps sliding -- so the claim can never converge.
+        hive.script_stamps([
+            BASE_TICKS,
+            BASE_TICKS + TICKS_PER_MINUTE,
+            BASE_TICKS + 2 * TICKS_PER_MINUTE,
+        ]);
+
+        let err = claim_default_with(&hive, ".zip", "ZipNest.zip", SID).unwrap_err();
+
+        assert!(err.contains("did not verify"), "{err}");
+        assert!(err.contains("was restored"), "{err}");
+        assert_eq!(hive.read(&choice, "ProgId").as_deref(), Some("7-Zip.zip"));
+        let ticks = hive.stamp_of(&choice).expect("a last-write time");
+        assert_eq!(
+            hive.read(&choice, "Hash"),
+            Some(user_choice_hash(".zip", SID, "7-Zip.zip", ticks))
+        );
+    }
+
+    /// `UserChoiceLatest` is a separate store and has to be restored too, or
+    /// the stale copy wins the next time Explorer looks.
+    #[test]
+    fn a_failed_claim_restores_user_choice_latest_as_well() {
+        let hive = FakeHive::new();
+        let (_, choice, latest) = ext_paths();
+        hive.seed(&choice, "ProgId", "7-Zip.zip");
+        hive.seed(&latest, "ProgId", "Old.Latest");
+        hive.seed(&latest, "Hash", "bGF0ZXN0");
+        hive.fail_writes(&choice, "ProgId", 1);
+
+        let err = claim_default_with(&hive, ".zip", "ZipNest.zip", SID).unwrap_err();
+        assert!(err.contains("was restored"), "{err}");
+
+        assert_eq!(hive.read(&latest, "ProgId").as_deref(), Some("Old.Latest"));
+        // Restored verbatim: this store is undocumented and Windows validates
+        // it itself, so its hash is not ours to recompute.
+        assert_eq!(hive.read(&latest, "Hash").as_deref(), Some("bGF0ZXN0"));
+    }
+
+    /// When even the undo cannot write, the caller has to hear about it instead
+    /// of a cheerful `Ok`.
+    #[test]
+    fn an_undo_that_cannot_write_says_so() {
+        let hive = FakeHive::new();
+        let (_, choice, _) = ext_paths();
+        hive.seed(&choice, "ProgId", "7-Zip.zip");
+        // Both the claim's write and the restore's rewrite fail.
+        hive.fail_writes(&choice, "ProgId", 2);
+
+        let err = claim_default_with(&hive, ".zip", "ZipNest.zip", SID).unwrap_err();
+
+        assert!(err.contains("could NOT be restored"), "{err}");
+        assert!(err.contains("injected write failure"), "{err}");
+    }
+
+    /// The very first delete failing leaves the old entry alone, so there is
+    /// nothing to undo -- but it must still be an error, not a silent `Ok`.
+    #[test]
+    fn a_delete_that_fails_stops_before_anything_is_lost() {
+        let hive = FakeHive::new();
+        let (_, choice, _) = ext_paths();
+        hive.seed(&choice, "ProgId", "7-Zip.zip");
+        hive.seed(&choice, "Hash", "c3RhbGU=");
+        hive.fail_delete("UserChoice");
+
+        let err = claim_default_with(&hive, ".zip", "ZipNest.zip", SID).unwrap_err();
+
+        assert!(err.contains("cannot remove the existing"), "{err}");
+        assert_eq!(hive.read(&choice, "ProgId").as_deref(), Some("7-Zip.zip"));
+        assert_eq!(hive.read(&choice, "Hash").as_deref(), Some("c3RhbGU="));
+    }
+
+    /// A stale `UserChoiceLatest` that will not go away is also fatal: it would
+    /// compete with the entry just written.
+    #[test]
+    fn a_latest_that_will_not_delete_is_an_error() {
+        let hive = FakeHive::new();
+        let (_, choice, latest) = ext_paths();
+        hive.seed(&choice, "ProgId", "7-Zip.zip");
+        hive.seed(&latest, "ProgId", "Old.Latest");
+        hive.fail_delete("UserChoiceLatest");
+
+        let err = claim_default_with(&hive, ".zip", "ZipNest.zip", SID).unwrap_err();
+
+        assert!(err.contains("stale UserChoiceLatest"), "{err}");
+        assert_eq!(hive.read(&choice, "ProgId").as_deref(), Some("7-Zip.zip"));
+    }
+
+    /// The happy path still produces a hash that verifies, and leaves the entry
+    /// claimed rather than rolled back.
+    #[test]
+    fn a_successful_claim_keeps_the_new_handler() {
+        let hive = FakeHive::new();
+        let (_, choice, _) = ext_paths();
+        hive.seed(&choice, "ProgId", "7-Zip.zip");
+
+        let hash = claim_default_with(&hive, ".zip", "ZipNest.zip", SID).expect("claim");
+
+        assert_eq!(hive.read(&choice, "ProgId").as_deref(), Some("ZipNest.zip"));
+        assert_eq!(hive.read(&choice, "Hash").as_deref(), Some(hash.as_str()));
+        let ticks = hive.stamp_of(&choice).expect("a last-write time");
+        assert_eq!(hash, user_choice_hash(".zip", SID, "ZipNest.zip", ticks));
+    }
+
+    /// Nothing to save when the extension had no handler: the claim simply
+    /// succeeds and the undo path would write nothing back.
+    #[test]
+    fn a_first_claim_needs_no_backup() {
+        let hive = FakeHive::new();
+        let (_, choice, _) = ext_paths();
+
+        let hash = claim_default_with(&hive, ".zip", "ZipNest.zip", SID).expect("claim");
+
+        assert!(!hash.is_empty());
+        assert_eq!(hive.read(&choice, "ProgId").as_deref(), Some("ZipNest.zip"));
     }
 }
 

@@ -1,9 +1,9 @@
-﻿; ZipNest 0.4.16 native installer (NSIS Unicode)
+; ZipNest 0.4.17 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.4.16"
+!define VERSION "0.4.17"
 ; This installer is a 32-bit process, so plain $PROGRAMFILES would resolve to
 ; "C:\Program Files (x86)" on 64-bit Windows. ZipNest ships as x64, so force
 ; the 64-bit location. InstallDirRegKey below still reads HKCU\...\ZipNest's
@@ -24,6 +24,24 @@ Unicode True
 !define ZN_BUSY_MSG_EN "Some files could not be written because they are still in use (ZipNest running, or a virus scan). Close ZipNest, then choose Retry."
 !define ZN_BUSY_GIVEUP_MSG "仍有文件被占用，这次没能更新它们。请关闭 ZipNest（或重启电脑）后重新运行安装包。"
 !define ZN_BUSY_GIVEUP_MSG_EN "Some files are still in use and were not updated. Close ZipNest (or reboot) and run the installer again."
+
+; Forced-kill consent (see ZN_TRY_CLOSE_RUNNING). Ten polite close requests can
+; fail because the window is busy with a job -- force-killing that loses the
+; user's extraction -- so we ask first and never decide for them.
+!define ZN_BUSY_FILE "$APPDATA\ZipNest\busy"
+!define ZN_FORCE_ASK_MSG "ZipNest 仍在运行，没有响应关闭请求。「强制关闭」会立即结束它，未完成的解压/压缩会丢失。是否强制关闭并继续？"
+!define ZN_FORCE_ASK_MSG_EN "ZipNest is still running and did not respond to the close request. Forcing it closed ends it immediately and any unfinished extraction or compression is lost. Force it closed and continue?"
+!define ZN_FORCE_BUSY_MSG "ZipNest 正在解压/压缩中，并且没有响应关闭请求。「强制关闭」会丢弃这个正在进行的任务。是否强制关闭并继续？"
+!define ZN_FORCE_BUSY_MSG_EN "ZipNest is in the middle of an extraction or compression and did not respond to the close request. Forcing it closed discards that job. Force it closed and continue?"
+; What a /S (silent) install answers when the user cannot be asked. The default
+; is "no": an unattended deployment must never kill somebody's job, so it
+; aborts with ZN_ERR_RUNNING instead. Define ZN_FORCE_STOP_IN_SILENT (or pass
+; it on the makensis command line) to opt in to force-stopping unasked.
+!ifdef ZN_FORCE_STOP_IN_SILENT
+  !define ZN_FORCE_ASK_SD IDYES
+!else
+  !define ZN_FORCE_ASK_SD IDNO
+!endif
 
 ; Exit codes. NSIS exits 0 unless told otherwise, so every failure path used to
 ; look like success to an unattended deployment (`/S` shows no dialog either).
@@ -59,7 +77,7 @@ Unicode True
 !macroend
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.4.16_x64-setup.exe"
+OutFile "ZipNest_0.4.17_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -101,13 +119,40 @@ UninstallIcon "${ZN_ICON}"
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
 ; Close a running ZipNest so its exe/dll are not locked while we overwrite
-; them. Never force-kills first: ZipNest may be mid-extraction/mid-archive, so
-; we ask it to close, wait, and only escalate to /F if it really will not go.
-; On failure we tell the user and Abort instead of overwriting locked files.
+; them. The polite phase never force-kills: ZipNest may be mid-extraction, and
+; killing it destroys that work (and can leave a half-written archive). Only
+; when it is *still* running after 10 polite close requests do we ask the user
+; whether to force it; /F then runs only after an explicit "yes". A silent
+; install answers "no" unless ZN_FORCE_STOP_IN_SILENT is defined, so an
+; unattended deployment never kills somebody's job behind their back.
+;
+; Declining aborts with ZN_ERR_RUNNING -- the install stops and says why rather
+; than overwriting files under a live process.
 ;
 ; $0 = taskkill exit code (0 = a request was delivered / a kill succeeded;
-;      128 = process not found, i.e. it is gone), $1/$2 = gentle retries,
-;      $3 = forced-kill retries (allowed to wrap: we only care about parity).
+;      128 = process not found, i.e. it is gone), $1 = pid_var (kept for the
+;      callers' signature), $2 = polite retries, $3 = forced-kill retries,
+;      $R0-$R3 = scratch belonging to ZN_IS_ZIPNEST_RUNNING.
+
+; Is zipnest.exe running right now? Leaves 1 in $R0 when it is, 0 when not.
+;
+; tasklist is used instead of the named mutex because the uninstaller may run
+; elevated / for another user, where Local\ mutexes are not the same object;
+; a process list is the honest answer either way. The filter matches by image
+; name, and with /NH the only lines that can appear start with "zipnest.exe"
+; (otherwise tasklist prints an "INFO: no tasks" line), so a prefix test is
+; enough and no output parsing of dates/columns is needed.
+!macro ZN_IS_ZIPNEST_RUNNING
+  StrCpy $R0 0
+  nsExec::ExecToStack '"$SYSDIR\tasklist.exe" /FI "IMAGENAME eq zipnest.exe" /NH'
+  Pop $R1 ; exit code -- 0 even when nothing matched, so the text decides
+  Pop $R2 ; captured output
+  StrCpy $R3 $R2 11
+  ; equal -> fall through and set 1; not equal -> skip the StrCpy.
+  StrCmp $R3 "zipnest.exe" 0 +2
+  StrCpy $R0 1
+!macroend
+
 !macro ZN_TRY_CLOSE_RUNNING pid_var label_prefix
   StrCpy ${pid_var} 0
   StrCpy $2 0
@@ -121,9 +166,33 @@ UninstallIcon "${ZN_ICON}"
   ${label_prefix}_gentle_more:
     Sleep 1000
     IntOp $2 $2 + 1
-    IntCmp $2 10 ${label_prefix}_forced ${label_prefix}_gentle ${label_prefix}_gentle
+    IntCmp $2 10 ${label_prefix}_ask ${label_prefix}_gentle ${label_prefix}_gentle
 
-  ; Phase 2: the app refused to close; force it, then re-check that it is gone.
+  ; Phase 2: ten polite requests did not get rid of it. Ask.
+  ; A second opinion from the process list: taskkill can report success while
+  ; the process is a zombie for a moment, and an idle window that ignored
+  ; WM_CLOSE must not be treated as "gone".
+  ${label_prefix}_ask:
+    !insertmacro ZN_IS_ZIPNEST_RUNNING
+    IntCmp $R0 0 ${label_prefix}_gone
+    ; A job in progress is the dangerous case: force-killing that loses the
+    ; user's extraction. The app publishes %APPDATA%\ZipNest\busy while one
+    ; runs, so the warning can say which of the two it is.
+    IfFileExists "${ZN_BUSY_FILE}" 0 ${label_prefix}_ask_idle
+      MessageBox MB_YESNO|MB_ICONEXCLAMATION "${ZN_FORCE_BUSY_MSG}$\r$\n$\r$\n${ZN_FORCE_BUSY_MSG_EN}" /SD ${ZN_FORCE_ASK_SD} IDYES ${label_prefix}_forced
+      Goto ${label_prefix}_declined
+    ${label_prefix}_ask_idle:
+    ; Idle window: it just refused to go, nothing is being lost by forcing it.
+    MessageBox MB_YESNO|MB_ICONEXCLAMATION "${ZN_FORCE_ASK_MSG}$\r$\n$\r$\n${ZN_FORCE_ASK_MSG_EN}" /SD ${ZN_FORCE_ASK_SD} IDYES ${label_prefix}_forced
+
+  ; No permission: do not touch it. Aborting is a failure, and the exit code
+  ; is the only thing a silent/scripted install can observe.
+  ${label_prefix}_declined:
+    DetailPrint "ZipNest 仍在运行，未获允许强制关闭，安装已中止"
+    SetErrorLevel ${ZN_ERR_RUNNING}
+    Abort
+
+  ; Phase 3: the user said yes -- force it, then re-check that it is gone.
   ${label_prefix}_forced:
     nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM zipnest.exe'
     Pop $0
@@ -134,11 +203,9 @@ UninstallIcon "${ZN_ICON}"
     IntOp $3 $3 + 1
     IntCmp $3 12 ${label_prefix}_abort ${label_prefix}_forced ${label_prefix}_forced
 
-  ; Phase 3: still running -- refuse to overwrite its files.
+  ; Even /F did not work: refuse to overwrite its files.
   ${label_prefix}_abort:
     MessageBox MB_OK|MB_ICONSTOP "${ZN_RUNNING_MSG}$\r$\n$\r$\n${ZN_RUNNING_MSG_EN}" /SD IDOK
-    ; Aborting is a failure: say so through the exit code, which is all a
-    ; silent/scripted install can observe.
     SetErrorLevel ${ZN_ERR_RUNNING}
     Abort
   ${label_prefix}_gone:

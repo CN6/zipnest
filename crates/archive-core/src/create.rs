@@ -171,6 +171,67 @@ fn temp_tar_path(dest: &Path) -> PathBuf {
     temp_scratch_path(dest, "tar")
 }
 
+/// The path to hand to the OS, prefixing long absolute paths with the verbatim
+/// `\\?\` marker so Windows doesn't reject them past MAX_PATH (os error
+/// 123). Mirrors the extract-side helper (extract.rs) so the temp stream and
+/// the final rename both survive a deep destination directory.
+#[cfg(windows)]
+fn os_path(p: &Path) -> PathBuf {
+    const LIMIT: usize = 240;
+    let s = p.as_os_str().to_string_lossy();
+    if s.len() < LIMIT || !p.is_absolute() || s.starts_with(r"\\?\") {
+        return p.to_path_buf();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    match s.strip_prefix(r"\\") {
+        // A UNC path needs the `UNC\` form, not `\\?\` + `\\`.
+        Some(rest) => {
+            out.push_str(r"\\?\UNC\\");
+            out.push_str(rest);
+        }
+        None => {
+            out.push_str(r"\\?\\");
+            out.push_str(&s);
+        }
+    }
+    PathBuf::from(out.replace('/', "\\"))
+}
+
+#[cfg(not(windows))]
+fn os_path(p: &Path) -> PathBuf {
+    p.to_path_buf()
+}
+
+/// A unique temp sibling for an atomic single-file create: same directory as
+/// `dest` so the final rename stays on one volume. The base name is trimmed
+/// when the suffix would push the whole component past 255 bytes (a name may
+/// itself be 255 bytes long). The `.zipnest-part-` marker is what the tests
+/// look for to assert no leftover temp survives any path.
+fn temp_part_path(dest: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    const MAX_COMPONENT: usize = 255;
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out".to_string());
+    let suffix = format!(
+        ".zipnest-part-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut base = name;
+    if base.len() + suffix.len() > MAX_COMPONENT {
+        let mut cut = MAX_COMPONENT.saturating_sub(suffix.len());
+        while cut > 0 && !base.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        base.truncate(cut);
+    }
+    let mut tmp = std::ffi::OsString::from(base);
+    tmp.push(suffix);
+    dest.with_file_name(tmp)
+}
+
 /// Inner node name for a compressed TAR: the destination filename with the
 /// compression suffix removed (`out.tar.gz` -> `out.tar`). This is the name the
 /// single compressed stream carries, so clients show `out.tar` rather than the
@@ -443,7 +504,7 @@ pub fn create_archive(
         return create_sfx(kind, sources, dest, opts, progress);
     }
     let clsid = clsid_for(opts.format).ok_or(ZipnestError::Engine(E_NOTIMPL))?;
-    write_archive(clsid, sources, dest, opts, progress)
+    write_archive(clsid, sources, dest, opts, progress, true)
 }
 
 /// Create a self-extracting `.exe`: build a normal 7z into a scratch file, then
@@ -469,7 +530,9 @@ fn create_sfx(
     // Build a plain .7z first; clearing `sfx` keeps this from recurring.
     let mut inner = opts.clone();
     inner.sfx = None;
-    let stats = write_archive(CLSID_FORMAT_7Z, sources, &archive, &inner, progress)?;
+    // Inner scratch write: `archive` is already a temp guarded by `_cleanup`,
+    // so no second temp/rename layer is needed here.
+    let stats = write_archive(CLSID_FORMAT_7Z, sources, &archive, &inner, progress, false)?;
 
     let bytes_out = concat_files(&stub, &archive, dest)?;
     Ok(CreateStats {
@@ -492,7 +555,8 @@ fn create_compressed_tar(
     let tar_path = temp_tar_path(dest);
     let _cleanup = TempCleanup(tar_path.clone());
 
-    let inner_stats = write_archive(CLSID_FORMAT_TAR, sources, &tar_path, opts, progress)?;
+    // Inner scratch write: `tar_path` is already a temp guarded by `_cleanup`.
+    let inner_stats = write_archive(CLSID_FORMAT_TAR, sources, &tar_path, opts, progress, false)?;
 
     let inner = [CreateSource {
         path: tar_path,
@@ -502,7 +566,8 @@ fn create_compressed_tar(
     // accidental "Copy disables compression" interpretation.
     let mut wrapper_opts = opts.clone();
     wrapper_opts.method = CompressionMethod::Auto;
-    let outer_stats = write_archive(wrapper, &inner, dest, &wrapper_opts, progress)?;
+    // Outer pass writes the final destination, so it gets the atomic temp+rename.
+    let outer_stats = write_archive(wrapper, &inner, dest, &wrapper_opts, progress, true)?;
 
     Ok(CreateStats {
         files: inner_stats.files,
@@ -556,6 +621,7 @@ fn write_archive(
     dest: &Path,
     opts: &CreateOptions,
     progress: &mut dyn FnMut(&CreateProgress) -> bool,
+    atomic_dest: bool,
 ) -> Result<CreateStats, ZipnestError> {
     let (items, total_bytes) = stat_sources(sources)?;
     let files = items.iter().filter(|i| !i.is_dir).count() as u32;
@@ -566,8 +632,18 @@ fn write_archive(
     // With a volume size, the stream spans `<dest>.001`, `.002`, ... instead of
     // a single `<dest>`; the handler is unaware and simply writes bytes (7-Zip's
     // own client does exactly this, via its `CMultiOutStream`).
+    // An atomic single-file create writes to a temp sibling and renames on
+    // success; the guard removes the temp on every path. Multi-volume output
+    // keeps its existing finalize-on-success / delete-on-failure semantics.
+    let mut atomic_tmp: Option<(PathBuf, TempCleanup)> = None;
     let out = match opts.volume_bytes {
         Some(limit) => OutTarget::Volumes(outstream::new_volumes(dest, limit)?),
+        None if atomic_dest => {
+            let tmp = temp_part_path(dest);
+            let stream = outstream::new(&tmp)?;
+            atomic_tmp = Some((tmp.clone(), TempCleanup(tmp)));
+            OutTarget::File(stream)
+        }
         None => OutTarget::File(outstream::new(dest)?),
     };
     let is_volumes = out.is_volumes();
@@ -655,6 +731,13 @@ fn write_archive(
 
     let bytes_out = if is_volumes {
         volume_bytes
+    } else if let Some((tmp, _guard)) = atomic_tmp.take() {
+        // Commit the finished archive over `dest`. The TempCleanup guard is
+        // dropped here on success too, but rename means its remove_file is a
+        // no-op. A rename failure (target locked, disk full) surfaces as Io and
+        // leaves the original `dest` untouched.
+        std::fs::rename(os_path(&tmp), os_path(dest)).map_err(ZipnestError::Io)?;
+        std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0)
     } else {
         std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0)
     };

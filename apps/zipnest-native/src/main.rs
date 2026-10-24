@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.16";
+const CURRENT_VERSION: &str = "0.4.17";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 /// Derived from [`CURRENT_VERSION`] on purpose: a hand-typed string here sat at
 /// `0.4.0` for ten releases (the release checklist asked for it every time and
@@ -349,6 +349,28 @@ fn claim_default_formats(list: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Hand every claimed archive format back to whatever was the default before
+/// ZipNest took it over.
+///
+/// This is the other half of [`claim_default_formats`]: claiming only rewrote
+/// the `FileExts\<ext>\UserChoice` record, so uninstalling without releasing it
+/// left Windows pointed at a ProgID whose registry tree (and exe) the uninstaller
+/// was about to delete. Double-clicking a .zip afterwards did nothing at all.
+///
+/// Formats the user has since given to another program are left alone — see
+/// [`zipnest_ipc::shell::release_defaults_for`]. Returns the extensions that
+/// could not be released.
+fn release_default_formats(list: &[String]) -> Vec<String> {
+    let exts = claimed_extensions(list);
+    zipnest_ipc::shell::release_defaults_for(exts.iter().map(String::as_str))
+        .into_iter()
+        .map(|(ext, reason)| {
+            eprintln!("ZipNest: could not release .{ext}: {reason}");
+            ext
+        })
+        .collect()
+}
+
 /// Look for a newer release.
 ///
 /// `manual` marks the Settings/toolbar button. Only that path may show a state:
@@ -436,17 +458,30 @@ fn main() -> Result<(), eframe::Error> {
     // the UI. A failure is reported through the exit code.
     if args.iter().skip(1).any(|a| a == "--unregister-shell") {
         cap_cli_runtime();
+        // Release the recorded defaults *first*, while the ProgIDs they point
+        // at still exist: `release_default` reads the current handler to decide
+        // whether it is ours to give back. Doing it after `assoc_removals` on
+        // the same pass would still work (the ops are only applied below) but
+        // ordering it first keeps the intent obvious.
+        let unreleased = release_default_formats(&[]);
         let mut ops = zipnest_ipc::shell::context_menu_removals();
         ops.extend(zipnest_ipc::shell::assoc_removals());
-        return match zipnest_ipc::shell::ShellApplier::run(
+        let cleaned = match zipnest_ipc::shell::ShellApplier::run(
             &zipnest_ipc::shell::WindowsRegistry,
             &ops,
         ) {
-            Ok(()) => Ok(()),
+            Ok(()) => true,
             Err(e) => {
                 eprintln!("ZipNest: shell cleanup failed: {e}");
-                std::process::exit(1);
+                false
             }
+        };
+        // A leftover `FileExts` record the user does not own is exactly the
+        // dangling-ProgID bug this fixes, so surface it as a failure too.
+        return if cleaned && unreleased.is_empty() {
+            Ok(())
+        } else {
+            std::process::exit(1);
         };
     }
     let mut launch_open: Option<String> = None;
@@ -2227,6 +2262,11 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                     if !failed.is_empty() && self.notice.is_none() {
                         self.notice = Some("settings.shell.claim_partial".into());
                     }
+                } else {
+                    // Associations switched off entirely: give every format we
+                    // still own back, including the `FileExts` record, so Windows
+                    // stops opening archives with a ProgID we just removed.
+                    let _ = release_default_formats(&[]);
                 }
                 // The rows are a snapshot of the registry: re-read them so
                 // the status line reflects this very save.

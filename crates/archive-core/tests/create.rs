@@ -294,6 +294,55 @@ fn cancelling_wrap_pass_removes_temp_tar() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// P0 regression: a create that fails midway must not truncate an archive that
+/// already lives at `dest`, and must not leave a temp file behind. Before the
+/// temp+rename fix, `File::create(dest)` zeroed the target before the first
+/// byte of the new archive was known to be complete.
+#[test]
+fn failed_create_preserves_existing_destination_and_leaves_no_temp() {
+    let base = tmp("preservedest");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "big.bin", &vec![7u8; 3_000_000]);
+    let dest = base.join("out.7z");
+    std::fs::write(&dest, b"ORIGINAL CONTENT").unwrap();
+
+    let srcs = vec![CreateSource { path: src, node: "big.bin".into() }];
+    let mut o = opts(CreateFormat::SevenZ);
+    o.level = CompressionLevel::Normal;
+    let err = create_archive(&srcs, &dest, &o, &mut |_| false).expect_err("cancel must abort");
+    assert_eq!(err.error_key(), "error.cancelled", "got {err:?}");
+
+    assert_eq!(
+        std::fs::read_to_string(&dest).unwrap(),
+        "ORIGINAL CONTENT",
+        "a failed create must not truncate the pre-existing destination"
+    );
+    let leftovers = leftover_tmp(&base);
+    assert!(leftovers.is_empty(), "temp file left behind after failed create: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The success path still commits: the archive lands at `dest` and no temp
+/// sibling survives the rename.
+#[test]
+fn successful_create_commits_over_existing_destination() {
+    let base = tmp("commitdest");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "a.txt", b"fresh payload");
+    let dest = base.join("out.zip");
+    std::fs::write(&dest, b"STALE").unwrap();
+    let srcs = vec![CreateSource { path: src, node: "a.txt".into() }];
+    let stats = create_archive(&srcs, &dest, &opts(CreateFormat::Zip), &mut |_| true).unwrap();
+    assert_eq!(stats.bytes_out, std::fs::metadata(&dest).unwrap().len());
+    let arc = Archive::open(&dest, ArchiveOpenOptions::default()).unwrap();
+    assert_eq!(arc.entries().unwrap()[0].path, "a.txt");
+    let leftovers = leftover_tmp(&base);
+    assert!(leftovers.is_empty(), "temp file left behind after successful create: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn creates_7z_with_one_file_roundtrip() {
     let base = tmp("7z"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();

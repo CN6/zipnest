@@ -282,6 +282,48 @@ pub fn assoc_removals() -> Vec<RegOp> {
     ops
 }
 
+/// Give every supported extension back, including the record Windows itself
+/// keeps in `FileExts\<ext>\UserChoice`.
+///
+/// [`assoc_removals`] only clears what we wrote under `HKCU\Software\Classes`.
+/// That is not enough: once Windows has recorded a handler for an extension it
+/// keeps using that record no matter what `Classes` says, so an uninstall left
+/// the OS pointing at our ProgID — a handler whose files the uninstaller then
+/// deleted, leaving double-click on a .zip doing nothing at all.
+///
+/// The release is deliberately conditional (see [`crate::user_choice::release_default`]):
+/// a format the user handed to another program after installing ZipNest keeps
+/// that program.
+///
+/// Returns `(ext, reason)` for the releases that failed, mirroring
+/// [`crate::user_choice::claim_all`] so callers report both the same way.
+pub fn release_defaults() -> Vec<(String, String)> {
+    release_defaults_for(SUPPORTED_EXTENSIONS)
+}
+
+/// [`release_defaults`] over an explicit extension list, for the Settings dialog
+/// where only the ticked set is claimed and the rest has to be handed back.
+pub fn release_defaults_for<'a>(exts: impl IntoIterator<Item = &'a str>) -> Vec<(String, String)> {
+    let mut failures = Vec::new();
+    let mut released = false;
+    for ext in exts {
+        let pid = prog_id(ext);
+        // Ask first: `release_default` reports success even when it correctly
+        // decided to touch nothing, and the shell refresh below should only be
+        // sent when a record actually went away.
+        if crate::user_choice::recorded_handler(ext).is_some_and(|p| p.eq_ignore_ascii_case(&pid)) {
+            released = true;
+        }
+        if let Err(e) = crate::user_choice::release_default(ext, &pid) {
+            failures.push((ext.to_string(), e));
+        }
+    }
+    if released {
+        crate::user_choice::notify_shell();
+    }
+    failures
+}
+
 /// One Explorer context target. Kept separate because a hardened machine can
 /// deny `*\shell` (all files) or `Directory\Background\shell` while still
 /// allowing the others, so the UI reports them independently.

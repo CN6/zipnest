@@ -364,6 +364,11 @@ impl IpcService {
             blocked = shell::blocked_extensions(probe);
             ok
         } else {
+            // `assoc_removals` only clears `HKCU\Software\Classes`; the record
+            // Windows actually honours lives in `FileExts\<ext>\UserChoice` and
+            // is released by `shell::release_defaults` at the call sites that own
+            // that decision (the uninstaller and the settings dialog) — not here,
+            // because this layer must stay a pure applier for the tests.
             let _ = applier.run(&shell::assoc_removals());
             false
         };
