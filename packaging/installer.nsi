@@ -1,4 +1,4 @@
-; ZipNest 0.4.17 native installer (NSIS Unicode)
+﻿; ZipNest 0.4.17 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
