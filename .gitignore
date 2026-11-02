@@ -1,6 +1,10 @@
 /target
 *.log
 
+# `apps/zipnest/src-tauri` is its own workspace (not shipped), so building it
+# writes a lockfile of its own that must never be committed.
+/apps/zipnest/src-tauri/Cargo.lock
+
 /.superpowers/
 
 /dist-portable/

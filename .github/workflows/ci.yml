@@ -6,13 +6,19 @@ name: ci
 # a stuck installer from v0.4.8; v0.4.10 fixed a flashing update window).
 #
 # The shipped app is `zipnest-native`; `apps/zipnest` is the older WebView2/Tauri
-# UI that is NOT shipped (AGENTS.md) and is deliberately not built here — it pulls
-# a whole second desktop stack into every run. Its frontend tests are run in the
-# `frontend` job.
+# UI that is NOT shipped (AGENTS.md). apps/zipnest/src-tauri is its own workspace
+# now, so `--workspace` below means exactly the six shipped crates, and the
+# frontend tests run only when apps/zipnest actually changed.
 
 on:
   push:
     branches: [master]
+    # A docs-only commit cannot break the build, the tests or the installer, so
+    # it does not trigger a full test + clippy + release-build round.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
   pull_request:
   workflow_dispatch:
 
@@ -28,8 +34,62 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # `apps/zipnest` (the older, unshipped WebView2 UI) has a test suite that is
+  # worth running when it changes and pure overhead when it does not. This job
+  # answers "did it change?" once, so `frontend` can gate on it.
+  changes:
+    name: changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      frontend: ${{ steps.frontend.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `git diff <before> HEAD` needs the base commit to be present.
+          fetch-depth: 0
+
+      - name: did apps/zipnest change?
+        id: frontend
+        shell: bash
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run: the frontend job runs."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+
+          # A brand-new branch pushes 000...0 as `before`, and a force-push can
+          # leave the old tip unreachable; fall back to the previous commit.
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-parse --verify --quiet HEAD~1 || true)"
+            echo "Base ${base:-<none>} (fallback to HEAD~1)"
+          fi
+
+          # Still nothing to diff against: a single-commit history. Be
+          # conservative and run the frontend job rather than skip it silently.
+          if [ -z "$base" ]; then
+            echo "No base commit; assuming apps/zipnest changed."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git diff --name-only "$base" HEAD | grep -q "^apps/zipnest/"; then
+            echo "apps/zipnest changed."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "apps/zipnest untouched."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   test:
-    name: test + clippy (shipped crates)
+    name: test + clippy (workspace)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,24 +100,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          # Only the shipped packages are built here, so cache them as such.
-          key: shipped
+          key: workspace
 
-      - name: cargo test (shipped crates)
-        run: >
-          cargo test
-          -p archive-core -p archive-security -p archive-jobs -p zipnest-ipc -p zipnest-native
-          -p zipnest-shell
+      - name: cargo test (workspace)
+        run: cargo test --workspace
 
-      - name: cargo clippy (shipped crates, warnings are errors)
-        run: >
-          cargo clippy
-          -p archive-core -p archive-security -p archive-jobs -p zipnest-ipc -p zipnest-native
-          -p zipnest-shell
-          --all-targets -- -D warnings
+      - name: cargo clippy (workspace, warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-  version-and-installer:
-    name: version strings + installer compiles
+  # The release binaries are built once here and handed to the installer job as
+  # an artifact. Building them again inside the installer job compiled the same
+  # tree a second time for the same commit.
+  release-build:
+    name: release binaries
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +121,26 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: shipped
+          key: shipped-release
+
+      - name: cargo build (release)
+        run: cargo build -p zipnest-native -p zipnest-shell --release
+
+      - name: upload the binaries the installer packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          if-no-files-found: error
+          path: |
+            target/release/zipnest-native.exe
+            target/release/zipnest_shell.dll
+
+  installer:
+    name: version strings + installer compiles
+    runs-on: windows-latest
+    needs: release-build
+    steps:
+      - uses: actions/checkout@v4
 
       - name: every version string agrees
         shell: pwsh
@@ -89,21 +163,27 @@ jobs:
           if (-not $ok) { throw "NSIS did not install: makensis.exe not found" }
           "C:\Program Files (x86)\NSIS" | Out-File -Append $env:GITHUB_PATH
 
+      - name: fetch the release binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binaries
+          path: target/release
+
       - name: emit the payload and compile the installer
         shell: pwsh
         run: |
           # The Win11 shell package needs the code-signing key, which CI does not
           # have: emit the rest and let installer.nsi prove its syntax against it.
-          cargo build -p zipnest-native --release
           ./packaging/emit-portable.ps1 -SkipWin11Shell
           # installer.nsi lists the Win11Shell files too, so placeholders stand in
           # for them here; only compilation is being checked, not the payload.
           New-Item -ItemType Directory -Force -Path dist-portable/ZipNest/Win11Shell | Out-Null
-          foreach ($f in 'ZipNestShell.msix','ZipNestCodesign.cer','install.ps1','uninstall.ps1') {
-            Set-Content -Path "dist-portable/ZipNest/Win11Shell/$f" -Value 'placeholder'
+          foreach ($f in "ZipNestShell.msix","ZipNestCodesign.cer","install.ps1","uninstall.ps1") {
+            Set-Content -Path "dist-portable/ZipNest/Win11Shell/$f" -Value "placeholder"
           }
-          New-Item -ItemType Directory -Force -Path dist-portable/ZipNest/Win11Shell | Out-Null
-          Set-Content -Path dist-portable/ZipNest/zipnest_shell.dll -Value 'placeholder'
+          # zipnest_shell.dll is really built by the release-build job, so the
+          # installer is compiled against the binary it would actually ship.
+          Copy-Item -Path target/release/zipnest_shell.dll -Destination dist-portable/ZipNest/zipnest_shell.dll -Force
           Push-Location packaging
           & "C:\Program Files (x86)\NSIS\makensis.exe" /V2 installer.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }
@@ -112,6 +192,8 @@ jobs:
   frontend:
     name: older web UI (not shipped) — tests only
     runs-on: windows-latest
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
     steps:
       - uses: actions/checkout@v4
 

@@ -4,18 +4,21 @@
     Fails when a version number appears somewhere and disagrees with the rest.
 
 .DESCRIPTION
-    Each release has to keep six places in sync, and two of them were silently
-    stale for ten releases (the Win11 package manifest stayed at 0.4.0.0 from
-    v0.4.0 to v0.4.10; UPDATE_UA stayed at 0.4.0). This is the check that makes
-    that impossible to miss, and it runs in CI.
+    Every shipped artifact must carry the same version, and two of them were
+    silently stale for ten releases (the Win11 package manifest stayed at
+    0.4.0.0 from v0.4.0 to v0.4.10; UPDATE_UA stayed at 0.4.0). This is the
+    check that makes that impossible to miss, and it runs in CI.
 
-    Sources of truth:
-      apps/zipnest-native/src/main.rs   const CURRENT_VERSION = "x.y.z"
+    Source of truth:
+      Cargo.toml                        [workspace.package].version
+
+    Everything else is derived from it, or compared against it:
+      crates/*/Cargo.toml               version.workspace = true (must not type one)
+      apps/zipnest-native/src/main.rs   env!("CARGO_PKG_VERSION") (no typed copy)
       packaging/installer.nsi           !define VERSION, OutFile name
       packaging/win11-shell/AppxManifest.xml   Version="x.y.z.0"
       README.md                         "当前 v x.y.z" + both artifact names
       CHANGELOG.md                      newest "## v x.y.z" heading
-      apps/zipnest-native/src/main.rs   UPDATE_UA  (should be derived, not typed)
 
 .EXAMPLE
     powershell -File packaging\check-versions.ps1
@@ -51,15 +54,22 @@ function Report([string]$what, [string]$got, [string]$want) {
     }
 }
 
-$mainRs = Join-Path $repo 'apps\zipnest-native\src\main.rs'
+$cargoToml = Join-Path $repo 'Cargo.toml'
 $nsi = Join-Path $repo 'packaging\installer.nsi'
 $manifest = Join-Path $repo 'packaging\win11-shell\AppxManifest.xml'
 $readme = Join-Path $repo 'README.md'
 $changelog = Join-Path $repo 'CHANGELOG.md'
 
-$mainText = Read-Utf8 $mainRs
-if ($mainText -notmatch 'const CURRENT_VERSION: &str = "([0-9]+\.[0-9]+\.[0-9]+)"') {
-    throw "CURRENT_VERSION not found in $mainRs"
+# The workspace manifest is the only place a version may be typed. Members
+# inherit it with version.workspace = true and main.rs reads it at compile time,
+# so there is no second copy that can drift.
+$cargoText = Read-Utf8 $cargoToml
+if ($cargoText -notmatch '(?ms)^\[workspace\.package\]\s*(.*?)(?=^\[|\Z)') {
+    throw "[workspace.package] not found in $cargoToml"
+}
+$workspacePackage = $Matches[1]
+if ($workspacePackage -notmatch '(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') {
+    throw "[workspace.package].version not found in $cargoToml"
 }
 $version = $Matches[1]
 Write-Host "Version: $version"
@@ -94,10 +104,39 @@ $changelogText = Read-Utf8 $changelog
 if ($changelogText -notmatch '(?m)^## v([0-9]+\.[0-9]+\.[0-9]+)') { throw "no version heading in CHANGELOG.md" }
 Report 'CHANGELOG newest heading' $Matches[1] $version
 
-# UPDATE_UA is built from CURRENT_VERSION since v0.4.11; make sure nobody
-# reintroduces a hand-typed copy.
-if ($mainText -match 'const UPDATE_UA: &str = "ZipNest-Updater/([0-9]+\.[0-9]+\.[0-9]+)"') {
+# main.rs must not carry a version of its own: it reads what Cargo.toml feeds the
+# crate. UPDATE_UA is derived from it as well (since v0.4.11), so a typed copy in
+# either place is a problem.
+$mainRs = Join-Path $repo 'apps\zipnest-native\src\main.rs'
+$mainText = Read-Utf8 $mainRs
+if ($mainText -match 'const CURRENT_VERSION: &str = "') {
+    $problems.Add('main.rs hard-codes CURRENT_VERSION; it must be env!("CARGO_PKG_VERSION")')
+} elseif ($mainText -match 'const UPDATE_UA: &str = "ZipNest-Updater/([0-9]+\.[0-9]+\.[0-9]+)"') {
     $problems.Add("UPDATE_UA is hand-typed ($($Matches[1])); it must be derived from CURRENT_VERSION")
+} else {
+    Write-Host ("  ok   {0,-46} {1}" -f 'main.rs CURRENT_VERSION', 'from CARGO_PKG_VERSION')
+}
+
+# A member crate that types its own version is how the drift started
+# (zipnest-shell sat at 0.3.0 while everything else said 0.4.x).
+$memberManifests = @(
+    'crates\archive-core\Cargo.toml',
+    'crates\archive-security\Cargo.toml',
+    'crates\archive-jobs\Cargo.toml',
+    'crates\zipnest-ipc\Cargo.toml',
+    'apps\zipnest-native\Cargo.toml',
+    'apps\zipnest-shell\Cargo.toml'
+)
+foreach ($rel in $memberManifests) {
+    $memberText = Read-Utf8 (Join-Path $repo $rel)
+    $crateName = Split-Path (Split-Path $rel -Parent) -Leaf
+    if ($memberText -match '(?m)^version\s*=\s*"') {
+        $problems.Add("$rel types its own version; it must be version.workspace = true")
+    } elseif ($memberText -match '(?m)^version\.workspace\s*=\s*true') {
+        Write-Host ("  ok   {0,-46} {1}" -f "crate $crateName version", 'workspace')
+    } else {
+        $problems.Add("$rel has no version field; expected version.workspace = true")
+    }
 }
 
 if ($problems.Count -gt 0) {

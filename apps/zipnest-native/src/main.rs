@@ -107,7 +107,11 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.19";
+// Single source of truth: the workspace version in the root Cargo.toml, which
+// packaging/check-versions.ps1 compares against the installer, the MSIX manifest,
+// the README and the CHANGELOG. It used to be a hand-typed literal here, and it
+// sat at 0.4.0 for ten releases.
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 /// Derived from [`CURRENT_VERSION`] on purpose: a hand-typed string here sat at
 /// `0.4.0` for ten releases (the release checklist asked for it every time and
@@ -656,6 +660,95 @@ struct PasswordPrompt {
     then: PasswordThen,
 }
 
+/// Which column the browser sorts by. There is no "unsorted": the engine's
+/// order was the entry index, which looked arbitrary to a user.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortKey {
+    Name,
+    Size,
+    Mtime,
+}
+
+/// Compare two names the way a file manager does: case-insensitively, and with
+/// digit runs compared as numbers, so `file2` sorts before `file10` and
+/// `Chapter 9` before `Chapter 10`.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut a_chars = a.chars().peekable();
+    let mut b_chars = b.chars().peekable();
+    loop {
+        match (a_chars.peek().copied(), b_chars.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(a_ch), Some(b_ch)) => {
+                if a_ch.is_ascii_digit() && b_ch.is_ascii_digit() {
+                    let mut a_run = String::new();
+                    while let Some(c) = a_chars.peek().copied() {
+                        if !c.is_ascii_digit() {
+                            break;
+                        }
+                        a_run.push(c);
+                        a_chars.next();
+                    }
+                    let mut b_run = String::new();
+                    while let Some(c) = b_chars.peek().copied() {
+                        if !c.is_ascii_digit() {
+                            break;
+                        }
+                        b_run.push(c);
+                        b_chars.next();
+                    }
+                    // Leading zeros are padding, not magnitude: compare the
+                    // stripped values numerically (longer = larger, then the
+                    // digits themselves), and fall back to the raw length so
+                    // "07" and "7" still order deterministically.
+                    let a_val = a_run.trim_start_matches('0');
+                    let b_val = b_run.trim_start_matches('0');
+                    let ord = a_val
+                        .len()
+                        .cmp(&b_val.len())
+                        .then_with(|| a_val.cmp(b_val))
+                        .then_with(|| a_run.len().cmp(&b_run.len()));
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                } else {
+                    a_chars.next();
+                    b_chars.next();
+                    let ord = a_ch.to_ascii_lowercase().cmp(&b_ch.to_ascii_lowercase());
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Sort a directory listing in place. Directories always lead, as in Explorer
+/// and 7-Zip; the chosen column only orders within each group.
+fn sort_rows(rows: &mut [EntryDto], key: SortKey, ascending: bool) {
+    rows.sort_by(|a, b| {
+        let dirs_first = b.is_dir.cmp(&a.is_dir);
+        if dirs_first != std::cmp::Ordering::Equal {
+            return dirs_first;
+        }
+        let ord = match key {
+            SortKey::Name => natural_cmp(&a.name, &b.name).then_with(|| a.name.cmp(&b.name)),
+            SortKey::Size => a.size.cmp(&b.size),
+            // An entry the engine gave no timestamp for counts as the oldest,
+            // so a directory full of them does not jump to the top.
+            SortKey::Mtime => a.mtime_ms.unwrap_or(0).cmp(&b.mtime_ms.unwrap_or(0)),
+        };
+        if ascending {
+            ord
+        } else {
+            ord.reverse()
+        }
+    });
+}
+
 struct App {
     ctx: egui::Context,
     svc: Arc<IpcService>,
@@ -699,6 +792,13 @@ struct App {
     cwd: String,
     rows: Vec<EntryDto>,
     selected: std::collections::HashSet<String>,
+    /// Which column the list is sorted by and in which direction. Directories
+    /// always lead; this only orders rows inside a group.
+    sort_key: SortKey,
+    sort_asc: bool,
+    /// Row index the last plain or Ctrl click landed on, for Shift ranges. It
+    /// indexes the *sorted* list, so sorting or navigating clears it.
+    anchor: Option<usize>,
     error: Option<String>,
     notice: Option<String>,
     /// Backup path of a settings file that could not be parsed at startup, so
@@ -882,6 +982,9 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             password_prompt: None,
             last_extract: None,
             selected: Default::default(),
+            sort_key: SortKey::Name,
+            sort_asc: true,
+            anchor: None,
             error: None,
             notice: settings_backup.as_ref().map(|_| "settings.corrupt".to_string()),
             settings_backup,
@@ -1303,6 +1406,7 @@ fn t(&self, key: &str) -> String {
                 self.cwd = String::new();
                 self.rows = self.svc.list_children(id, String::new()).unwrap_or_default();
                 self.selected.clear();
+                self.resort();
                 self.error = None;
             }
             Err(e) => {
@@ -1325,6 +1429,14 @@ fn t(&self, key: &str) -> String {
         }
     }
 
+    /// Apply the current sort to `rows`. Called wherever `rows` is replaced and
+    /// when a column header is clicked; the Shift anchor indexes the sorted
+    /// list, so it cannot survive either.
+    fn resort(&mut self) {
+        sort_rows(&mut self.rows, self.sort_key, self.sort_asc);
+        self.anchor = None;
+    }
+
     /// The one place that changes the browsed directory. Descending, the up and
     /// root buttons, a breadcrumb click and Backspace all funnel through here,
     /// so `cwd` and `rows` can never disagree about where we are.
@@ -1334,6 +1446,7 @@ fn t(&self, key: &str) -> String {
             self.rows = self.svc.list_children(a.id, dir.clone()).unwrap_or_default();
             self.cwd = dir;
             self.selected.clear();
+            self.resort();
         }
     }
 
@@ -1569,8 +1682,64 @@ let extract_enabled = self.archive.is_some();
             self.nav_row(ui);
 
             // ---- header ----
+            // Each of the three sortable column titles is a button: clicking it
+            // sorts by that column, clicking it again flips the direction, the
+            // way Explorer and 7-Zip behave.
             let (head, _) = ui.allocate_exact_size(egui::vec2(full_w, 20.0), egui::Sense::hover());
+            let mut sort_click: Option<SortKey> = None;
+            let mut arrow_at: Option<egui::Pos2> = None;
             {
+                // The name column owns everything left of the size column, which
+                // is why its hit box starts at the card edge and not at its
+                // label.
+                let columns = [
+                    (
+                        egui::Rect::from_min_max(head.left_top(), egui::pos2(size_x, head.bottom())),
+                        0usize,
+                        SortKey::Name,
+                    ),
+                    (
+                        egui::Rect::from_min_max(
+                            egui::pos2(size_x, head.top()),
+                            egui::pos2(mtime_x, head.bottom()),
+                        ),
+                        1usize,
+                        SortKey::Size,
+                    ),
+                    (
+                        egui::Rect::from_min_max(
+                            egui::pos2(mtime_x, head.top()),
+                            egui::pos2(enc_x, head.bottom()),
+                        ),
+                        2usize,
+                        SortKey::Mtime,
+                    ),
+                ];
+                for (rect, slot, key) in columns {
+                    let clicked = ui
+                        .interact(
+                            rect,
+                            ui.id().with(("sort-column", slot)),
+                            egui::Sense::click(),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked();
+                    if clicked {
+                        sort_click = Some(key);
+                    }
+                    if key == self.sort_key {
+                        // Park the triangle where it cannot touch the label: the
+                        // far side of the name column, the left edge of the size
+                        // column (its label is right-aligned), and the far side
+                        // of the time column.
+                        let x = match key {
+                            SortKey::Name => size_x - 8.0,
+                            SortKey::Size => size_x + 8.0,
+                            SortKey::Mtime => enc_x - 8.0,
+                        };
+                        arrow_at = Some(egui::pos2(x, rect.center().y));
+                    }
+                }
                 let p = ui.painter();
                 let f = egui::FontId::proportional(12.0);
                 p.text(
@@ -1601,6 +1770,29 @@ let extract_enabled = self.archive.is_some();
                     f,
                     weak,
                 );
+                if let Some(pos) = arrow_at {
+                    // Up means ascending (A to Z, small to large), down is the
+                    // reverse. An 8-point-wide, 6-point-tall triangle.
+                    let base = if self.sort_asc { 3.0 } else { -3.0 };
+                    p.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(pos.x - 4.0, pos.y + base),
+                            egui::pos2(pos.x + 4.0, pos.y + base),
+                            egui::pos2(pos.x, pos.y - base),
+                        ],
+                        text_color,
+                        egui::Stroke::NONE,
+                    ));
+                }
+            }
+            if let Some(key) = sort_click {
+                if self.sort_key == key {
+                    self.sort_asc = !self.sort_asc;
+                } else {
+                    self.sort_key = key;
+                    self.sort_asc = true;
+                }
+                self.resort();
             }
             let sep_y = ui.cursor().top();
             ui.painter()
@@ -1610,7 +1802,6 @@ let extract_enabled = self.archive.is_some();
             // ---- rows ----
             let mut click_dir: Option<String> = None;
             let mut dbl: Option<String> = None;
-            let mut click_file: Option<String> = None;
             // Shell icons cost a Win32 round trip each; resolve a handful per
             // frame and let the painted badge stand in until a row's turn
             // comes, so a 10 000-entry directory cannot stall the UI thread.
@@ -1736,10 +1927,38 @@ let extract_enabled = self.archive.is_some();
                         if resp.double_clicked() && e.is_dir {
                             dbl = Some(e.path.clone());
                         } else if resp.clicked() {
-                            if e.is_dir {
+                            // Ctrl toggles one row, Shift extends from the last
+                            // clicked one, a plain click replaces the selection.
+                            // A plain click on a directory still descends into
+                            // it, which is how this list has always behaved;
+                            // Ctrl and Shift on a directory only select it.
+                            let mods = ui.input(|i| i.modifiers);
+                            if mods.shift {
+                                let start = match self.anchor {
+                                    Some(a) if a < rows.len() => a,
+                                    _ => i,
+                                };
+                                let (lo, hi) = if start <= i { (start, i) } else { (i, start) };
+                                if !mods.command {
+                                    self.selected.clear();
+                                }
+                                for row in &rows[lo..=hi] {
+                                    self.selected.insert(row.path.clone());
+                                }
+                                if self.anchor.is_none() {
+                                    self.anchor = Some(i);
+                                }
+                            } else if mods.command {
+                                if !self.selected.remove(&e.path) {
+                                    self.selected.insert(e.path.clone());
+                                }
+                                self.anchor = Some(i);
+                            } else if e.is_dir {
                                 click_dir = Some(e.path.clone());
                             } else {
-                                click_file = Some(e.path.clone());
+                                self.selected.clear();
+                                self.selected.insert(e.path.clone());
+                                self.anchor = Some(i);
                             }
                         }
                     }
@@ -1749,12 +1968,6 @@ let extract_enabled = self.archive.is_some();
             self.rows = rows;
             if let Some(d) = dbl.or(click_dir) {
                 self.navigate(&d);
-            } else if let Some(f) = click_file {
-                // Select only. This used to also run the preview reader,
-                // which pulled up to `preview_max_bytes` out of the archive on
-                // the UI thread for a panel that no longer exists.
-                self.selected.clear();
-                self.selected.insert(f);
             }
         });
     }
@@ -3072,6 +3285,18 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             self.go_up();
         }
 
+        // Ctrl+A selects every entry in the directory, the shortcut half of the
+        // new multi-selection. Skipped for the same reason as Backspace: a text
+        // field (or the settings page) owns the keyboard then.
+        if self.archive.is_some()
+            && !self.show_settings
+            && !ctx.wants_keyboard_input()
+            && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A))
+        {
+            self.selected = self.rows.iter().map(|e| e.path.clone()).collect();
+            self.anchor = if self.rows.is_empty() { None } else { Some(0) };
+        }
+
         if self.show_settings {
             // Settings is a page of this window, so it draws *instead of* the
             // archive view rather than on top of it.
@@ -4098,5 +4323,74 @@ mod feedback_tests {
             "mailto must point at the feedback mailbox: {url}"
         );
         assert!(url.contains("subject=") && url.contains("&body="));
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::{natural_cmp, sort_rows, EntryDto, SortKey};
+    use std::cmp::Ordering;
+
+    fn entry(name: &str, is_dir: bool, size: u64, mtime: Option<u64>) -> EntryDto {
+        EntryDto {
+            path: name.to_string(),
+            name: name.to_string(),
+            is_dir,
+            size,
+            mtime_ms: mtime,
+            encrypted: false,
+        }
+    }
+
+    fn names(rows: &[EntryDto]) -> Vec<&str> {
+        rows.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn names_sort_numerically_not_lexically() {
+        // The whole reason this is not a plain `str::cmp`: a file manager has to
+        // put `file2` before `file10`, and `Chapter 2` before `Chapter 10`.
+        assert_eq!(natural_cmp("file2", "file10"), Ordering::Less);
+        assert_eq!(natural_cmp("file10", "file2"), Ordering::Greater);
+        assert_eq!(natural_cmp("报告2", "报告10"), Ordering::Less);
+        // Padding zeros are not magnitude.
+        assert_eq!(natural_cmp("a0007", "a8"), Ordering::Less);
+        // Case does not decide the order of two otherwise equal names.
+        assert_eq!(natural_cmp("a", "A"), Ordering::Equal);
+        assert_eq!(natural_cmp("", "a"), Ordering::Less);
+    }
+
+    #[test]
+    fn directories_lead_whatever_the_column_says() {
+        let mut rows = vec![
+            entry("b.txt", false, 300, Some(3)),
+            entry("zz", true, 0, None),
+            entry("a.txt", false, 100, Some(1)),
+        ];
+        sort_rows(&mut rows, SortKey::Size, true);
+        assert_eq!(names(&rows), ["zz", "a.txt", "b.txt"]);
+        // Descending reverses the files but the directory stays on top.
+        sort_rows(&mut rows, SortKey::Size, false);
+        assert_eq!(names(&rows), ["zz", "b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn a_missing_timestamp_counts_as_the_oldest() {
+        let mut rows = vec![
+            entry("b.txt", false, 0, Some(20)),
+            entry("a.txt", false, 0, None),
+            entry("c.txt", false, 0, Some(10)),
+        ];
+        sort_rows(&mut rows, SortKey::Mtime, true);
+        assert_eq!(names(&rows), ["a.txt", "c.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn the_name_order_is_stable_for_names_differing_only_in_case() {
+        let mut rows = vec![entry("b.txt", false, 0, None), entry("B.txt", false, 0, None)];
+        sort_rows(&mut rows, SortKey::Name, true);
+        // `natural_cmp` calls these equal, so the tie-break has to decide, and
+        // it has to decide the same way every time: uppercase sorts first.
+        assert_eq!(names(&rows), ["B.txt", "b.txt"]);
     }
 }

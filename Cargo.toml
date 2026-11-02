@@ -1,8 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["crates/archive-security", "crates/archive-core", "apps/zipnest/src-tauri", "crates/archive-jobs", "crates/zipnest-ipc", "apps/zipnest-native", "apps/zipnest-shell"]
+# `apps/zipnest/src-tauri` is the older Tauri/WebView2 UI and is NOT shipped
+# (AGENTS.md). It is its own workspace, so a plain `cargo` command here never
+# resolves the whole Tauri dependency tree.
+members = ["crates/archive-security", "crates/archive-core", "crates/archive-jobs", "crates/zipnest-ipc", "apps/zipnest-native", "apps/zipnest-shell"]
 
 [workspace.package]
+# The only place a release version is typed: every member inherits it with
+# version.workspace = true, and packaging/check-versions.ps1 compares it with
+# the installer, the MSIX manifest, the README and the CHANGELOG.
+version = "0.4.20"
 edition = "2021"
 license = "MIT"
 
