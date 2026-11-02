@@ -388,3 +388,38 @@ fn extract_encrypted_without_any_password_prompts() {
     assert!(!dest.exists() || std::fs::read_dir(&dest).unwrap().next().is_none());
     std::fs::remove_dir_all(&dest).ok();
 }
+
+// Preview has no dialog to fall back on, so the same "ask for a password" key
+// has to come back from the read itself; the engine would only say "failed".
+#[test]
+fn read_entry_encrypted_without_password_prompts() {
+    let (svc, _) = service();
+    let r = svc
+        .open_archive(fx("enc.zip").to_string_lossy().into(), None)
+        .unwrap();
+    let err = svc
+        .read_entry_bytes(r.id, "a.txt".into(), 1024)
+        .unwrap_err();
+    assert_eq!(err.key, "error.password_required");
+}
+
+#[test]
+fn read_entry_encrypted_reuses_open_time_password() {
+    let (svc, _) = service();
+    let r = svc
+        .open_archive(fx("enc.zip").to_string_lossy().into(), Some("secret".into()))
+        .unwrap();
+    let bytes = svc
+        .read_entry_bytes(r.id, "a.txt".into(), 1024)
+        .expect("the password given at open time unlocks the entry");
+    assert!(!bytes.is_empty());
+}
+
+#[test]
+fn open_encrypted_7z_wrong_password_reports_incorrect() {
+    let (svc, _) = service();
+    let err = svc
+        .open_archive(fx("enc.7z").to_string_lossy().into(), Some("wrong".into()))
+        .unwrap_err();
+    assert_eq!(err.key, "error.password_incorrect");
+}

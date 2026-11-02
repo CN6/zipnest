@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.18";
+const CURRENT_VERSION: &str = "0.4.19";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 /// Derived from [`CURRENT_VERSION`] on purpose: a hand-typed string here sat at
 /// `0.4.0` for ten releases (the release checklist asked for it every time and
@@ -612,6 +612,50 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
+/// What to do once a password has been typed in.
+///
+/// Opening an archive and extracting from one take the same password, but they
+/// are different operations: the first has to run `open_archive` again, the
+/// second has to start the extract job that was refused. Keeping the intent in
+/// the prompt means the user types the password once and the retry happens
+/// automatically, instead of having to walk back through the dialog they came
+/// from.
+enum PasswordThen {
+    /// Re-open the archive the prompt is for.
+    Open,
+    /// Re-run an extract that was refused for lack of a password.
+    Extract(ExtractRequest),
+}
+
+/// One extract request, kept whole so it can be replayed.
+///
+/// A password refusal arrives either before the job starts or part-way into
+/// it, and both need the same retry. Carrying the request itself — rather than
+/// scattered fields — means the retry runs exactly what the user asked for.
+#[derive(Clone)]
+struct ExtractRequest {
+    archive_id: u64,
+    /// Empty for "the whole archive", the entry paths otherwise.
+    sources: Vec<String>,
+    dest: String,
+    on_conflict: String,
+}
+
+/// A password prompt that is on screen right now.
+struct PasswordPrompt {
+    /// The archive the password belongs to, shown so the user knows which of
+    /// several open archives is asking.
+    path: String,
+    /// What has been typed so far.
+    text: String,
+    /// A password was already refused, so the field starts empty and says so.
+    retry: bool,
+    /// Put the caret in the field on the first frame; cleared once done so
+    /// typing is not stolen back on every repaint.
+    focus: bool,
+    then: PasswordThen,
+}
+
 struct App {
     ctx: egui::Context,
     svc: Arc<IpcService>,
@@ -641,6 +685,17 @@ struct App {
 
     archive: Option<zipnest_ipc::OpenArchiveResult>,
     archive_path: String,
+    /// The password the open archive was unlocked with, when the user had to
+    /// supply one. The service also keeps it for preview; this copy is what
+    /// the extract dialog hands over so an encrypted archive extracts without
+    /// asking twice.
+    archive_password: Option<String>,
+    /// The password prompt on screen, if any.
+    password_prompt: Option<PasswordPrompt>,
+    /// The extract request the running or last job belongs to, so a password
+    /// refused after the job started can be answered without losing what the
+    /// user picked.
+    last_extract: Option<ExtractRequest>,
     cwd: String,
     rows: Vec<EntryDto>,
     selected: std::collections::HashSet<String>,
@@ -823,6 +878,9 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             archive_path: String::new(),
             cwd: String::new(),
             rows: Vec::new(),
+            archive_password: None,
+            password_prompt: None,
+            last_extract: None,
             selected: Default::default(),
             error: None,
             notice: settings_backup.as_ref().map(|_| "settings.corrupt".to_string()),
@@ -1135,9 +1193,31 @@ fn t(&self, key: &str) -> String {
                         let key = err_key
                             .filter(|k| k.starts_with("error."))
                             .unwrap_or_else(|| "error.engine".into());
-                        self.notice = Some(key.clone());
-                        // Pop a dialog so a failure is never missed.
-                        self.error = Some(self.t(&key));
+                        // A password refused mid-job is not a failure to report:
+                        // it is the same question the pre-flight check asks, and
+                        // the request is still around to replay it. This is the
+                        // ZIP-with-AES case, where the names are readable but
+                        // the contents are not.
+                        match (is_password_key(&key), self.last_extract.clone()) {
+                            (true, Some(req)) => {
+                                self.password_prompt = Some(PasswordPrompt {
+                                    path: self.archive_path.clone(),
+                                    text: String::new(),
+                                    retry: true,
+                                    focus: true,
+                                    then: PasswordThen::Extract(req),
+                                });
+                                // The retry replaces it; leaving the failed
+                                // progress window up would talk over the prompt.
+                                self.job = None;
+                                self.notice = None;
+                            }
+                            _ => {
+                                self.notice = Some(key.clone());
+                                // Pop a dialog so a failure is never missed.
+                                self.error = Some(self.t(&key));
+                            }
+                        }
                     }
                     // Done or cancelled: close only when the user asked for it.
                     // The window carries the "done" message (and the output
@@ -1193,23 +1273,55 @@ fn t(&self, key: &str) -> String {
     }
 
     fn open_archive(&mut self, path: &str) {
+        self.open_archive_with_password(path, None);
+    }
+
+    /// Open an archive, optionally with a password.
+    ///
+    /// An archive whose *names* are encrypted cannot even be listed without the
+    /// password: the engine refuses during `Open`, which surfaces as
+    /// `error.password_required`. That is not a failure to report — it is a
+    /// question to ask — so it opens the password prompt with this path queued
+    /// for a retry. Any other error is a real one and goes to the error dialog.
+    fn open_archive_with_password(&mut self, path: &str, password: Option<String>) {
         // Release whatever we are replacing first: the engine, the source file
         // handle and the session password all live inside that archive, and
         // nothing else closes it (see `IpcService::close_archive`).
         if let Some(old) = self.archive.take() {
             self.svc.close_archive(old.id);
         }
-        match self.svc.open_archive(path.to_string(), None) {
+        // The previous archive's password dies with it; a successful open below
+        // sets the one this archive was unlocked with.
+        self.archive_password = None;
+        match self.svc.open_archive(path.to_string(), password.clone()) {
             Ok(res) => {
                 let id = res.id;
                 self.archive = Some(res);
                 self.archive_path = path.to_string();
+                self.archive_password = password;
+                self.password_prompt = None;
                 self.cwd = String::new();
                 self.rows = self.svc.list_children(id, String::new()).unwrap_or_default();
                 self.selected.clear();
                 self.error = None;
             }
-            Err(e) => self.error = Some(self.t(&e.key)),
+            Err(e) => {
+                if is_password_key(&e.key) {
+                    // A password was tried and refused, or none was given at
+                    // all: either way the answer is the same prompt, with the
+                    // "wrong password" line shown only in the first case.
+                    self.password_prompt = Some(PasswordPrompt {
+                        path: path.to_string(),
+                        text: String::new(),
+                        retry: password.is_some() || e.key == "error.password_incorrect",
+                        focus: true,
+                        then: PasswordThen::Open,
+                    });
+                    self.error = None;
+                } else {
+                    self.error = Some(self.t(&e.key));
+                }
+            }
         }
     }
 
@@ -1745,7 +1857,6 @@ let extract_enabled = self.archive.is_some();
             return;
         }
         let srcs = self.selected.clone();
-        let svc = self.svc.clone();
         let t = self.t("extract.title");
         let center = ctx.screen_rect().center() - egui::vec2(215.0, 110.0);
         egui::Window::new(t)
@@ -1780,8 +1891,11 @@ let extract_enabled = self.archive.is_some();
             let clicked = ui
                 .add_enabled(can, egui::Button::new(self.t("extract.start")))
                 .clicked();
-            // Enter confirms (that is what a dialog is expected to do).
-            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // Enter confirms (that is what a dialog is expected to do) — but not
+            // while the password prompt is up: that prompt owns the keyboard,
+            // and a shared Enter would start the extract behind its back.
+            let prompt_open = self.password_prompt.is_some();
+            let enter = !prompt_open && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if clicked || (can && enter) {
                 let dest = self.extract_dest.clone();
                 let on_conflict = if ask {
@@ -1794,36 +1908,36 @@ let extract_enabled = self.archive.is_some();
                     policy.as_str()
                 }
                 .to_string();
-                self.job = Some(JobState {
-                    job_id: 0,
-                    title: self.t("extract.title"),
-                    ..Default::default()
-                });
-                // Last job's rename/failure lists belong to the last job.
-                self.renamed_entries.clear();
-                self.error_detail.clear();
-                match svc.extract(
-                    arch_id,
-                    srcs.iter().cloned().collect(),
+                let req = ExtractRequest {
+                    archive_id: arch_id,
+                    sources: srcs.iter().cloned().collect(),
                     dest,
-                    Some(on_conflict),
-                    None,
-                ) {
-                    Ok(jid) => {
-                        if let Some(job) = self.job.as_mut() {
-                            job.job_id = jid;
-                        }
+                    on_conflict,
+                };
+                // The password the archive was opened with, if any. The service
+                // also remembers it per archive, but passing it here keeps a
+                // re-opened archive (new id) working the same way.
+                match self.begin_extract(req.clone(), self.archive_password.clone()) {
+                    None => {}
+                    Some(key) if is_password_key(&key) => {
+                        // Encrypted contents, no password yet: keep everything
+                        // this dialog collected and ask for the password rather
+                        // than making the user redo the dialog afterwards.
+                        self.password_prompt = Some(PasswordPrompt {
+                            path: self.archive_path.clone(),
+                            text: String::new(),
+                            retry: key == "error.password_incorrect",
+                            focus: true,
+                            then: PasswordThen::Extract(req),
+                        });
                     }
-                    Err(e) => {
-                        self.error = Some(self.t(&e.key));
-                        self.job = None;
-                    }
+                    Some(key) => self.error = Some(self.t(&key)),
                 }
                 self.show_extract = false;
             }
             ui.separator();
             if ui.button(self.t("extract.cancel")).clicked()
-                || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                || (!prompt_open && ui.input(|i| i.key_pressed(egui::Key::Escape)))
             {
                 close = true;
             }
@@ -1831,6 +1945,150 @@ let extract_enabled = self.archive.is_some();
         // Cancel used to set `show_extract` inside the closure, which the line
         // below then overwrote — the button did nothing at all.
         self.show_extract = open && !close && self.job.is_none();
+    }
+
+    /// Start an extract job and point the progress window at it.
+    ///
+    /// Returns the error key when the job was refused. A refusal for want of a
+    /// password is left to the caller: that caller has the dialog's inputs and
+    /// can reopen the password prompt with them intact, instead of showing an
+    /// error the user can do nothing about.
+    fn begin_extract(
+        &mut self,
+        req: ExtractRequest,
+        password: Option<String>,
+    ) -> Option<String> {
+        self.last_extract = Some(req.clone());
+        self.job = Some(JobState {
+            job_id: 0,
+            title: self.t("extract.title"),
+            ..Default::default()
+        });
+        // Last job's rename/failure lists belong to the last job.
+        self.renamed_entries.clear();
+        self.error_detail.clear();
+        match self.svc.extract(
+            req.archive_id,
+            req.sources,
+            req.dest,
+            Some(req.on_conflict),
+            password,
+        ) {
+            Ok(jid) => {
+                if let Some(job) = self.job.as_mut() {
+                    job.job_id = jid;
+                }
+                None
+            }
+            Err(e) => {
+                self.job = None;
+                Some(e.key)
+            }
+        }
+    }
+
+    /// The password prompt.
+    ///
+    /// Shown whenever the engine needs a password to open an archive or to
+    /// extract from one. It remembers what the user was doing, so one password
+    /// is enough: the open or the extract that triggered it runs again as soon
+    /// as the field is submitted.
+    fn password_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut prompt) = self.password_prompt.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut submit = false;
+        let mut cancel = false;
+        let title = self.t("password.title");
+        let center = ctx.screen_rect().center() - egui::vec2(190.0, 60.0);
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .default_pos(center)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(self.t("password.prompt"));
+                // Which archive is asking. Names are the only thing the user
+                // can match against the window they dragged in.
+                let name = prompt
+                    .path
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or(&prompt.path)
+                    .to_string();
+                ui.label(egui::RichText::new(name).weak().small());
+                if prompt.retry {
+                    ui.colored_label(ui.visuals().error_fg_color, self.t("password.wrong"));
+                }
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut prompt.text)
+                        .password(true)
+                        .hint_text(self.t("password.hint")),
+                );
+                if prompt.focus {
+                    field.request_focus();
+                    prompt.focus = false;
+                }
+                let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let can = !prompt.text.is_empty();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(can, egui::Button::new(self.t("password.ok")))
+                        .clicked()
+                    {
+                        submit = true;
+                    }
+                    if ui.button(self.t("password.cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+                if entered && can {
+                    submit = true;
+                }
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if submit {
+            let password = std::mem::take(&mut prompt.text);
+            let then = std::mem::replace(&mut prompt.then, PasswordThen::Open);
+            match then {
+                PasswordThen::Open => {
+                    // A refusal re-arms the prompt from inside here, so nothing
+                    // is restored afterwards.
+                    let path = prompt.path.clone();
+                    self.open_archive_with_password(&path, Some(password));
+                }
+                PasswordThen::Extract(req) => {
+                    self.show_extract = false;
+                    match self.begin_extract(req.clone(), Some(password)) {
+                        None => {}
+                        // The job path reports a bad password as an event, but
+                        // a refusal before the job starts comes back here.
+                        Some(key) if is_password_key(&key) => {
+                            self.password_prompt = Some(PasswordPrompt {
+                                path: prompt.path.clone(),
+                                text: String::new(),
+                                retry: true,
+                                focus: true,
+                                then: PasswordThen::Extract(req),
+                            });
+                        }
+                        Some(key) => self.error = Some(self.t(&key)),
+                    }
+                }
+            }
+            return;
+        }
+        // Cancelled, closed with the window button, or simply repainted: only
+        // the first two drop the prompt.
+        if cancel || !open {
+            return;
+        }
+        self.password_prompt = Some(prompt);
     }
 
     fn create_dialog(&mut self, ctx: &egui::Context) {
@@ -2863,6 +3121,7 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         }
 
         self.extract_dialog(ctx);
+        self.password_dialog(ctx);
         self.create_dialog(ctx);
         self.donate_dialog(ctx);
         self.help_window(ctx);
@@ -2882,6 +3141,36 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
 
 
 
+
+/// Whether an error key means "a password is needed", rather than a failure
+/// worth an error dialog.
+///
+/// The engine separates the two cases: `required` when nothing was supplied,
+/// `incorrect` when what was supplied did not work. Both are answered the same
+/// way — ask again — so every place that has to choose between asking and
+/// reporting shares this rule. `unsupported` is deliberately not here: the
+/// engine cannot handle that encryption at all, and asking again would only
+/// waste the user's time.
+fn is_password_key(key: &str) -> bool {
+    key == "error.password_required" || key == "error.password_incorrect"
+}
+
+#[cfg(test)]
+mod password_key_tests {
+    use super::is_password_key;
+
+    #[test]
+    fn only_the_two_password_keys_ask_again() {
+        assert!(is_password_key("error.password_required"));
+        assert!(is_password_key("error.password_incorrect"));
+        // Asking again cannot fix an encryption the engine does not support,
+        // and the remaining keys are ordinary failures.
+        assert!(!is_password_key("error.password_unsupported"));
+        assert!(!is_password_key("error.engine"));
+        assert!(!is_password_key("error.cancelled"));
+        assert!(!is_password_key("error.not_an_archive"));
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Archive paths

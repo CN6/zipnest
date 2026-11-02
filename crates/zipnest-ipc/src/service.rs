@@ -473,16 +473,21 @@ impl IpcService {
         // turning one panic into a permanent error for that archive.
         let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
         let entries = guard.0.entries_arc()?;
-        let idx = entries
+        let entry = entries
             .iter()
             .find(|e| e.path == path)
-            .map(|e| e.index)
             .ok_or_else(|| IpcError::new("error.not_an_archive"))?;
         // Preview reuses the open-time password for encrypted entries.
-        let opts = ArchiveOpenOptions {
-            password: self.registry.password(id),
-        };
-        Ok(guard.0.read_entry(idx, &opts, Some(max_bytes))?)
+        let password = self.registry.password(id);
+        // Same pre-flight the extract path does: an encrypted entry read with
+        // no password at all comes back from the engine as a generic data
+        // error, which reads as "operation failed". The key that means "ask for
+        // a password" is only useful if we look for the case first.
+        if entry.encrypted && password.is_none() {
+            return Err(IpcError::new("error.password_required"));
+        }
+        let opts = ArchiveOpenOptions { password };
+        Ok(guard.0.read_entry(entry.index, &opts, Some(max_bytes))?)
     }
 
     fn lock_archive(&self, id: u64) -> Result<SharedArchive, IpcError> {
