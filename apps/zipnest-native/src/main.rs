@@ -2078,6 +2078,14 @@ let extract_enabled = self.archive.is_some();
             .default_pos(center)
             .open(&mut open)
             .show(ctx, |ui| {
+            // Selection is now a scope, not just a highlight: say so before the
+            // fields, because "Extract" with rows selected means "these rows".
+            ui.label(if srcs.is_empty() {
+                self.t("extract.scope_all")
+            } else {
+                self.t("extract.scope_selected")
+                    .replace("{n}", &srcs.len().to_string())
+            });
             ui.label(self.t("extract.dest"));
             ui.text_edit_singleline(&mut self.extract_dest);
             if ui.button(self.t("extract.browse")).clicked() {
@@ -3290,6 +3298,12 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // field (or the settings page) owns the keyboard then.
         if self.archive.is_some()
             && !self.show_settings
+            // An open dialog decides what gets extracted (or created) from the
+            // selection, so it must not change under it: Ctrl+A while the
+            // extract dialog is up would silently widen the scope.
+            && !self.show_extract
+            && !self.show_create
+            && self.password_prompt.is_none()
             && !ctx.wants_keyboard_input()
             && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A))
         {
@@ -4358,6 +4372,13 @@ mod sort_tests {
         // Case does not decide the order of two otherwise equal names.
         assert_eq!(natural_cmp("a", "A"), Ordering::Equal);
         assert_eq!(natural_cmp("", "a"), Ordering::Less);
+        // A name that is a prefix of another sorts first, and a digit run in the
+        // middle of a name counts as a number too.
+        assert_eq!(natural_cmp("a", "a1"), Ordering::Less);
+        assert_eq!(natural_cmp("x2y", "x10y"), Ordering::Less);
+        // Zero padding is only a tie-break, so the ordering is deterministic
+        // instead of depending on which one the sort happened to see first.
+        assert_eq!(natural_cmp("007", "7"), Ordering::Greater);
     }
 
     #[test]
