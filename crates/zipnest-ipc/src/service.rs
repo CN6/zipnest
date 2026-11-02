@@ -313,6 +313,16 @@ impl IpcService {
         self.lock_settings()?.set(patch)
     }
 
+    /// Whether the settings file had to be quarantined at startup, and where the
+    /// unreadable original was kept.
+    ///
+    /// The UI asks once, on the first frame, so the user is told that their
+    /// preferences were not read instead of finding every toggle back at its
+    /// default with no explanation. `None` on a normal start.
+    pub fn corrupt_settings(&self) -> Option<crate::settings::CorruptSettings> {
+        self.lock_settings().ok()?.corrupt_settings().cloned()
+    }
+
     fn lock_settings(&self) -> Result<std::sync::MutexGuard<'_, SettingsStore>, IpcError> {
         self.settings.lock().map_err(|_| IpcError::new("error.engine"))
     }
@@ -411,7 +421,9 @@ impl IpcService {
             std::path::Path::new(&path),
             ArchiveOpenOptions { password: password.clone() },
         )?;
-        let entries = archive.entries()?;
+        // The listing is cached on the `Archive` itself: opening already pays
+        // for it, and every later navigation/preview/extract reuses it.
+        let entries = archive.entries_arc()?;
         let encrypted = entries.iter().any(|e| e.encrypted);
         let format = std::path::Path::new(&path)
             .extension()
@@ -450,7 +462,7 @@ impl IpcService {
     pub fn list_children(&self, id: u64, dir: String) -> Result<Vec<EntryDto>, IpcError> {
         let shared = self.lock_archive(id)?;
         let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let entries = guard.0.entries()?;
+        let entries = guard.0.entries_arc()?;
         Ok(children_of(&entries, &dir).into_iter().map(to_dto).collect())
     }
 
@@ -460,7 +472,7 @@ impl IpcService {
         // archive itself is still usable, so recover the guard instead of
         // turning one panic into a permanent error for that archive.
         let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let entries = guard.0.entries()?;
+        let entries = guard.0.entries_arc()?;
         let idx = entries
             .iter()
             .find(|e| e.path == path)
@@ -521,7 +533,7 @@ impl IpcService {
             // archive permanently unusable (the settings lock above already
             // does the same).
             let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
-            let entries = guard.0.entries().map_err(|e| e.error_key().to_string())?;
+            let entries = guard.0.entries_arc().map_err(|e| e.error_key().to_string())?;
 
             // Expand the selection: a directory contributes its subtree *and*
             // the directory entry itself (so empty folders survive). An empty

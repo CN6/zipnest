@@ -1,4 +1,4 @@
-﻿[workspace]
+[workspace]
 resolver = "2"
 members = ["crates/archive-security", "crates/archive-core", "apps/zipnest/src-tauri", "crates/archive-jobs", "crates/zipnest-ipc", "apps/zipnest-native", "apps/zipnest-shell"]
 
@@ -6,3 +6,19 @@ members = ["crates/archive-security", "crates/archive-core", "apps/zipnest/src-t
 edition = "2021"
 license = "MIT"
 
+# Release builds shipped in the installer and the portable zip.
+#
+# Without this table cargo used its defaults (lto = false, codegen-units = 16,
+# no stripping), which left an ~8.6 MB executable plus a 4.5 MB .pdb beside it.
+# Thin LTO is the sweet spot here: it recovers most of the cross-crate inlining
+# fat LTO gives, at a fraction of the build time the release job budgets for.
+# Debug info stays in the .pdb (strip = "debuginfo" only drops the copies
+# embedded in the binary), so a crash report can still be symbolicated.
+#
+# panic = "abort" is deliberately NOT set: the COM boundary in archive-core
+# relies on unwinding to turn a Rust panic into an HRESULT instead of tearing
+# the process down.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

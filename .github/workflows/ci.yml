@@ -16,6 +16,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A push that lands while the previous run is still going used to leave both
+# running: two full test+clippy rounds and two installer compiles for a tree
+# only the newer one describes. Superseded runs of the same ref are cancelled;
+# runs on different refs stay independent.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 

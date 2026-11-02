@@ -107,7 +107,7 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 }
 
 // --- auto-update ---
-const CURRENT_VERSION: &str = "0.4.17";
+const CURRENT_VERSION: &str = "0.4.18";
 const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
 /// Derived from [`CURRENT_VERSION`] on purpose: a hand-typed string here sat at
 /// `0.4.0` for ten releases (the release checklist asked for it every time and
@@ -646,6 +646,9 @@ struct App {
     selected: std::collections::HashSet<String>,
     error: Option<String>,
     notice: Option<String>,
+    /// Backup path of a settings file that could not be parsed at startup, so
+    /// the `settings.corrupt` notice can name it. `None` on a normal start.
+    settings_backup: Option<String>,
     /// When the diagnostics report was last copied, so the Settings dialog can
     /// show a short "已复制" confirmation instead of a silent button.
     copied_at: Option<std::time::Instant>,
@@ -792,6 +795,14 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
                 }
             });
         }
+        // A settings file that could not be parsed has already been moved
+        // aside by the store; say so once, with the path the old file went to.
+        // Without this the app simply started with every preference reset and
+        // no explanation of why.
+        let settings_backup = svc
+            .corrupt_settings()
+            .and_then(|c| c.backup)
+            .map(|p| p.display().to_string());
         // first frame. maximized_saved starts at the stored value so the first
         Self {
             ctx,
@@ -814,7 +825,8 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             rows: Vec::new(),
             selected: Default::default(),
             error: None,
-            notice: None,
+            notice: settings_backup.as_ref().map(|_| "settings.corrupt".to_string()),
+            settings_backup,
             copied_at: None,
             lang,
             open_picker: false,
@@ -955,6 +967,10 @@ fn t(&self, key: &str) -> String {
         if key == "job.ok_renamed" {
             let n = self.job.as_ref().map(|j| j.renamed).unwrap_or(0);
             text = text.replace("{count}", &n.to_string());
+        }
+        if key == "settings.corrupt" {
+            let path = self.settings_backup.clone().unwrap_or_default();
+            text = text.replace("{path}", &path);
         }
         Some(text)
     }
@@ -1487,11 +1503,22 @@ let extract_enabled = self.archive.is_some();
             // frame and let the painted badge stand in until a row's turn
             // comes, so a 10 000-entry directory cannot stall the UI thread.
             let mut icon_budget = Self::ICONS_PER_FRAME;
-            let rows = self.rows.clone();
+            // The loop needs `&mut self` (icons) *and* the list that
+            // `self.rows` owns. Copying the whole list every frame was the old
+            // way out: a 10 000-entry directory cloned ~1 MB of paths and
+            // strings on every repaint. Move it out for the duration of the
+            // loop instead and put it back before the actions below run, so
+            // they still see a whole `self`.
+            let rows = std::mem::take(&mut self.rows);
+            // `show_rows` touches only the rows inside the viewport: the old
+            // code allocated a rect and laid out four text runs for every
+            // entry in the archive on every frame, which is what made a big
+            // directory feel heavy.
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for (i, e) in rows.iter().enumerate() {
+                .show_rows(ui, Self::ROW_H, rows.len(), |ui, range| {
+                    for i in range {
+                        let e = &rows[i];
                         let selected = self.selected.contains(&e.path);
                         let (rect, resp) = ui.allocate_exact_size(
                             egui::vec2(full_w, Self::ROW_H),
@@ -1604,17 +1631,19 @@ let extract_enabled = self.archive.is_some();
                             }
                         }
                     }
-                    if let Some(d) = dbl.or(click_dir) {
-                        self.navigate(&d);
-                    } else if let Some(f) = click_file {
-                        // Select only. This used to also run the preview reader,
-                        // which pulled up to `preview_max_bytes` out of the
-                        // archive on the UI thread for a panel that no longer
-                        // exists.
-                        self.selected.clear();
-                        self.selected.insert(f);
-                    }
                 });
+            // Put the list back before acting on a click: `navigate` replaces
+            // `self.rows` itself, and selecting needs the field intact.
+            self.rows = rows;
+            if let Some(d) = dbl.or(click_dir) {
+                self.navigate(&d);
+            } else if let Some(f) = click_file {
+                // Select only. This used to also run the preview reader,
+                // which pulled up to `preview_max_bytes` out of the archive on
+                // the UI thread for a panel that no longer exists.
+                self.selected.clear();
+                self.selected.insert(f);
+            }
         });
     }
 

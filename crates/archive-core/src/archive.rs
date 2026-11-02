@@ -17,6 +17,7 @@ use crate::error::{hr_failed, ZipnestError};
 use crate::types::{ArchiveEntry, ArchiveOpenOptions, ExtractOptions, ExtractProgress, ExtractStats};
 use std::ffi::c_void;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 /// Cap on the initial `Vec` capacity used by [`Archive::entries`]: the item
 /// count comes from the archive header and must never drive an allocation
@@ -26,6 +27,13 @@ const MAX_PREALLOC_ENTRIES: u32 = 4096;
 pub struct Archive {
     raw: *mut c_void,   // IInArchive (owned)
     stream: *mut c_void, // IInStream retained by the handler (owned)
+    /// Full listing, enumerated on first use and shared from then on.
+    ///
+    /// Every entry costs six `GetProperty` round trips, and callers re-list on
+    /// each navigation step (list children, preview, extract). The archive is
+    /// read-only for as long as it is open, so a cached list cannot go stale
+    /// and the enumeration only ever has to happen once.
+    entries: OnceLock<Arc<Vec<ArchiveEntry>>>,
     _not_send: *mut (),  // keep !Send/!Sync: IInArchive is not thread-safe
 }
 
@@ -151,6 +159,7 @@ impl Archive {
                 return Ok(Archive {
                     raw,
                     stream: stream.into_raw(),
+                    entries: OnceLock::new(),
                     _not_send: std::ptr::null_mut(),
                 });
             }
@@ -279,6 +288,7 @@ impl Archive {
                 return Ok(Archive {
                     raw,
                     stream: combined,
+                    entries: OnceLock::new(),
                     _not_send: std::ptr::null_mut(),
                 });
             }
@@ -314,12 +324,35 @@ impl Archive {
         self.len() == 0
     }
 
-    /// Enumerate all entries with metadata (Task 6).
+    /// Enumerate all entries with metadata (Task 6), walking the archive at
+    /// most once and sharing the result from then on.
     ///
     /// A property read the engine reports as failed becomes an error: turning it
     /// into an empty path / `size = 0` / "no timestamp" would hand the caller a
-    /// list that quietly lies about the archive.
+    /// list that quietly lies about the archive. A failed walk is deliberately
+    /// left uncached, so a transient I/O error does not condemn the archive.
+    pub fn entries_arc(&self) -> Result<Arc<Vec<ArchiveEntry>>, ZipnestError> {
+        if let Some(cached) = self.entries.get() {
+            return Ok(Arc::clone(cached));
+        }
+        let fresh = Arc::new(self.enumerate_entries()?);
+        // `get_or_init` hands back whichever value won, so the cache always
+        // holds exactly one list even if two callers ever raced here.
+        Ok(Arc::clone(self.entries.get_or_init(|| fresh)))
+    }
+
+    /// Enumerate all entries with metadata (Task 6).
+    ///
+    /// Owned-copy flavour of [`Self::entries_arc`], for callers that want their
+    /// own list: the expensive engine walk is still shared, only the
+    /// allocation-only copy is paid per call.
     pub fn entries(&self) -> Result<Vec<ArchiveEntry>, ZipnestError> {
+        self.entries_arc().map(|entries| entries.as_ref().clone())
+    }
+
+    /// The uncached walk behind [`Self::entries_arc`]: ask the handler for the
+    /// item count, then pull each item's six properties out of it.
+    fn enumerate_entries(&self) -> Result<Vec<ArchiveEntry>, ZipnestError> {
         let count = unsafe {
             let vt = &**(self.raw as *const *const InArchiveVt);
             let mut n: u32 = 0;

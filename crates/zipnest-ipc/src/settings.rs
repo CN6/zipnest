@@ -1,11 +1,18 @@
 //! User settings: a small JSON document persisted under the app data dir.
 //!
 //! The store takes its file path as a parameter so tests can point it at a
-//! temp dir. Load never fails: a missing or corrupt file falls back to
+//! temp dir. Load never fails: a missing file falls back to
 //! [`Settings::default`], and unknown fields are ignored so an older build can
 //! still read a newer file. Values read back from disk are sanitized (bad enum
 //! strings fall back to defaults, numbers are clamped) and saves are atomic
 //! (temp file + rename), so a hand-edited or half-written file is harmless.
+//!
+//! A file that is not a settings document at all is the one case that is *not*
+//! harmless: falling back to defaults silently meant the next `set()` wrote
+//! those defaults over every preference the user had. So an unparsable file is
+//! moved aside (see [`quarantine_corrupt`]) before the defaults are used, and
+//! the store remembers it happened — [`SettingsStore::corrupt_settings`] hands
+//! the backup path to the UI, which owns the wording of the warning.
 
 use crate::error::IpcError;
 use serde::{Deserialize, Serialize};
@@ -247,18 +254,62 @@ impl Settings {
     }
 }
 
+/// What happened when a settings file could not be read as settings.
+///
+/// Kept out of [`Settings`] on purpose: it describes one load, not a
+/// preference, so it must never be persisted (a flag inside `Settings` would
+/// be one more field to serialise, sanitise and get wrong, and it would make a
+/// recovered store unequal to its defaults in every test). The UI reads it from
+/// the store instead — see [`SettingsStore::corrupt_settings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorruptSettings {
+    /// Where the unreadable original was preserved, or `None` when it could not
+    /// be (the directory is read-only, say). Worth showing to the user: it is
+    /// the file their old preferences live in.
+    pub backup: Option<PathBuf>,
+    /// Parser message, for diagnostics — never shown verbatim (it is English
+    /// and mentions byte positions the user cannot act on).
+    pub detail: String,
+}
+
 /// Settings backed by a JSON file.
 #[derive(Debug)]
 pub struct SettingsStore {
     path: PathBuf,
     current: Settings,
+    /// Set only by a load that had to fall back because the file on disk was
+    /// unusable; `None` for a normal load. Not persisted and not cleared by a
+    /// later [`set`]: it records what the user lost at startup, and the UI's
+    /// one-time notice is about exactly that.
+    corrupted: Option<CorruptSettings>,
 }
 
 impl SettingsStore {
     /// Load (or default) from `path`; nothing is written until [`set`].
     pub fn new(path: PathBuf) -> Self {
-        let current = load_from(&path);
-        Self { path, current }
+        let (current, corrupted) = load_from(&path);
+        Self {
+            path,
+            current,
+            corrupted,
+        }
+    }
+
+    /// `true` when the stored file could not be parsed and the defaults are in
+    /// use because of it, i.e. the user's saved preferences were **not** read.
+    ///
+    /// This is the one thing the UI needs for a startup notice; pair it with
+    /// [`corrupt_settings`] to name the backup file. False for a missing file
+    /// (a fresh profile, nothing was lost), for a file that could not be
+    /// *opened* (locked/ACL — it is left untouched and may load fine next
+    /// launch) and for every successful load.
+    pub fn was_reset_from_corrupt(&self) -> bool {
+        self.corrupted.is_some()
+    }
+
+    /// The failure behind [`was_reset_from_corrupt`], with the backup path.
+    pub fn corrupt_settings(&self) -> Option<&CorruptSettings> {
+        self.corrupted.as_ref()
     }
 
     pub fn get(&self) -> &Settings {
@@ -275,18 +326,90 @@ impl SettingsStore {
     }
 }
 
-fn load_from(path: &Path) -> Settings {
-    let mut s: Settings = std::fs::read_to_string(path)
-        .ok()
-        // Notepad and plenty of Windows editors save UTF-8 *with* a BOM.
-        // Handed straight to serde_json, that first character makes the whole
-        // document invalid — the store then fell back to defaults and the next
-        // save wrote those over every preference the user had. Strip it.
-        .map(|raw| raw.trim_start_matches('\u{feff}').to_string())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    s.sanitize();
-    s
+/// Read `path`, returning the settings to use and — when the file had to be
+/// quarantined as unreadable — what happened.
+fn load_from(path: &Path) -> (Settings, Option<CorruptSettings>) {
+    // Bytes first, not `read_to_string`: the two failures need opposite
+    // treatment. Bytes that are not a settings document are *corruption* and
+    // have to be preserved (below). A file that cannot even be opened —
+    // another process holds it, an ACL says no — is not corruption, and
+    // renaming it out from under its owner would turn a temporary condition
+    // into permanent data loss.
+    let raw = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        // No file at all: a fresh profile, nothing was lost.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (Settings::default(), None);
+        }
+        // Unreadable: use defaults for now and leave the file where it is.
+        Err(_) => return (Settings::default(), None),
+    };
+
+    match parse_settings(&raw) {
+        Ok(mut s) => {
+            s.sanitize();
+            (s, None)
+        }
+        Err(detail) => {
+            // The document is unusable, so keeping it at `path` only means the
+            // next `set()` writes defaults over it. Move it aside first: the
+            // bytes are all that is left of the user's preferences.
+            let backup = quarantine_corrupt(path);
+            (
+                Settings::default(),
+                Some(CorruptSettings { backup, detail }),
+            )
+        }
+    }
+}
+
+fn parse_settings(raw: &[u8]) -> Result<Settings, String> {
+    let text = std::str::from_utf8(raw).map_err(|e| format!("not UTF-8: {e}"))?;
+    // Notepad and plenty of Windows editors save UTF-8 *with* a BOM. Handed
+    // straight to serde_json, that first character makes the whole document
+    // invalid — the store then fell back to defaults and the next save wrote
+    // those over every preference the user had. Strip it (only at the start:
+    // a stray BOM inside the document is still a broken document).
+    serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())
+}
+
+/// Preserve an unparsable `settings.json` as `settings.json.corrupt-<unix
+/// seconds>` next to it (same directory, so the rename stays on one
+/// filesystem and the user can find it).
+///
+/// Returns the path the bytes ended up at, or `None` when they could not be
+/// kept. A copy is attempted when the rename is refused: on Windows a file
+/// another process (an AV scanner, an editor) has open cannot be renamed, but
+/// it usually can be read.
+fn quarantine_corrupt(path: &Path) -> Option<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "settings.json".to_string());
+    // Never replace an earlier backup: a crash loop can corrupt twice inside
+    // the same second, and the second failure must not delete the first file.
+    for attempt in 0..8u32 {
+        let name = if attempt == 0 {
+            format!("{base}.corrupt-{stamp}")
+        } else {
+            format!("{base}.corrupt-{stamp}-{attempt}")
+        };
+        let candidate = path.with_file_name(name);
+        if candidate.exists() {
+            continue;
+        }
+        if std::fs::rename(path, &candidate).is_ok() {
+            return Some(candidate);
+        }
+        // The original is still in place; keep a copy of the bytes so a later
+        // save that overwrites `path` cannot destroy them.
+        return std::fs::copy(path, &candidate).ok().map(|_| candidate);
+    }
+    None
 }
 
 /// `settings.json` -> `settings.json.tmp`, in the same directory so the final
@@ -459,6 +582,151 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{ not json").unwrap();
         assert_eq!(SettingsStore::new(path).get(), &Settings::default());
+    }
+
+    /// Every `*.corrupt-*` file the store left in `path`'s directory.
+    fn corrupt_backups(path: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().contains(".corrupt-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// M2: a corrupt file used to fall back to defaults *silently*, so the next
+    /// `set()` wrote those defaults over every preference the user had. The
+    /// bytes now survive as a sibling backup, and the caller is told.
+    #[test]
+    fn a_corrupt_file_is_backed_up_before_defaults_are_used() {
+        let path = tmp_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+
+        let store = SettingsStore::new(path.clone());
+
+        // Defaults are in use, and the store says why.
+        assert_eq!(store.get(), &Settings::default());
+        assert!(store.was_reset_from_corrupt());
+        let corrupt = store
+            .corrupt_settings()
+            .expect("a corrupt load must be reported to the caller");
+        let backup = corrupt.backup.as_ref().expect("the original must be kept");
+        // `settings.json.corrupt-<unix seconds>`, in the same directory.
+        let name = backup.file_name().unwrap().to_string_lossy().into_owned();
+        let stamp = name
+            .strip_prefix("settings.json.corrupt-")
+            .unwrap_or_else(|| panic!("unexpected backup name: {name}"));
+        assert!(
+            stamp.parse::<u64>().is_ok(),
+            "backup suffix must be a unix timestamp, got {stamp}"
+        );
+        assert_eq!(backup.parent(), path.parent(), "backup stays next to the original");
+        // The original is gone from its old name; its bytes survive intact.
+        assert!(!path.exists(), "the unparsable file must be moved aside");
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), "{ not json");
+        assert_eq!(corrupt_backups(&path).len(), 1);
+    }
+
+    /// The whole point of the backup: the defaults the store now holds are
+    /// never written over the only copy of the user's preferences.
+    #[test]
+    fn a_save_after_corruption_does_not_destroy_the_backup() {
+        let path = tmp_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"language":"zh-CN","ui_zoom":150"#).unwrap();
+        let mut store = SettingsStore::new(path.clone());
+        let backup = store
+            .corrupt_settings()
+            .unwrap()
+            .backup
+            .clone()
+            .unwrap();
+        store
+            .set(SettingsPatch {
+                language: Some("en-US".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        // The new file is a clean default-plus-patch document...
+        assert_eq!(
+            serde_json::from_str::<Settings>(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .language,
+            "en-US"
+        );
+        // ...and the broken one still sits beside it, byte for byte.
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            r#"{"language":"zh-CN","ui_zoom":150"#
+        );
+    }
+
+    #[test]
+    fn a_good_file_is_never_quarantined() {
+        let path = tmp_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"language":"en-US"}"#).unwrap();
+        let store = SettingsStore::new(path.clone());
+        assert_eq!(store.get().language, "en-US");
+        assert!(!store.was_reset_from_corrupt());
+        assert!(store.corrupt_settings().is_none());
+        assert!(corrupt_backups(&path).is_empty());
+        assert!(path.exists(), "the file must be left exactly where it was");
+    }
+
+    /// A missing file is a fresh profile, not a loss: no backup, no warning.
+    #[test]
+    fn a_missing_file_is_not_corruption() {
+        let store = SettingsStore::new(tmp_path());
+        assert!(!store.was_reset_from_corrupt());
+        assert!(store.corrupt_settings().is_none());
+    }
+
+    /// Two failures inside one second (a restart loop, a test) must not make
+    /// the second backup overwrite the first.
+    #[test]
+    fn a_second_corruption_keeps_the_first_backup() {
+        let path = tmp_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ first").unwrap();
+        let first = SettingsStore::new(path.clone())
+            .corrupt_settings()
+            .unwrap()
+            .backup
+            .clone()
+            .unwrap();
+        std::fs::write(&path, "{ second").unwrap();
+        let second = SettingsStore::new(path.clone())
+            .corrupt_settings()
+            .unwrap()
+            .backup
+            .clone()
+            .unwrap();
+        assert_ne!(first, second, "the second backup must not reuse the name");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "{ first");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "{ second");
+    }
+
+    /// Bytes that are not UTF-8 are corruption too, and are preserved raw —
+    /// reading them back through a lossy string would destroy the evidence.
+    #[test]
+    fn a_non_utf8_file_is_quarantined() {
+        let path = tmp_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw: [u8; 4] = [b'{', 0xff, 0xfe, b'}'];
+        std::fs::write(&path, raw).unwrap();
+        let store = SettingsStore::new(path.clone());
+        assert_eq!(store.get(), &Settings::default());
+        let backup = store.corrupt_settings().unwrap().backup.clone().unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), raw);
+        assert!(!path.exists());
     }
 
     #[test]

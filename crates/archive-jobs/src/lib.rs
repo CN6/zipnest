@@ -208,16 +208,20 @@ impl JobContext {
     }
 
     /// Throttled emit; bypasses the throttle when the job is complete
-    /// (done_bytes == total_bytes) so the final state always lands.
+    /// (every item and every byte reported) so the final state always lands.
     pub fn report(&self, done_items: u64, total_items: u64, done_bytes: u64, total_bytes: u64) {
         let now = Instant::now();
         {
-            let last = self.last_emit.lock().unwrap();
-            if now.duration_since(*last) < self.throttle && done_bytes != total_bytes {
+            // Check and stamp under one lock: the old code took the lock
+            // twice, so two threads could both pass the check and emit inside
+            // the same throttle window.
+            let mut last = self.last_emit.lock().unwrap();
+            let complete = done_items == total_items && done_bytes == total_bytes;
+            if now.duration_since(*last) < self.throttle && !complete {
                 return;
             }
+            *last = now;
         }
-        *self.last_emit.lock().unwrap() = now;
         let (speed_bps, eta_secs) = {
             let mut prev = self.prev_bytes.lock().unwrap();
             let dt = (now - prev.1).as_secs_f64().max(1e-3);

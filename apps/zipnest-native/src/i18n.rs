@@ -4,10 +4,49 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::ops::Deref;
 
+/// The language to start in when the settings file says `"system"`.
+///
+/// Only two UI languages ship, so every non-Chinese Windows UI language
+/// resolves to English. The old version returned `"zh-CN"` unconditionally,
+/// which meant an English (or German, or Japanese) Windows opened in Chinese
+/// until the user found the setting and changed it.
 pub fn os_language() -> &'static str {
-    // Windows returns e.g. "zh-CN" in GetUserDefaultUILanguage via env? Not set;
-    // fall back to zh by default for this user, overridden by settings later.
-    "zh-CN"
+    if system_ui_is_chinese() {
+        "zh-CN"
+    } else {
+        "en-US"
+    }
+}
+
+/// Whether the *user's* Windows UI language is Chinese.
+#[cfg(windows)]
+fn system_ui_is_chinese() -> bool {
+    /// `LANG_CHINESE` from winnt.h. A LANGID is a primary language in the low
+    /// 10 bits plus a sub-language above it, so this matches zh-CN, zh-TW and
+    /// zh-HK alike: Simplified Chinese is all this build ships, and a Chinese
+    /// UI beats an English one for any of them.
+    const LANG_CHINESE: u16 = 0x04;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        /// `LANGID GetUserDefaultUILanguage(void)`. The user's own choice for
+        /// Windows — not the system default or the installer's language — and
+        /// it has no failure mode: on a fresh profile it falls back to the
+        /// system default itself.
+        fn GetUserDefaultUILanguage() -> u16;
+    }
+
+    // Safe: no arguments, no pointers, no allocation, and kernel32 is mapped
+    // into every process.
+    let langid = unsafe { GetUserDefaultUILanguage() };
+    (langid & 0x03ff) == LANG_CHINESE
+}
+
+/// Not Windows: no registry-free language API to call, and the native UI only
+/// ships for Windows anyway. English is the neutral fallback.
+#[cfg(not(windows))]
+fn system_ui_is_chinese() -> bool {
+    false
 }
 
 /// Decode a JPEG/PNG into an egui color image. Used for QR codes.
@@ -178,6 +217,8 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "settings.shell.associate" => "默认用 ZipNest 打开压缩包",
             "settings.shell.assoc_hint" => "安装后会接管 ZIP / 7Z / RAR / TAR / GZ / BZ2 / XZ / ISO 的默认打开方式；取消勾选会立刻还回去。",
             "settings.shell.blocked" => "系统给 {exts} 记住了别的默认程序，所以要再改回来一次 —— 点下面的按钮就行，不用去系统设置里翻。",
+            // Shown once, when the settings file could not be read at startup.
+            "settings.corrupt" => "设置文件读不出来，已按默认设置启动；原来那份保存到了 {path}，需要的话可以手动恢复。",
             "settings.shell.claim_ok" => "已改好：压缩包现在默认用 ZipNest 打开",
             "settings.shell.claim_partial" => "大部分格式已经改回来，个别格式没能改（系统仍在保护它）",
             "settings.shell.set_default" => "设为默认解压软件",
@@ -346,6 +387,7 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "settings.shell.associate" => "Open archives with ZipNest by default",
             "settings.shell.assoc_hint" => "Takes over the default handler for ZIP / 7Z / RAR / TAR / GZ / BZ2 / XZ / ISO on install; unticking hands them straight back.",
             "settings.shell.blocked" => "Windows has another default app recorded for {exts}, so it needs changing back once — the button below does that, with no trip to Windows Settings.",
+            "settings.corrupt" => "Your settings file could not be read, so ZipNest started with defaults. The old file was kept at {path} if you want it back.",
             "settings.shell.claim_ok" => "Done — archives open with ZipNest by default now",
             "settings.shell.claim_partial" => "Most formats were taken over; Windows still protects the rest",
             "settings.shell.set_default" => "Make ZipNest the default",
@@ -459,6 +501,23 @@ mod tests {
             assert!(ZH.deref().contains_key(key.as_str()), "zh-CN lacks {key}");
             assert!(EN.deref().contains_key(key.as_str()), "en-US lacks {key}");
         }
+    }
+
+    #[test]
+    fn os_language_reports_one_of_the_shipped_languages() {
+        // Whatever Windows answers, the result has to be a tag the settings
+        // file accepts and a table exists for — otherwise `tr()` would print
+        // raw keys for the whole UI.
+        let lang = super::os_language();
+        assert!(
+            matches!(lang, "zh-CN" | "en-US"),
+            "os_language() returned {lang}, which has no string table"
+        );
+        assert_ne!(
+            super::tr(lang, "settings.title"),
+            "settings.title",
+            "the detected language has no string table"
+        );
     }
 
     #[test]

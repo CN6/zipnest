@@ -352,6 +352,10 @@ struct EntryMeta {
     /// How `plan` differs from `raw_path` (empty when identical).
     fixes: Vec<EntryPathFix>,
     is_dir: bool,
+    /// Size the archive claims for this entry. Only used to keep the progress
+    /// total honest when the entry never gets a stream (skipped or unwritable):
+    /// otherwise the bar would stop short of 100% for the rest of the run.
+    size: u64,
     mtime: Option<std::time::SystemTime>,
 }
 
@@ -431,6 +435,36 @@ impl DiskState {
         if let Ok(mut s) = self.skipped.lock() {
             s.push(raw.to_string());
         }
+    }
+
+    /// Charge an entry that will never write a byte: skipped, unwritable, or a
+    /// directory.
+    ///
+    /// `done_bytes` counts what actually reached the disk, and `total_bytes` is
+    /// summed from the listing, so an entry that is skipped or fails before its
+    /// stream opens used to leave the bar permanently short of the total — a
+    /// run that skipped 3 000 existing files over 1 GiB sat at 12% and then
+    /// "finished", with the ETA extrapolating from a fraction that could never
+    /// reach 1. Charging the listed size keeps the denominator and the running
+    /// total in the same units.
+    fn account_unwritten(&self, meta: &EntryMeta) {
+        self.done_bytes.fetch_add(meta.size, Ordering::Relaxed);
+    }
+
+    /// Record a per-entry failure and charge its bytes, returning the callback
+    /// result the caller must pass on (`S_OK`: one bad entry never aborts the
+    /// run, the post-checks turn `failed` into a reported error).
+    fn fail_entry(&self, meta: &EntryMeta, reason: &'static str, detail: Option<String>) -> i32 {
+        self.record_failure(&meta.raw_path, reason, detail);
+        self.account_unwritten(meta);
+        S_OK
+    }
+
+    /// Same for an entry the conflict policy leaves alone (`skip`).
+    fn skip_entry(&self, meta: &EntryMeta) -> i32 {
+        self.record_skip(&meta.raw_path);
+        self.account_unwritten(meta);
+        S_OK
     }
 
     /// Record an entry that is **not on disk**. Every one of these turns the run
@@ -893,16 +927,16 @@ unsafe extern "system" fn disk_get_stream(
     if !full.starts_with(&st.dest) {
         // Double insurance (symlink-style escapes cannot happen here, but
         // never write outside dest even if join semantics change).
-        st.record_failure(&meta.raw_path, "error.entry_path", None);
-        return S_OK;
+        return st.fail_entry(meta, "error.entry_path", None);
     }
 
     if meta.is_dir {
         // Directories are idempotent and never conflict. One we cannot create
         // is a real failure: its files cannot land either.
         if let Err(e) = std::fs::create_dir_all(os_path(&full)) {
-            st.record_failure(&meta.raw_path, "error.entry_io", Some(e.to_string()));
+            return st.fail_entry(meta, "error.entry_io", Some(e.to_string()));
         }
+        st.account_unwritten(meta);
         return S_OK;
     }
 
@@ -910,18 +944,15 @@ unsafe extern "system" fn disk_get_stream(
     let target = if os_exists(&full) {
         match st.on_conflict {
             OnConflict::Skip => {
-                st.record_skip(&meta.raw_path);
-                return S_OK; // null stream → the engine leaves the file alone
+                // Null stream → the engine leaves the file alone.
+                return st.skip_entry(meta);
             }
             OnConflict::Rename => match unique_dest(&full) {
                 Some(free) => free,
                 // Every `name (n).ext` up to 9999 exists. The policy promises
                 // never to overwrite, so this entry cannot be written — which is
                 // a failure to report, not something to hide behind "done".
-                None => {
-                    st.record_failure(&meta.raw_path, "error.entry_conflict", None);
-                    return S_OK;
-                }
+                None => return st.fail_entry(meta, "error.entry_conflict", None),
             },
             OnConflict::Overwrite => full.clone(),
         }
@@ -934,8 +965,7 @@ unsafe extern "system" fn disk_get_stream(
     // `stats.failed`, which makes the job report a failure with these names.
     if let Some(parent) = target.parent() {
         if let Err(e) = std::fs::create_dir_all(os_path(parent)) {
-            st.record_failure(&meta.raw_path, "error.entry_io", Some(e.to_string()));
-            return S_OK;
+            return st.fail_entry(meta, "error.entry_io", Some(e.to_string()));
         }
     }
     // The planner vets the entry *name* only. An archive can still ship a link
@@ -947,19 +977,14 @@ unsafe extern "system" fn disk_get_stream(
     // SeCreateSymbolicLinkPrivilege, so this is defence in depth rather than an
     // open door; junctions need no privilege.)
     if has_link_ancestor(&st.dest, &target) {
-        st.record_failure(&meta.raw_path, "error.entry_link", None);
-        return S_OK;
+        return st.fail_entry(meta, "error.entry_link", None);
     }
     let Some(tmp) = temp_sibling(&target) else {
-        st.record_failure(&meta.raw_path, "error.entry_path", None);
-        return S_OK;
+        return st.fail_entry(meta, "error.entry_path", None);
     };
     let file = match std::fs::File::create(os_path(&tmp)) {
         Ok(f) => f,
-        Err(e) => {
-            st.record_failure(&meta.raw_path, "error.entry_io", Some(e.to_string()));
-            return S_OK;
-        }
+        Err(e) => return st.fail_entry(meta, "error.entry_io", Some(e.to_string())),
     };
     {
         // The handler serializes GetStream/SetOperationResult, so at most one
@@ -1081,6 +1106,7 @@ pub(crate) fn extract_to_disk(
             plan: p.path,
             fixes: p.fixes,
             is_dir: e.is_dir,
+            size: e.size,
             mtime: e.mtime,
         })
         .collect();
