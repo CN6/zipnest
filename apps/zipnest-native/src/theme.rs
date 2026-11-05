@@ -22,23 +22,43 @@ pub enum Mode {
 }
 
 pub fn install_fonts(ctx: &egui::Context) {
+    use egui::FontFamily;
+
     let mut fonts = egui::FontDefinitions::default();
-    let mut add = |path: &str, family: egui::FontFamily| {
-        if let Ok(bytes) = std::fs::read(path) {
-            let key = format!("sys-{}", std::path::Path::new(path).file_name().unwrap_or_default().to_string_lossy());
-            fonts.font_data.insert(key.clone(), egui::FontData::from_owned(bytes));
-            fonts.families.entry(family).or_default().push(key);
+    // Each font file is read once and registered once, then referenced from
+    // every family that wants it. `msyh.ttc` used to be read twice (once for
+    // Proportional, once for Monospace): the key collided, so memory was not
+    // duplicated, but the ~19 MB file was read from disk and dropped a second
+    // time on every start.
+    let mut add = |path: &str, families: &[FontFamily]| {
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let file = std::path::Path::new(path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let key = format!("sys-{file}");
+        fonts.font_data.insert(key.clone(), egui::FontData::from_owned(bytes));
+        for family in families {
+            let list = fonts.families.entry(family.clone()).or_default();
+            if !list.contains(&key) {
+                list.push(key.clone());
+            }
         }
     };
     // Latin: Segoe UI (Win11 default). CJK: Microsoft YaHei fallback.
     // Deliberately NO color/emoji fonts — egui's glyph engine cannot parse
     // them and would render every glyph as a box.
-    add("C:\\Windows\\Fonts\\segoeui.ttf", egui::FontFamily::Proportional);
-    add("C:\\Windows\\Fonts\\msyh.ttc", egui::FontFamily::Proportional);
-    add("C:\\Windows\\Fonts\\consola.ttf", egui::FontFamily::Monospace);
-    add("C:\\Windows\\Fonts\\msyh.ttc", egui::FontFamily::Monospace);
+    add("C:\\Windows\\Fonts\\segoeui.ttf", &[FontFamily::Proportional]);
+    add(
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        &[FontFamily::Proportional, FontFamily::Monospace],
+    );
+    add("C:\\Windows\\Fonts\\consola.ttf", &[FontFamily::Monospace]);
     // Move our system fonts ahead of the built-ins so they win.
-    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+    for fam in [FontFamily::Proportional, FontFamily::Monospace] {
         if let Some(list) = fonts.families.get_mut(&fam) {
             let sys: Vec<String> = list.iter().filter(|k| k.starts_with("sys-")).cloned().collect();
             let rest: Vec<String> = list.iter().filter(|k| !k.starts_with("sys-")).cloned().collect();

@@ -852,6 +852,16 @@ struct App {
     /// Insertion order of `icons`, oldest first, so eviction can free the
     /// oldest texture instead of letting the cache grow without bound.
     icon_order: std::collections::VecDeque<String>,
+    /// Listings already fetched for a directory of the open archive, keyed by
+    /// the normalized directory. Every navigation used to rescan the whole
+    /// entry list; walking back and forth into the same folder should not.
+    /// Cleared when a different archive opens.
+    dir_cache: std::collections::HashMap<String, Vec<EntryDto>>,
+    /// Local-time text for an entry's modification time, keyed by the raw
+    /// timestamp. Producing it costs two Win32 calls plus a `format!`, and a
+    /// visible row is redrawn every frame, so the same timestamp was converted
+    /// ~60 times a second for as long as the folder stayed on screen.
+    mtime_cache: std::collections::HashMap<u64, String>,
     // auto-update
     update: Arc<Mutex<UpdateState>>,
 }
@@ -1018,6 +1028,8 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             qr_alipay,
             icons: Default::default(),
             icon_order: Default::default(),
+            dir_cache: Default::default(),
+            mtime_cache: Default::default(),
             update,
         }
     }
@@ -1389,22 +1401,27 @@ fn t(&self, key: &str) -> String {
     fn open_archive_with_password(&mut self, path: &str, password: Option<String>) {
         // Release whatever we are replacing first: the engine, the source file
         // handle and the session password all live inside that archive, and
-        // nothing else closes it (see `IpcService::close_archive`).
+        // nothing else closes it (see `IpcService::close_archive`). The cached
+        // listings belong to that archive too.
         if let Some(old) = self.archive.take() {
             self.svc.close_archive(old.id);
         }
+        self.dir_cache.clear();
         // The previous archive's password dies with it; a successful open below
         // sets the one this archive was unlocked with.
         self.archive_password = None;
         match self.svc.open_archive(path.to_string(), password.clone()) {
             Ok(res) => {
-                let id = res.id;
+                // The open already computed the root listing; reusing it here
+                // saves a second full scan of every entry in the archive.
+                let root = res.entries.clone();
                 self.archive = Some(res);
                 self.archive_path = path.to_string();
                 self.archive_password = password;
                 self.password_prompt = None;
                 self.cwd = String::new();
-                self.rows = self.svc.list_children(id, String::new()).unwrap_or_default();
+                self.dir_cache.insert(String::new(), root.clone());
+                self.rows = root;
                 self.selected.clear();
                 self.resort();
                 self.error = None;
@@ -1442,12 +1459,47 @@ fn t(&self, key: &str) -> String {
     /// so `cwd` and `rows` can never disagree about where we are.
     fn navigate(&mut self, dir: &str) {
         let dir = normalize_dir(dir);
-        if let Some(a) = &self.archive {
-            self.rows = self.svc.list_children(a.id, dir.clone()).unwrap_or_default();
-            self.cwd = dir;
-            self.selected.clear();
-            self.resort();
+        let Some(id) = self.archive.as_ref().map(|a| a.id) else {
+            return;
+        };
+        self.rows = match self.dir_cache.get(&dir) {
+            Some(cached) => cached.clone(),
+            None => {
+                let rows = self.svc.list_children(id, dir.clone()).unwrap_or_default();
+                // Bounded: clearing on overflow costs one re-scan later, and
+                // keeps a deep walk through a huge archive from caching every
+                // listing it passed through.
+                if self.dir_cache.len() >= Self::DIR_CACHE_MAX {
+                    self.dir_cache.clear();
+                }
+                self.dir_cache.insert(dir.clone(), rows.clone());
+                rows
+            }
+        };
+        self.cwd = dir;
+        self.selected.clear();
+        self.resort();
+    }
+
+    /// Local-time text for an entry's modification time, memoized by the
+    /// timestamp. Every row is repainted each frame, and formatting one needs
+    /// two Win32 calls, so a folder left on screen was re-converting the same
+    /// timestamps sixty times a second.
+    fn mtime_text(&mut self, mtime_ms: Option<u64>) -> &str {
+        const DASH: &str = "-";
+        let Some(ms) = mtime_ms else {
+            return DASH;
+        };
+        if !self.mtime_cache.contains_key(&ms) {
+            let text = format_mtime_local(ms).unwrap_or_else(|| DASH.to_string());
+            // A directory can hold more distinct timestamps than are worth
+            // remembering; start over rather than grow without bound.
+            if self.mtime_cache.len() >= 8192 {
+                self.mtime_cache.clear();
+            }
+            self.mtime_cache.insert(ms, text);
         }
+        self.mtime_cache.get(&ms).map(String::as_str).unwrap_or(DASH)
     }
 
     /// Backspace and the "up" button. At the root there is nowhere to go, so
@@ -1631,6 +1683,10 @@ let extract_enabled = self.archive.is_some();
     /// Hard cap on cached icons. Textures are freed as their key is evicted,
     /// so browsing a huge archive cannot leak GPU memory.
     const ICON_CACHE_MAX: usize = 256;
+    /// Directories remembered per open archive. Old enough to cover normal
+    /// back-and-forth browsing, small enough that a deep walk through a huge
+    /// archive cannot hold a copy of every listing it ever showed.
+    const DIR_CACHE_MAX: usize = 64;
 
     /// Drop the oldest cached icons. Runs at the start of the list, before any
     /// row is painted: egui frees a texture when its last handle goes, so
@@ -1900,18 +1956,15 @@ let extract_enabled = self.archive.is_some();
                         }
 
                         // Modification time: the column existed but was never
-                        // filled in before.
-                        let mtime = e
-                            .mtime_ms
-                            .and_then(format_mtime_local)
-                            .unwrap_or_else(|| "-".to_string());
+                        // filled in before. Memoized — see `mtime_text`.
+                        let mtime = self.mtime_text(e.mtime_ms);
                         paint_elided(
                             ui,
                             egui::Rect::from_min_max(
                                 egui::pos2(mtime_x + 2.0, rect.top()),
                                 egui::pos2(enc_x - 4.0, rect.bottom()),
                             ),
-                            &mtime,
+                            mtime,
                             egui::FontId::proportional(12.5),
                             weak,
                             egui::Align2::LEFT_CENTER,

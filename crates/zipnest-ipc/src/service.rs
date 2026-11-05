@@ -178,23 +178,38 @@ fn to_dto(e: &ArchiveEntry) -> EntryDto {
     }
 }
 
+/// `/`-separated form of an archive path, with trailing separators trimmed.
+///
+/// Borrows when the path already uses `/` — the common case, and the one that
+/// matters: this runs over *every* entry of the archive on each listing or
+/// extraction, so allocating a `String` per entry was pure churn. Only the
+/// Windows-style `\` paths some archivers store are copied.
+fn normalized(s: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = s.trim_end_matches(['/', '\\']);
+    if trimmed.contains('\\') {
+        std::borrow::Cow::Owned(trimmed.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    }
+}
+
 /// Direct children of `dir` (`""` = root); tolerates trailing-slash forms.
 /// Archives may store Windows-style backslash separators (`sub\b.txt`), so
 /// matching normalizes to `/` without mutating the stored path (the UI and
 /// `read_entry` see the engine's original path verbatim).
 fn children_of<'a>(entries: &'a [ArchiveEntry], dir: &str) -> Vec<&'a ArchiveEntry> {
-    fn norm(s: &str) -> String {
-        s.replace('\\', "/")
-    }
-    let dir = norm(dir.trim_end_matches(['/', '\\']));
+    let dir = normalized(dir);
+    // Built once per call. It used to be `format!("{dir}/")` *inside* the
+    // filter closure, so it was allocated once per entry instead of once here.
+    let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
     entries
         .iter()
         .filter(|e| {
-            let p = norm(e.path.trim_end_matches(['/', '\\']));
+            let p = normalized(&e.path);
             if dir.is_empty() {
                 !p.contains('/')
             } else {
-                matches!(p.strip_prefix(&format!("{dir}/")), Some(rest) if !rest.contains('/'))
+                matches!(p.strip_prefix(prefix.as_str()), Some(rest) if !rest.contains('/'))
             }
         })
         .collect()
@@ -204,35 +219,56 @@ fn children_of<'a>(entries: &'a [ArchiveEntry], dir: &str) -> Vec<&'a ArchiveEnt
 ///
 /// A selected directory contributes its subtree *and* the directory entry
 /// itself, so empty folders land on disk. An empty selection means "the whole
-/// archive". Directory membership is looked up in a set instead of rescanning
-/// every entry once per selection (that inner scan made selecting a big
-/// archive quadratic in the entry count). The result is sorted and deduped.
+/// archive".
+///
+/// Membership is decided by walking each entry's own ancestors, not by testing
+/// every selected path against every entry. The old nested scan was
+/// `O(entries × selection)` — selecting a few thousand siblings and pressing
+/// extract turned into billions of string comparisons on the worker thread,
+/// before the first progress report, so the progress bar simply sat there.
+/// Depth is tiny, so this is linear in entries.
 fn select_entries(entries: &[ArchiveEntry], paths: &[String]) -> Vec<u32> {
-    fn norm(s: &str) -> String {
-        s.replace('\\', "/").trim_end_matches('/').to_string()
-    }
-    let selection: Vec<String> = paths.iter().map(|p| norm(p)).collect();
-    let mut wanted: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let selection: Vec<std::borrow::Cow<'_, str>> = paths.iter().map(|p| normalized(p)).collect();
     if selection.is_empty() || selection.iter().any(|s| s.is_empty()) {
-        wanted.extend(entries.iter().map(|e| e.index));
-        return wanted.into_iter().collect();
+        let mut all: Vec<u32> = entries.iter().map(|e| e.index).collect();
+        all.sort_unstable();
+        all.dedup();
+        return all;
     }
-    let dirs: std::collections::HashSet<String> = entries
+
+    let selected: std::collections::HashSet<&str> = selection.iter().map(|s| s.as_ref()).collect();
+    // Only a selected path that is really a directory entry contributes its
+    // subtree — a file path is just that file.
+    let dirs: std::collections::HashSet<std::borrow::Cow<'_, str>> = entries
         .iter()
         .filter(|e| e.is_dir)
-        .map(|e| norm(&e.path))
+        .map(|e| normalized(&e.path))
         .collect();
-    let selected: std::collections::HashSet<&str> = selection.iter().map(|s| s.as_str()).collect();
+    let selected_dirs: std::collections::HashSet<&str> = selected
+        .iter()
+        .copied()
+        .filter(|sel| dirs.contains(*sel))
+        .collect();
+
+    let mut wanted: Vec<u32> = Vec::new();
     for e in entries {
-        let path = norm(&e.path);
-        let inside_selected_dir = selected.iter().any(|sel| {
-            dirs.contains(*sel) && path.strip_prefix(sel).is_some_and(|rest| rest.starts_with('/'))
-        });
-        if selected.contains(path.as_str()) || inside_selected_dir {
-            wanted.insert(e.index);
+        let path = normalized(&e.path);
+        let mut inside_selected_dir = false;
+        let mut rest = path.as_ref();
+        while let Some(cut) = rest.rfind('/') {
+            rest = &rest[..cut];
+            if selected_dirs.contains(rest) {
+                inside_selected_dir = true;
+                break;
+            }
+        }
+        if inside_selected_dir || selected.contains(path.as_ref()) {
+            wanted.push(e.index);
         }
     }
-    wanted.into_iter().collect()
+    wanted.sort_unstable();
+    wanted.dedup();
+    wanted
 }
 
 /// `emit(event_name, json_payload)` — thread-safe callback the glue layer
@@ -895,5 +931,84 @@ mod tests {
         assert!(out.associate);
         assert!(out.context_menu);
         assert_eq!(out.warnings, vec!["error.shell.file_menu".to_string()]);
+    }
+
+    // --- listing / selection planning -------------------------------------
+
+    fn entry(index: u32, path: &str, is_dir: bool) -> ArchiveEntry {
+        ArchiveEntry {
+            index,
+            path: path.to_string(),
+            is_dir,
+            size: 0,
+            crc: None,
+            mtime: None,
+            encrypted: false,
+        }
+    }
+
+    fn listing(entries: &[ArchiveEntry], dir: &str) -> Vec<String> {
+        children_of(entries, dir).iter().map(|e| e.path.clone()).collect()
+    }
+
+    #[test]
+    fn children_of_lists_only_direct_children() {
+        let entries = vec![
+            entry(0, "a.txt", false),
+            entry(1, "sub/", true),
+            entry(2, "sub/b.txt", false),
+            entry(3, "sub/deep/", true),
+            entry(4, "sub/deep/c.txt", false),
+        ];
+        assert_eq!(listing(&entries, ""), vec!["a.txt", "sub/"]);
+        assert_eq!(listing(&entries, "sub"), vec!["sub/b.txt", "sub/deep/"]);
+        // The same directory spelled with a trailing slash.
+        assert_eq!(listing(&entries, "sub/"), vec!["sub/b.txt", "sub/deep/"]);
+        // Archives that store Windows separators still list correctly.
+        let backslash = vec![entry(0, r"sub\b.txt", false)];
+        assert_eq!(children_of(&backslash, "sub").len(), 1);
+    }
+
+    #[test]
+    fn select_entries_expands_directories_and_dedupes() {
+        let entries = vec![
+            entry(0, "a.txt", false),
+            entry(1, "sub/", true),
+            entry(2, "sub/b.txt", false),
+            entry(3, "sub/deep/", true),
+            entry(4, "sub/deep/c.txt", false),
+            entry(5, "z.txt", false),
+        ];
+        // A directory contributes itself plus its whole subtree.
+        assert_eq!(select_entries(&entries, &["sub".to_string()]), vec![1, 2, 3, 4]);
+        // A file contributes exactly itself, never its siblings.
+        assert_eq!(select_entries(&entries, &["a.txt".to_string()]), vec![0]);
+        // Overlapping picks collapse into one sorted list.
+        assert_eq!(
+            select_entries(&entries, &["sub".into(), "sub/b.txt".into(), "a.txt".into()]),
+            vec![0, 1, 2, 3, 4]
+        );
+        // A backslash-spelled directory is the same directory.
+        assert_eq!(select_entries(&entries, &[r"sub\deep".into()]), vec![3, 4]);
+        // An empty selection means "the whole archive" — and so does an empty
+        // path inside it.
+        assert_eq!(select_entries(&entries, &[]), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(select_entries(&entries, &[String::new()]), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    /// Selecting thousands of siblings used to be `O(entries × selection)`:
+    /// 20 000 picks against 20 000 entries is 400 million comparisons on the
+    /// worker thread, before the first progress event. This pins the linear
+    /// behaviour — and that every pick survives.
+    #[test]
+    fn select_entries_scales_to_wide_selections() {
+        let n = 20_000u32;
+        let entries: Vec<ArchiveEntry> =
+            (0..n).map(|i| entry(i, &format!("f{i}.txt"), false)).collect();
+        let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+        let wanted = select_entries(&entries, &paths);
+        assert_eq!(wanted.len(), n as usize);
+        assert_eq!(wanted.first(), Some(&0));
+        assert_eq!(wanted.last(), Some(&(n - 1)));
     }
 }
