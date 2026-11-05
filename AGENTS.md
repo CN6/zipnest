@@ -52,7 +52,9 @@ otherwise violate. Read it first, every session.
 ## Dev-loop gotchas
 
 - PowerShell 5.1 starts each shell plain: run `[Console]::OutputEncoding=[Text.Encoding]::UTF8` and prepend `$env:USERPROFILE\.cargo\bin` to `$env:Path` before cargo/pnpm.
-- `tauri dev` watches `crates/**`: editing Rust restarts the app and wipes UI state; front-end edits hot-reload.
+- The UI is egui/eframe, not Tauri: there is **no** hot reload for either Rust or
+  UI code. Rebuild and relaunch (`cargo run -p zipnest-native`) to see a change;
+  the window's state does not survive that restart.
 - The window position changes on every restart — re-snapshot coordinates before driving the UI.
 
 ## Shipping a release (Windows) - exact recipe
@@ -60,11 +62,13 @@ otherwise violate. Read it first, every session.
 `apps/zipnest-native` is the real app (egui, no WebView2); `apps/zipnest` is the
 older web UI and is NOT shipped.
 
-1. Bump `CURRENT_VERSION` in `apps/zipnest-native/src/main.rs`, `!define VERSION`
-   and `OutFile` in `packaging/installer.nsi`, `Version` in
+1. Bump `[workspace.package].version` in the root `Cargo.toml` — that is the only
+   place a version is typed; every crate inherits it with `version.workspace = true`
+   and `main.rs` reads it via `env!("CARGO_PKG_VERSION")`. Then update `!define
+   VERSION` and `OutFile` in `packaging/installer.nsi`, `Version` in
    `packaging/win11-shell/AppxManifest.xml`, and the version/file names in
    `README.md`. Add a `CHANGELOG.md` section (Chinese, matching that file's style).
-   Then run `packaging\check-versions.ps1`: it fails loudly on any of the six
+   Then run `packaging\check-versions.ps1`: it fails loudly on any of the fourteen
    places disagreeing, which is how the Win11 manifest version sat at 0.4.0.0 for
    ten releases unnoticed.
 2. `cargo test --workspace` (all suites green) + `cargo clippy --workspace
@@ -108,7 +112,7 @@ older web UI and is NOT shipped.
    - Local installers/portable zips are not kept: upload them and delete the
      copies (the maintainer does not want them on disk).
 
-## Known open items / gotchas (as of v0.4.15)
+## Known open items / gotchas (as of v0.4.22)
 
 - **Scripts and JSON this agent writes**: the editor tool drops a leading `#`
   from the first line (`#Requires -Version 5.1` came out as
