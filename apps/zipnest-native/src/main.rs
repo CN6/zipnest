@@ -3026,6 +3026,14 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
         }
         if close {
             self.job = None;
+            if self.settings.auto_close_after_job {
+                self.close_at = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                // Do not make the user wait for the next scheduled frame: an
+                // idle egui loop only wakes up on its own timer, which is what
+                // made a click on 关闭 look like a two-second hang.
+                ctx.request_repaint();
+            }
         }
     }
 }
