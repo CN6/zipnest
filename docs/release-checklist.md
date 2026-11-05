@@ -4,8 +4,7 @@
 
 ## 0. 版本号一致（必须）
 
-- [ ] `apps/zipnest-native/src/main.rs` 的 `CURRENT_VERSION`（自动更新比较靠它）
-- [ ] `apps/zipnest-native/src/main.rs` 的 `UPDATE_UA`
+- [ ] 根 `Cargo.toml` 的 `[workspace.package].version`（唯一真源；`main.rs` 用 `env!("CARGO_PKG_VERSION")` 读取，`UPDATE_UA` 也由它派生）
 - [ ] `packaging/installer.nsi` 的 `VERSION` 与 `OutFile`
 - [ ] `packaging/win11-shell/AppxManifest.xml` 的 `Version`（如 `0.3.0.0`）
 - [ ] `CHANGELOG.md` 已补本次版本条目

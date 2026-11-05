@@ -5,10 +5,9 @@ name: ci
 # user-visible regression that one of these steps would have caught (v0.4.9 fixed
 # a stuck installer from v0.4.8; v0.4.10 fixed a flashing update window).
 #
-# The shipped app is `zipnest-native`; `apps/zipnest` is the older WebView2/Tauri
-# UI that is NOT shipped (AGENTS.md). apps/zipnest/src-tauri is its own workspace
-# now, so `--workspace` below means exactly the six shipped crates, and the
-# frontend tests run only when apps/zipnest actually changed.
+# The shipped app is `zipnest-native` (egui) and `zipnest-shell` for the Win11
+# menu package. The older Tauri/WebView2 UI was removed in v0.4.22, so every
+# job below covers the whole repository; there is no separate frontend suite.
 
 on:
   push:
@@ -34,60 +33,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # `apps/zipnest` (the older, unshipped WebView2 UI) has a test suite that is
-  # worth running when it changes and pure overhead when it does not. This job
-  # answers "did it change?" once, so `frontend` can gate on it.
-  changes:
-    name: changed paths
-    runs-on: ubuntu-latest
-    outputs:
-      frontend: ${{ steps.frontend.outputs.changed }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # `git diff <before> HEAD` needs the base commit to be present.
-          fetch-depth: 0
-
-      - name: did apps/zipnest change?
-        id: frontend
-        shell: bash
-        run: |
-          set -eu
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual run: the frontend job runs."
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="${{ github.event.pull_request.base.sha }}"
-          else
-            base="${{ github.event.before }}"
-          fi
-
-          # A brand-new branch pushes 000...0 as `before`, and a force-push can
-          # leave the old tip unreachable; fall back to the previous commit.
-          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
-            base="$(git rev-parse --verify --quiet HEAD~1 || true)"
-            echo "Base ${base:-<none>} (fallback to HEAD~1)"
-          fi
-
-          # Still nothing to diff against: a single-commit history. Be
-          # conservative and run the frontend job rather than skip it silently.
-          if [ -z "$base" ]; then
-            echo "No base commit; assuming apps/zipnest changed."
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if git diff --name-only "$base" HEAD | grep -q "^apps/zipnest/"; then
-            echo "apps/zipnest changed."
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "apps/zipnest untouched."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
   test:
     name: test + clippy (workspace)
     runs-on: windows-latest
@@ -188,27 +133,3 @@ jobs:
           & "C:\Program Files (x86)\NSIS\makensis.exe" /V2 installer.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }
           Pop-Location
-
-  frontend:
-    name: older web UI (not shipped) — tests only
-    runs-on: windows-latest
-    needs: changes
-    if: needs.changes.outputs.frontend == 'true'
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: apps/zipnest/pnpm-lock.yaml
-
-      - name: pnpm test
-        working-directory: apps/zipnest
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm test

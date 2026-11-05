@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-# `apps/zipnest/src-tauri` is the older Tauri/WebView2 UI and is NOT shipped
-# (AGENTS.md). It is its own workspace, so a plain `cargo` command here never
-# resolves the whole Tauri dependency tree.
+# The shipped app is `apps/zipnest-native` (egui) plus `apps/zipnest-shell` for
+# the Win11 context-menu package. The older Tauri/WebView2 UI was removed in
+# v0.4.22; it was never shipped.
 members = ["crates/archive-security", "crates/archive-core", "crates/archive-jobs", "crates/zipnest-ipc", "apps/zipnest-native", "apps/zipnest-shell"]
 
 [workspace.package]

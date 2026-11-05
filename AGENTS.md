@@ -59,8 +59,8 @@ otherwise violate. Read it first, every session.
 
 ## Shipping a release (Windows) - exact recipe
 
-`apps/zipnest-native` is the real app (egui, no WebView2); `apps/zipnest` is the
-older web UI and is NOT shipped.
+`apps/zipnest-native` is the real app (egui, no WebView2). The older Tauri/WebView2
+UI that lived in `apps/zipnest` was removed in v0.4.22; it was never shipped.
 
 1. Bump `[workspace.package].version` in the root `Cargo.toml` — that is the only
    place a version is typed; every crate inherits it with `version.workspace = true`
@@ -72,9 +72,8 @@ older web UI and is NOT shipped.
    places disagreeing, which is how the Win11 manifest version sat at 0.4.0.0 for
    ten releases unnoticed.
 2. `cargo test --workspace` (all suites green) + `cargo clippy --workspace
-   --all-targets` (no new warnings). CI (`.github/workflows/ci.yml`) runs the
-   shipped crates only — `apps/zipnest` is the unshipped WebView2 UI and would
-   drag a second desktop stack into every run.
+   --all-targets` (no new warnings). CI (`.github/workflows/ci.yml`) runs exactly
+   these on every push.
 3. Build both binaries: `cargo build -p zipnest-native --release` and
    `cargo build -p zipnest-shell --release` (the shell DLL feeds the Win11 MSIX).
 4. Emit the payload: `packaging\emit-portable.ps1` (third-party licenses are

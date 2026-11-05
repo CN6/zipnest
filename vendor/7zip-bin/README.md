@@ -18,9 +18,7 @@ an installer at all (`packaging\installer.nsi` reads every file from there).
 | License text shipped as | `licenses\7zip.txt` (from `vendor\7zip-sdk\LICENSE`) |
 
 Provenance: this is the engine the project has shipped since the first release —
-taken from the official 7-Zip distribution and copied forward byte for byte (the
-hash above also matches the copy under `apps/zipnest/src-tauri/resources`, the
-older, unshipped web build).
+taken from the official 7-Zip distribution and copied forward byte for byte.
 
 Replacing it: drop the new `7z.dll` in here, update the hash table above and the
 `licenses\7zip.txt` copy, then re-run `packaging\emit-portable.ps1`. Users may
