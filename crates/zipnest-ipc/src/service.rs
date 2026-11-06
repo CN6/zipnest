@@ -781,6 +781,13 @@ impl IpcService {
                 return Err("error.entries_failed".into());
             }
             if delete_archive {
+                // A skipped entry means the destination already held a file of
+                // that name, so the archive's version of it never reached the
+                // disk — and the archive is this run's only other copy. Deleting
+                // it would lose that content for good.
+                if !stats.skipped.is_empty() {
+                    return Err("error.delete_skipped".into());
+                }
                 // Windows cannot unlink a file while Archive owns its read
                 // handle, so release both the worker's and registry's refs.
                 drop(shared);

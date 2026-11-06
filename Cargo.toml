@@ -9,7 +9,7 @@ members = ["crates/archive-security", "crates/archive-core", "crates/archive-job
 # The only place a release version is typed: every member inherits it with
 # version.workspace = true, and packaging/check-versions.ps1 compares it with
 # the installer, the MSIX manifest, the README and the CHANGELOG.
-version = "0.4.26"
+version = "0.4.27"
 edition = "2021"
 license = "MIT"
 

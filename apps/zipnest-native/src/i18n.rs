@@ -119,6 +119,7 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "error.entries_failed" => "有文件没能解压出来 —— 已成功的文件留在目标文件夹里，下面列出的这些没有写出来：",
             "error.archive_delete" => "解压已完成，但原压缩包删除失败（文件可能正被其他程序占用）",
             "error.delete_partial" => "「解压并删除」只能在整个压缩包一起解压时使用；原压缩包已保留",
+            "error.delete_skipped" => "有文件因重名被跳过，压缩包里这些文件的新内容还没写出来，因此原压缩包已保留。想删掉压缩包，请改用「覆盖」或「重命名」再解压一次。",
             "error.entry_io" => "无法写入（文件被占用 / 没有权限 / 磁盘空间不足）",
             "error.entry_link" => "路径里出现了符号链接或目录联接，为安全起见拒绝写入",
             "error.entry_path" => "条目名无法映射到安全的路径",
@@ -302,6 +303,7 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "error.entries_failed" => "Some entries could not be extracted. The files that worked are in the destination; these are not:",
             "error.archive_delete" => "Extraction finished, but the source archive could not be deleted (another program may have it open)",
             "error.delete_partial" => "\"Extract and delete\" only works when extracting the whole archive; the source was kept",
+            "error.delete_skipped" => "Some files were skipped because the destination already had them, so the archive's version of those files never reached the disk. The source archive was kept — re-extract with \"overwrite\" or \"rename\" to delete it.",
             "error.entry_io" => "cannot be written (in use / no permission / disk full)",
             "error.entry_link" => "a symlink or directory junction is in the way, so writing there is refused",
             "error.entry_path" => "the entry name cannot be mapped to a safe path",
@@ -443,10 +445,11 @@ mod tests {
     /// `archive-core/src/error.rs`, the IPC layer's own keys, and the shell
     /// integration warnings). `tr()` falls back to printing the key itself, so
     /// a missing one shows the user `error.io` — this list is the guard.
-    const ERROR_KEYS: [&str; 24] = [
+    const ERROR_KEYS: [&str; 25] = [
         "error.archive_delete",
         "error.cancelled",
         "error.delete_partial",
+        "error.delete_skipped",
         "error.dll_missing",
         "error.engine",
         "error.entries_failed",

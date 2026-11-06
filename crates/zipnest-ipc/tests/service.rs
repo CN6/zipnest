@@ -310,6 +310,53 @@ fn extract_and_delete_refuses_a_partial_selection() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Deleting the source is only safe when the archive is not the last copy of
+/// anything. A `skip` entry leaves the archive's version of that file on no
+/// disk at all — the destination kept its own — so the source must survive.
+#[test]
+fn extract_and_delete_refuses_when_entries_were_skipped() {
+    let (svc, events) = service();
+    let tmp = std::env::temp_dir().join(format!("zipnest-delete-skip-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let source = tmp.join("plain.zip");
+    std::fs::copy(fx("plain.zip"), &source).unwrap();
+    let dest = tmp.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    // `a.txt` is already there, so the `skip` policy leaves it alone and the
+    // archive's copy of it never gets written.
+    std::fs::write(dest.join("a.txt"), b"OLDER").unwrap();
+    let r = svc.open_archive(source.to_string_lossy().into(), None).unwrap();
+    let job = svc
+        .extract_with_delete(
+            r.id,
+            vec![], // the whole archive: the partial-selection check does not apply
+            dest.to_string_lossy().into(),
+            Some("skip".into()),
+            None,
+            true,
+        )
+        .unwrap();
+    wait_events(&events, 5000, |v| v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job));
+    let v = events.lock().unwrap();
+    let skipped = v.iter().any(|(n, _)| n == "extract_skipped");
+    let fin = v.iter().find(|(n, _)| n == "job_finished").unwrap();
+    assert!(skipped, "the run must report the skipped entry");
+    assert_eq!(fin.1["ok"], false, "deleting past a skip is not a success");
+    assert_eq!(fin.1["error_key"].as_str(), Some("error.delete_skipped"));
+    drop(v);
+
+    assert!(source.exists(), "the archive is the only copy of a.txt's new content");
+    assert_eq!(
+        std::fs::read(dest.join("a.txt")).unwrap(),
+        b"OLDER",
+        "the skip policy still leaves the existing file alone"
+    );
+    assert!(dest.join("c.txt").exists(), "the rest of the archive did extract");
+    svc.close_archive(r.id);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn failed_extract_with_delete_requested_keeps_source() {
     let (svc, events) = service();
