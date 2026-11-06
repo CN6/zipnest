@@ -2,6 +2,7 @@
 
 use archive_core::Archive;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -25,18 +26,21 @@ pub struct ArchiveRegistry {
     /// so later extract/preview calls can reuse it — matching desktop
     /// archiver behavior where the password stays valid for the session.
     passwords: RwLock<HashMap<u64, String>>,
+    /// Source file, kept for extract-and-delete after the run succeeds.
+    paths: RwLock<HashMap<u64, PathBuf>>,
     next: AtomicU64,
 }
 
 impl ArchiveRegistry {
     /// Stores the archive and returns its public id plus a shared handle.
-    pub fn insert(&self, archive: Archive, password: Option<String>) -> (u64, SharedArchive) {
+    pub fn insert(&self, archive: Archive, path: PathBuf, password: Option<String>) -> (u64, SharedArchive) {
         let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         let shared = Arc::new(Mutex::new(SendArchive(archive)));
         self.map.write().unwrap_or_else(|e| e.into_inner()).insert(id, Arc::clone(&shared));
         if let Some(pw) = password {
             self.passwords.write().unwrap_or_else(|e| e.into_inner()).insert(id, pw);
         }
+        self.paths.write().unwrap_or_else(|e| e.into_inner()).insert(id, path);
         (id, shared)
     }
 
@@ -58,7 +62,13 @@ impl ArchiveRegistry {
     /// alive until that one goes too, which is the correct behaviour.
     pub fn remove(&self, id: u64) -> Option<SharedArchive> {
         self.passwords.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        self.paths.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
         self.map.write().unwrap_or_else(|e| e.into_inner()).remove(&id)
+    }
+
+    /// Source path for a still-open archive.
+    pub fn path(&self, id: u64) -> Option<PathBuf> {
+        self.paths.read().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
     }
 
     /// The password the archive was opened with, if any (memory only).

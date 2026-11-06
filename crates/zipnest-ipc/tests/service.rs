@@ -244,6 +244,74 @@ fn extract_ui_selection_subset_writes_full_bytes() {
 }
 
 #[test]
+fn extract_and_delete_removes_source_only_after_success() {
+    let (svc, events) = service();
+    let tmp = std::env::temp_dir().join(format!("zipnest-delete-ok-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let source = tmp.join("plain.zip");
+    std::fs::copy(fx("plain.zip"), &source).unwrap();
+    let dest = tmp.join("out");
+    let r = svc.open_archive(source.to_string_lossy().into(), None).unwrap();
+    let job = svc
+        .extract_with_delete(
+            r.id,
+            vec!["a.txt".into()],
+            dest.to_string_lossy().into(),
+            Some("overwrite".into()),
+            None,
+            true,
+        )
+        .unwrap();
+    wait_events(&events, 5000, |v| v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job));
+    let v = events.lock().unwrap();
+    let fin = v.iter().find(|(n, _)| n == "job_finished").unwrap();
+    assert_eq!(fin.1["ok"], true, "extract failed: {:?}", fin.1);
+    drop(v);
+
+    assert!(dest.join("a.txt").exists(), "selected file must be extracted");
+    assert!(!dest.join("c.txt").exists(), "unselected file must stay out");
+    assert!(!source.exists(), "source archive must be deleted");
+    assert_eq!(svc.open_archive_count(), 0, "deleted archive must be closed");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn failed_extract_with_delete_requested_keeps_source() {
+    let (svc, events) = service();
+    let tmp = std::env::temp_dir().join(format!("zipnest-delete-fail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let source = tmp.join("enc.7z");
+    std::fs::copy(fx("enc.7z"), &source).unwrap();
+    let dest = tmp.join("out");
+    let r = svc
+        .open_archive(source.to_string_lossy().into(), Some("secret".into()))
+        .unwrap();
+    let job = svc
+        .extract_with_delete(
+            r.id,
+            vec!["a.txt".into()],
+            dest.to_string_lossy().into(),
+            Some("overwrite".into()),
+            Some("wrong".into()),
+            true,
+        )
+        .unwrap();
+    wait_events(&events, 5000, |v| v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job));
+    let v = events.lock().unwrap();
+    let fin = v.iter().find(|(n, _)| n == "job_finished").unwrap();
+    assert_eq!(fin.1["ok"], false);
+    assert_eq!(fin.1["error_key"].as_str(), Some("error.password_incorrect"));
+    drop(v);
+
+    assert!(source.exists(), "a failed extraction must keep its archive");
+    assert_eq!(svc.open_archive_count(), 1, "failed archive stays available");
+    svc.close_archive(r.id);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn extract_wrong_password_reports_key() {
     let (svc, events) = service();
     let r = svc

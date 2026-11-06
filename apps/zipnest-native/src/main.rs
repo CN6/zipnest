@@ -424,6 +424,8 @@ struct JobState {
     skipped: u64,
     /// Entries written under a rewritten name. All of them are on disk.
     renamed: u64,
+    /// This extract asked the IPC layer to remove its source on success.
+    delete_archive: bool,
     title: String,
 }
 
@@ -643,6 +645,8 @@ struct ExtractRequest {
     sources: Vec<String>,
     dest: String,
     on_conflict: String,
+    /// Delete the source only after the whole extraction succeeds.
+    delete_archive: bool,
 }
 
 /// A password prompt that is on screen right now.
@@ -1292,10 +1296,15 @@ fn t(&self, key: &str) -> String {
                         j.skipped = skipped;
                     }
                     let cancelled = !ok && err_key.as_deref() == Some("error.cancelled");
+                    let delete_archive = self.job.as_ref().map(|j| j.delete_archive).unwrap_or(false);
+                    let archive_released = (ok && delete_archive)
+                        || (!ok && err_key.as_deref() == Some("error.archive_delete"));
                     if ok {
                         let renamed = self.job.as_ref().map(|j| j.renamed).unwrap_or(0);
                         self.notice = Some(
-                            if renamed > 0 {
+                            if delete_archive {
+                                "job.ok_deleted"
+                            } else if renamed > 0 {
                                 "job.ok_renamed"
                             } else if skipped > 0 {
                                 "job.ok_skipped"
@@ -1343,6 +1352,9 @@ fn t(&self, key: &str) -> String {
                         );
                     }
                     self.extract_skipped = 0;
+                    if archive_released {
+                        self.clear_archive_view();
+                    }
                 }
                 _ => {}
             }
@@ -1385,6 +1397,24 @@ fn t(&self, key: &str) -> String {
                 self.refresh_default_dest();
             }
         }
+    }
+
+    /// The IPC layer already released this source after a successful
+    /// extract-and-delete (or a deletion that failed). Forget its UI state;
+    /// the job result window stays visible.
+    fn clear_archive_view(&mut self) {
+        self.archive = None;
+        self.archive_path.clear();
+        self.archive_password = None;
+        self.password_prompt = None;
+        self.last_extract = None;
+        self.cwd.clear();
+        self.rows.clear();
+        self.selected.clear();
+        self.anchor = None;
+        self.dir_cache.clear();
+        self.mtime_cache.clear();
+        self.show_extract = false;
     }
 
     fn open_archive(&mut self, path: &str) {
@@ -2162,15 +2192,25 @@ let extract_enabled = self.archive.is_some();
                 ));
             }
             let can = !self.extract_dest.trim().is_empty();
-            let clicked = ui
-                .add_enabled(can, egui::Button::new(self.t("extract.start")))
-                .clicked();
+            let (clicked, delete_clicked) = ui.horizontal(|ui| {
+                let start = ui.add_enabled(can, egui::Button::new(self.t("extract.start")));
+                let delete = ui
+                    .add_enabled(
+                        can,
+                        egui::Button::new(
+                            egui::RichText::new(self.t("extract.delete")).color(error_color(ui)),
+                        )
+                        .stroke(egui::Stroke::new(1.0_f32, error_color(ui))),
+                    )
+                    .on_hover_text(self.t("extract.delete_hint"));
+                (start.clicked(), delete.clicked())
+            }).inner;
             // Enter confirms (that is what a dialog is expected to do) — but not
             // while the password prompt is up: that prompt owns the keyboard,
             // and a shared Enter would start the extract behind its back.
             let prompt_open = self.password_prompt.is_some();
             let enter = !prompt_open && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if clicked || (can && enter) {
+            if clicked || delete_clicked || (can && enter) {
                 let dest = self.extract_dest.clone();
                 let on_conflict = if ask {
                     if self.overwrite {
@@ -2187,6 +2227,7 @@ let extract_enabled = self.archive.is_some();
                     sources: srcs.iter().cloned().collect(),
                     dest,
                     on_conflict,
+                    delete_archive: delete_clicked,
                 };
                 // The password the archive was opened with, if any. The service
                 // also remembers it per archive, but passing it here keeps a
@@ -2236,17 +2277,19 @@ let extract_enabled = self.archive.is_some();
         self.job = Some(JobState {
             job_id: 0,
             title: self.t("extract.title"),
+            delete_archive: req.delete_archive,
             ..Default::default()
         });
         // Last job's rename/failure lists belong to the last job.
         self.renamed_entries.clear();
         self.error_detail.clear();
-        match self.svc.extract(
+        match self.svc.extract_with_delete(
             req.archive_id,
             req.sources,
             req.dest,
             Some(req.on_conflict),
             password,
+            req.delete_archive,
         ) {
             Ok(jid) => {
                 if let Some(job) = self.job.as_mut() {

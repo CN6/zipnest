@@ -277,7 +277,7 @@ pub type Emit = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 
 pub struct IpcService {
     /// Exposed read-only for the Tauri glue (resolve an entry for preview).
-    pub registry: ArchiveRegistry,
+    pub registry: Arc<ArchiveRegistry>,
     jobs: archive_jobs::JobManager,
     emit: Emit,
     settings: std::sync::Mutex<SettingsStore>,
@@ -327,7 +327,7 @@ impl IpcService {
             }
         });
         IpcService {
-            registry: ArchiveRegistry::default(),
+            registry: Arc::new(ArchiveRegistry::default()),
             jobs: archive_jobs::JobManager::with_throttle(sink, throttle),
             emit,
             settings: std::sync::Mutex::new(SettingsStore::new(settings_path)),
@@ -466,7 +466,7 @@ impl IpcService {
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
         let root = children_of(&entries, "").into_iter().map(to_dto).collect();
-        let (id, _) = self.registry.insert(archive, password);
+        let (id, _) = self.registry.insert(archive, std::path::PathBuf::from(&path), password);
         Ok(OpenArchiveResult { id, encrypted, format, entries: root })
     }
 
@@ -555,14 +555,34 @@ impl IpcService {
         on_conflict: Option<String>,
         password: Option<String>,
     ) -> Result<u64, IpcError> {
+        self.extract_with_delete(id, paths, dest, on_conflict, password, false)
+    }
+
+    /// Same as [`IpcService::extract`], with an optional source deletion after
+    /// every success check passes. The handle is released before deleting.
+    pub fn extract_with_delete(
+        &self,
+        id: u64,
+        paths: Vec<String>,
+        dest: String,
+        on_conflict: Option<String>,
+        password: Option<String>,
+        delete_archive: bool,
+    ) -> Result<u64, IpcError> {
         if dest.trim().is_empty() {
             return Err(IpcError::new("error.io"));
         }
         let shared = self.lock_archive(id)?;
+        let source_path = if delete_archive {
+            self.registry.path(id).ok_or_else(|| IpcError::new("error.not_an_archive"))?
+        } else {
+            std::path::PathBuf::new()
+        };
         // Callers may omit the password; fall back to the one supplied at
         // open time (session-scoped, memory only).
         let password = password.or_else(|| self.registry.password(id));
         let emit = Arc::clone(&self.emit);
+        let registry = Arc::clone(&self.registry);
         let max_total_bytes = match self.settings.lock() {
             Ok(s) => s.get().max_extract_bytes,
             Err(p) => p.into_inner().get().max_extract_bytes,
@@ -698,6 +718,23 @@ impl IpcService {
                     }),
                 );
                 return Err("error.entries_failed".into());
+            }
+            if delete_archive {
+                // Windows cannot unlink a file while Archive owns its read
+                // handle, so release both the worker's and registry's refs.
+                drop(shared);
+                drop(registry.remove(id));
+                if let Err(e) = std::fs::remove_file(&source_path) {
+                    emit(
+                        "extract_failed",
+                        serde_json::json!({
+                            "count": 0,
+                            "detail": e.to_string(),
+                            "entries": [],
+                        }),
+                    );
+                    return Err("error.archive_delete".into());
+                }
             }
             Ok(())
         }));

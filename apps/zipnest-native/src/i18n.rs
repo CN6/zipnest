@@ -93,6 +93,8 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "extract.browse" => "浏览…",
             "extract.overwrite" => "覆盖已存在文件",
             "extract.start" => "开始解压",
+            "extract.delete" => "解压并删除",
+            "extract.delete_hint" => "解压成功后会永久删除原压缩包；失败或取消时保留。",
             "extract.all_hint" => "未选择条目：将解压整个压缩包",
             "extract.scope_all" => "范围：整个压缩包",
             "extract.scope_selected" => "范围：选中的 {n} 个条目",
@@ -115,6 +117,7 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "error.security_blocked" => "条目名不安全",
             "error.quota_exceeded" => "解压内容超出大小限制",
             "error.entries_failed" => "有文件没能解压出来 —— 已成功的文件留在目标文件夹里，下面列出的这些没有写出来：",
+            "error.archive_delete" => "解压已完成，但原压缩包删除失败（文件可能正被其他程序占用）",
             "error.entry_io" => "无法写入（文件被占用 / 没有权限 / 磁盘空间不足）",
             "error.entry_link" => "路径里出现了符号链接或目录联接，为安全起见拒绝写入",
             "error.entry_path" => "条目名无法映射到安全的路径",
@@ -179,6 +182,7 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "help.volume" => "把大文件拆成多个指定大小的小分卷，方便复制或上传。\n· 10 MB / 100 MB / 1 GB：固定分卷大小\n· 自定义：按你输入的体积分卷，例如 100m 或 1g\n· 关闭：不拆分，打成一个文件",
             "job.canceled" => "取消",
             "job.ok" => "完成",
+            "job.ok_deleted" => "解压完成，原压缩包已删除",
             "job.ok_skipped" => "完成（{count} 个已存在的文件按你的设置跳过）",
             "job.ok_renamed" => "完成（{count} 个怪名字已自动改成 Windows 能用的名字，文件都在）",
             "job.renamed.header" => "这些文件名改了（内容完整，都在目标文件夹里）：",
@@ -271,6 +275,8 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "extract.browse" => "Browse…",
             "extract.overwrite" => "Overwrite existing files",
             "extract.start" => "Extract",
+            "extract.delete" => "Extract and delete",
+            "extract.delete_hint" => "Deletes the source archive after a successful extraction. Failed or cancelled runs keep it.",
             "extract.all_hint" => "Nothing selected: extract the whole archive",
             "extract.scope_all" => "Scope: the whole archive",
             "extract.scope_selected" => "Scope: {n} selected entries",
@@ -293,6 +299,7 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "error.security_blocked" => "Entry name is unsafe",
             "error.quota_exceeded" => "Extracted content exceeds the size limit",
             "error.entries_failed" => "Some entries could not be extracted. The files that worked are in the destination; these are not:",
+            "error.archive_delete" => "Extraction finished, but the source archive could not be deleted (another program may have it open)",
             "error.entry_io" => "cannot be written (in use / no permission / disk full)",
             "error.entry_link" => "a symlink or directory junction is in the way, so writing there is refused",
             "error.entry_path" => "the entry name cannot be mapped to a safe path",
@@ -357,6 +364,7 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "help.volume" => "Splits into smaller parts for copying/uploading: 10/100 MB, 1 GB, or custom like 100m/1g. Off = single file.",
             "job.canceled" => "Cancel",
             "job.ok" => "Done",
+            "job.ok_deleted" => "Extraction complete, source archive deleted",
             "job.ok_skipped" => "Done ({count} existing files left alone per your setting)",
             "job.ok_renamed" => "Done ({count} odd names were rewritten so Windows could store them — nothing is missing)",
             "job.renamed.header" => "These names changed (content is complete, all in the destination):",
@@ -433,7 +441,8 @@ mod tests {
     /// `archive-core/src/error.rs`, the IPC layer's own keys, and the shell
     /// integration warnings). `tr()` falls back to printing the key itself, so
     /// a missing one shows the user `error.io` — this list is the guard.
-    const ERROR_KEYS: [&str; 22] = [
+    const ERROR_KEYS: [&str; 23] = [
+        "error.archive_delete",
         "error.cancelled",
         "error.dll_missing",
         "error.engine",
