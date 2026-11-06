@@ -2192,11 +2192,14 @@ let extract_enabled = self.archive.is_some();
                 ));
             }
             let can = !self.extract_dest.trim().is_empty();
+            // Deleting the source is only safe when everything in it is being
+            // extracted; a partial selection would lose the rest.
+            let whole_archive = srcs.is_empty();
             let (clicked, delete_clicked) = ui.horizontal(|ui| {
                 let start = ui.add_enabled(can, egui::Button::new(self.t("extract.start")));
                 let delete = ui
                     .add_enabled(
-                        can,
+                        can && whole_archive,
                         egui::Button::new(
                             egui::RichText::new(self.t("extract.delete")).color(error_color(ui)),
                         )

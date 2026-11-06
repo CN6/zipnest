@@ -227,10 +227,11 @@ fn children_of(entries: &[ArchiveEntry], dir: &str) -> Vec<EntryDto> {
             continue;
         }
         match rest.split_once('/') {
+            // A doubled separator (`root//b.txt`) names no folder to show.
+            Some(("", _)) => {}
             Some((seg, _)) => {
                 let full = if dir.is_empty() { seg.to_string() } else { format!("{dir}/{seg}") };
-                let key = full.to_lowercase();
-                if !listed.contains(&key) && synthetic_seen.insert(key) {
+                if synthetic_seen.insert(full.to_lowercase()) {
                     synthetic.push((full, seg.to_string()));
                 }
             }
@@ -240,14 +241,21 @@ fn children_of(entries: &[ArchiveEntry], dir: &str) -> Vec<EntryDto> {
             }
         }
     }
-    out.extend(synthetic.into_iter().map(|(path, name)| EntryDto {
-        path,
-        name,
-        is_dir: true,
-        size: 0,
-        mtime_ms: None,
-        encrypted: false,
-    }));
+    // A real entry outranks a synthetic folder for the same name, whatever
+    // order the archive stores them in (a folder item may follow its files).
+    out.extend(
+        synthetic
+            .into_iter()
+            .filter(|(path, _)| !listed.contains(&path.to_lowercase()))
+            .map(|(path, name)| EntryDto {
+                path,
+                name,
+                is_dir: true,
+                size: 0,
+                mtime_ms: None,
+                encrypted: false,
+            }),
+    );
     out
 }
 
@@ -650,6 +658,11 @@ impl IpcService {
             let wanted = select_entries(&entries, &paths);
             if wanted.is_empty() {
                 return Err("error.not_an_archive".into());
+            }
+            // Deleting the source is only safe once every entry it holds is
+            // being extracted; a partial run would lose the rest.
+            if delete_archive && wanted.len() < entries.len() {
+                return Err("error.delete_partial".into());
             }
             let wanted_set: std::collections::HashSet<u32> = wanted.iter().copied().collect();
             // Encrypted entries with no password anywhere (argument or
@@ -1077,6 +1090,24 @@ mod tests {
 
         // Selecting the synthetic folder takes its whole subtree.
         assert_eq!(select_entries(&entries, &["root/sub".into()]), vec![1, 2]);
+    }
+
+    #[test]
+    fn implicit_directory_is_not_duplicated_by_a_later_real_dir_entry() {
+        // Entry order is whatever the archiver wrote: a real folder item can
+        // follow files under it, and then both the synthetic and the real row
+        // would name the same folder.
+        let entries = vec![
+            entry(0, "root/a.txt", false),
+            entry(1, "root/sub/b.txt", false),
+            entry(2, "root/sub/", true),
+        ];
+        let dirs: Vec<String> = children_of(&entries, "root")
+            .into_iter()
+            .filter(|e| e.is_dir)
+            .map(|e| normalized(&e.path).into_owned())
+            .collect();
+        assert_eq!(dirs, vec!["root/sub"]);
     }
 
     #[test]
