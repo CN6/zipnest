@@ -197,22 +197,58 @@ fn normalized(s: &str) -> std::borrow::Cow<'_, str> {
 /// Archives may store Windows-style backslash separators (`sub\b.txt`), so
 /// matching normalizes to `/` without mutating the stored path (the UI and
 /// `read_entry` see the engine's original path verbatim).
-fn children_of<'a>(entries: &'a [ArchiveEntry], dir: &str) -> Vec<&'a ArchiveEntry> {
+///
+/// Folders that exist only as a prefix of deeper entries (`dir/sub/file`) are
+/// listed too, as synthetic `EntryDto`s. Some archivers write no directory
+/// items at all, so without this the root of such an archive looked empty even
+/// though extraction produced the files.
+fn children_of(entries: &[ArchiveEntry], dir: &str) -> Vec<EntryDto> {
     let dir = normalized(dir);
     // Built once per call. It used to be `format!("{dir}/")` *inside* the
     // filter closure, so it was allocated once per entry instead of once here.
     let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
-    entries
-        .iter()
-        .filter(|e| {
-            let p = normalized(&e.path);
-            if dir.is_empty() {
-                !p.contains('/')
-            } else {
-                matches!(p.strip_prefix(prefix.as_str()), Some(rest) if !rest.contains('/'))
+    let mut out: Vec<EntryDto> = Vec::new();
+    // Windows treats names case-insensitively; a synthetic folder must not be
+    // added next to a real entry for the same folder.
+    let mut listed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut synthetic: Vec<(String, String)> = Vec::new();
+    let mut synthetic_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in entries {
+        let p = normalized(&e.path);
+        let rest = if dir.is_empty() {
+            p.as_ref()
+        } else {
+            match p.strip_prefix(prefix.as_str()) {
+                Some(rest) => rest,
+                None => continue,
             }
-        })
-        .collect()
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        match rest.split_once('/') {
+            Some((seg, _)) => {
+                let full = if dir.is_empty() { seg.to_string() } else { format!("{dir}/{seg}") };
+                let key = full.to_lowercase();
+                if !listed.contains(&key) && synthetic_seen.insert(key) {
+                    synthetic.push((full, seg.to_string()));
+                }
+            }
+            None => {
+                listed.insert(p.to_lowercase());
+                out.push(to_dto(e));
+            }
+        }
+    }
+    out.extend(synthetic.into_iter().map(|(path, name)| EntryDto {
+        path,
+        name,
+        is_dir: true,
+        size: 0,
+        mtime_ms: None,
+        encrypted: false,
+    }));
+    out
 }
 
 /// Expand the UI's selection into the engine's index list.
@@ -237,13 +273,25 @@ fn select_entries(entries: &[ArchiveEntry], paths: &[String]) -> Vec<u32> {
     }
 
     let selected: std::collections::HashSet<&str> = selection.iter().map(|s| s.as_ref()).collect();
-    // Only a selected path that is really a directory entry contributes its
-    // subtree — a file path is just that file.
-    let dirs: std::collections::HashSet<std::borrow::Cow<'_, str>> = entries
-        .iter()
-        .filter(|e| e.is_dir)
-        .map(|e| normalized(&e.path))
-        .collect();
+    // A selected path is a directory if an entry names it OR any entry lives
+    // beneath it. The second case matters for archives that store no directory
+    // items: their folders exist only as path prefixes, and selecting one of
+    // those from the listing must still extract its contents.
+    let dirs: std::collections::HashSet<String> = {
+        let mut dirs = std::collections::HashSet::new();
+        for e in entries {
+            let path = normalized(&e.path);
+            if e.is_dir {
+                dirs.insert(path.to_string());
+            }
+            let mut rest = path.as_ref();
+            while let Some(cut) = rest.rfind('/') {
+                rest = &rest[..cut];
+                dirs.insert(rest.to_string());
+            }
+        }
+        dirs
+    };
     let selected_dirs: std::collections::HashSet<&str> = selected
         .iter()
         .copied()
@@ -465,7 +513,7 @@ impl IpcService {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        let root = children_of(&entries, "").into_iter().map(to_dto).collect();
+        let root = children_of(&entries, "");
         let (id, _) = self.registry.insert(archive, std::path::PathBuf::from(&path), password);
         Ok(OpenArchiveResult { id, encrypted, format, entries: root })
     }
@@ -499,7 +547,7 @@ impl IpcService {
         let shared = self.lock_archive(id)?;
         let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
         let entries = guard.0.entries_arc()?;
-        Ok(children_of(&entries, &dir).into_iter().map(to_dto).collect())
+        Ok(children_of(&entries, &dir))
     }
 
     pub fn read_entry_bytes(&self, id: u64, path: String, max_bytes: u64) -> Result<Vec<u8>, IpcError> {
@@ -1004,6 +1052,31 @@ mod tests {
         // Archives that store Windows separators still list correctly.
         let backslash = vec![entry(0, r"sub\b.txt", false)];
         assert_eq!(children_of(&backslash, "sub").len(), 1);
+    }
+
+    #[test]
+    fn implicit_directories_are_listed_and_selectable() {
+        // Some archivers store no directory items at all (360压缩箱 does this):
+        // folders exist only as prefixes of deeper paths. The root must still
+        // list them, and selecting one must extract what is beneath it.
+        let entries = vec![
+            entry(0, r"root\a.txt", false),
+            entry(1, r"root\sub\b.txt", false),
+            entry(2, r"root\sub\deep\c.txt", false),
+        ];
+        let root = children_of(&entries, "");
+        assert_eq!(root.len(), 1);
+        assert!(root[0].is_dir, "implicit folder must list as a directory");
+        assert_eq!(root[0].path, "root");
+        assert_eq!(root[0].name, "root");
+
+        let inner = children_of(&entries, "root");
+        let listed: Vec<&str> = inner.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(listed, vec!["root\\a.txt", "root/sub"]);
+        assert!(inner[1].is_dir);
+
+        // Selecting the synthetic folder takes its whole subtree.
+        assert_eq!(select_entries(&entries, &["root/sub".into()]), vec![1, 2]);
     }
 
     #[test]

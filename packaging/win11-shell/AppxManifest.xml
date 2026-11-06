@@ -23,7 +23,7 @@
   <Identity
     Name="ZipNest.Shell"
     Publisher="CN=ZipNest"
-    Version="0.4.24.0"
+    Version="0.4.25.0"
     ProcessorArchitecture="neutral" />
 
   <Properties>
