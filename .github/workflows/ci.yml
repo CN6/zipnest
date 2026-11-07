@@ -37,7 +37,7 @@ jobs:
     name: test + clippy (workspace)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -60,7 +60,7 @@ jobs:
     name: release binaries
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -72,7 +72,7 @@ jobs:
         run: cargo build -p zipnest-native -p zipnest-shell --release
 
       - name: upload the binaries the installer packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-binaries
           if-no-files-found: error
@@ -85,7 +85,7 @@ jobs:
     runs-on: windows-latest
     needs: release-build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: every version string agrees
         shell: pwsh
@@ -109,7 +109,7 @@ jobs:
           "C:\Program Files (x86)\NSIS" | Out-File -Append $env:GITHUB_PATH
 
       - name: fetch the release binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-binaries
           path: target/release
