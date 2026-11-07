@@ -259,6 +259,32 @@ fn children_of(entries: &[ArchiveEntry], dir: &str) -> Vec<EntryDto> {
     out
 }
 
+/// Entries anywhere in the archive whose *name* contains `query`, ignoring
+/// case, capped at `limit`.
+///
+/// Matches the name only: a hit has to be something the user can recognise in
+/// the list, and matching whole paths turned a search for `a` into every file
+/// under a folder whose name happened to contain one.
+fn search_entries_in(entries: &[ArchiveEntry], query: &str, limit: usize) -> Vec<EntryDto> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for e in entries {
+        let dto = to_dto(e);
+        // `to_lowercase` allocates; a big archive being searched on every
+        // keystroke would otherwise lowercase every name on every frame.
+        if dto.name.to_lowercase().contains(&needle) {
+            out.push(dto);
+            if out.len() == limit {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Expand the UI's selection into the engine's index list.
 ///
 /// A selected directory contributes its subtree *and* the directory entry
@@ -556,6 +582,25 @@ impl IpcService {
         let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
         let entries = guard.0.entries_arc()?;
         Ok(children_of(&entries, &dir))
+    }
+
+    /// Entries anywhere in the archive whose *name* contains `query`
+    /// (case-insensitive), capped at `limit`.
+    ///
+    /// The browser can only show one directory at a time, so a file three
+    /// folders down is unfindable by eye in a big archive. This searches the
+    /// whole entry list and returns real entry paths, which means a hit can be
+    /// selected and extracted without navigating to it first.
+    pub fn search_entries(
+        &self,
+        id: u64,
+        query: String,
+        limit: usize,
+    ) -> Result<Vec<EntryDto>, IpcError> {
+        let shared = self.lock_archive(id)?;
+        let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let entries = guard.0.entries_arc()?;
+        Ok(search_entries_in(&entries, &query, limit))
     }
 
     pub fn read_entry_bytes(&self, id: u64, path: String, max_bytes: u64) -> Result<Vec<u8>, IpcError> {
@@ -1042,6 +1087,32 @@ mod tests {
         assert!(out.associate);
         assert!(out.context_menu);
         assert_eq!(out.warnings, vec!["error.shell.file_menu".to_string()]);
+    }
+
+    #[test]
+    fn search_matches_names_anywhere_in_the_archive() {
+        let entries = vec![
+            entry(0, "readme.txt", false),
+            entry(1, "photos/", true),
+            entry(2, "photos/holiday.jpg", false),
+            entry(3, "photos/README.MD", false),
+            entry(4, "docs/notes.txt", false),
+        ];
+        let hits = |q: &str| -> Vec<String> {
+            search_entries_in(&entries, q, 100).into_iter().map(|e| e.path).collect()
+        };
+        // Case does not matter, and the match is on the name, not the folder:
+        // "readme" must not drag in everything under a "readme"-ish folder.
+        assert_eq!(hits("README"), vec!["readme.txt", "photos/README.MD"]);
+        assert_eq!(hits("  readme  "), vec!["readme.txt", "photos/README.MD"]);
+        // A name from a folder the browser is not showing is still found.
+        assert_eq!(hits("holiday"), vec!["photos/holiday.jpg"]);
+        assert_eq!(hits("photos"), vec!["photos/"]);
+        assert!(hits("").is_empty());
+        assert!(hits("   ").is_empty());
+        assert!(hits("no such file").is_empty());
+        // The cap is a hard stop, not a hint.
+        assert_eq!(search_entries_in(&entries, "t", 2).len(), 2);
     }
 
     // --- listing / selection planning -------------------------------------

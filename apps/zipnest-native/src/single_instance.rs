@@ -32,6 +32,8 @@ pub enum LaunchRequest {
     Open(String),
     /// Pre-fill the create wizard with these paths.
     Add(Vec<String>),
+    /// Open this archive with the extract dialog already up ("解压到…").
+    Extract(String),
 }
 
 /// One JSON object per line, in the app data dir (the same folder the
@@ -43,6 +45,7 @@ pub fn queue_path() -> PathBuf {
 fn encode(req: &LaunchRequest) -> String {
     let value = match req {
         LaunchRequest::Open(path) => serde_json::json!({ "open": path }),
+        LaunchRequest::Extract(path) => serde_json::json!({ "extract": path }),
         LaunchRequest::Add(paths) => serde_json::json!({ "add": paths }),
     };
     let mut line = value.to_string();
@@ -61,6 +64,8 @@ pub fn parse_queue(text: &str) -> Vec<LaunchRequest> {
         };
         if let Some(path) = value.get("open").and_then(|p| p.as_str()) {
             out.push(LaunchRequest::Open(path.to_string()));
+        } else if let Some(path) = value.get("extract").and_then(|p| p.as_str()) {
+            out.push(LaunchRequest::Extract(path.to_string()));
         } else if let Some(paths) = value.get("add").and_then(|p| p.as_array()) {
             let paths: Vec<String> = paths
                 .iter()
@@ -231,10 +236,12 @@ mod tests {
     #[test]
     fn requests_round_trip_through_the_queue_format() {
         let open = LaunchRequest::Open(r"D:\some folder\a b.zip".into());
+        let extract = LaunchRequest::Extract(r"D:\photos.7z".into());
         let add = LaunchRequest::Add(vec![r"D:\x".into(), r"D:\y.txt".into()]);
         let mut text = encode(&open);
+        text.push_str(&encode(&extract));
         text.push_str(&encode(&add));
-        assert_eq!(parse_queue(&text), vec![open, add]);
+        assert_eq!(parse_queue(&text), vec![open, extract, add]);
     }
 
     #[test]

@@ -15,7 +15,7 @@
     Everything else is derived from it, or compared against it:
       crates/*/Cargo.toml               version.workspace = true (must not type one)
       apps/zipnest-native/src/main.rs   env!("CARGO_PKG_VERSION") (no typed copy)
-      packaging/installer.nsi           !define VERSION, OutFile name
+      packaging/installer.nsi           !define VERSION, OutFile name, VIProductVersion
       packaging/win11-shell/AppxManifest.xml   Version="x.y.z.0"
       README.md                         "当前 v x.y.z" + both artifact names
       CHANGELOG.md                      newest "## v x.y.z" heading
@@ -82,6 +82,20 @@ if ($nsiText -notmatch 'OutFile "ZipNest_([0-9]+\.[0-9]+\.[0-9]+)_x64-setup\.exe
     throw "OutFile not found in installer.nsi"
 }
 Report 'installer.nsi OutFile' $Matches[1] $version
+
+# `VIProductVersion` is written in the 4-part form and did not exist at all
+# before v0.4.28 — the shipped installer had no version resource, so two
+# downloads from different releases looked identical in Explorer. A plain
+# `OutFile` bump leaves it behind: they are two separate literals.
+if ($nsiText -notmatch 'VIProductVersion "([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)"') {
+    $problems.Add('installer.nsi has no VIProductVersion (the installer would ship with no version resource)')
+} else {
+    if ($Matches[1] -ne $version) {
+        $problems.Add("installer.nsi VIProductVersion is $($Matches[1]), expected $version")
+    } else {
+        Write-Host "  ok   installer.nsi VIProductVersion                $($Matches[1])"
+    }
+}
 
 $manifestText = Read-Utf8 $manifest
 if ($manifestText -notmatch 'Version="([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+"') { throw "Version not found in AppxManifest.xml" }

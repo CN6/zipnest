@@ -144,6 +144,11 @@ fn is_newer(tag: &str) -> bool {
 fn fetch_latest() -> Result<(String, String), String> {
     let body = ureq::get(UPDATE_API)
         .set("User-Agent", &UPDATE_UA)
+        // Without a timeout the check waits for Windows' TCP timeouts — on a
+        // machine whose network drops packets instead of refusing them, the
+        // spinner in the status bar never stopped. Both bounds are short
+        // because this is a background courtesy, never something to wait on.
+        .timeout(std::time::Duration::from_secs(10))
         .call()
         .map_err(|e| e.to_string())?
         .into_string()
@@ -171,6 +176,63 @@ fn open_shell_url(url: &str) {
     #[cfg(not(windows))]
     {
         let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+/// Show a folder in Explorer.
+fn open_path_in_explorer(path: &str) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer")
+            .arg(path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+/// Hand a file to whatever Windows has registered for its type — the same
+/// thing a double-click in Explorer does.
+///
+/// `explorer <path>` is not that: given a file it opens the *containing
+/// folder* instead of the file, which is why a double-clicked entry looked
+/// like it did nothing. `ShellExecuteW` is the shell's own "open" verb, so it
+/// honours the user's file associations, and it takes a wide string, so a
+/// path with `&` or spaces needs no quoting.
+fn open_with_default_app(path: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: isize,
+                op: *const u16,
+                file: *const u16,
+                params: *const u16,
+                dir: *const u16,
+                show: i32,
+            ) -> isize;
+        }
+        /// `SW_SHOWNORMAL`.
+        const SW_SHOWNORMAL: i32 = 1;
+        let wide = |s: &str| -> Vec<u16> {
+            std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+        };
+        let op = wide("open");
+        let file = wide(path);
+        // Safe: two NUL-terminated buffers that outlive the call, and a null
+        // parent window, which is what "no owner" means for the shell.
+        unsafe {
+            ShellExecuteW(0, op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
     }
 }
 
@@ -427,9 +489,43 @@ struct JobState {
     /// This extract asked the IPC layer to remove its source on success.
     delete_archive: bool,
     title: String,
+    /// Where this job writes. Shown next to the result so the user does not
+    /// have to guess the folder the app picked for them.
+    dest: String,
 }
 
 impl JobState {
+    /// `还剩 1 分 20 秒`, or empty while there is no honest estimate yet.
+    ///
+    /// The engine reports a rate; for the first moments of a job, and once it
+    /// is all but done, the arithmetic divides by noise — so the estimate is
+    /// suppressed at both ends rather than shown wrong.
+    fn eta_text(&self, lang: &str) -> Option<String> {
+        // Under 2% the rate is measured over a handful of milliseconds, so a
+        // 300 MB archive can read "还剩 43 分钟" on work that takes ten
+        // seconds. Suppress it until there is a real sample to divide by —
+        // a wrong number is worse than none.
+        if self.finished || self.eta_secs == 0 || self.total_bytes == 0 {
+            return None;
+        }
+        if !(0.02..=0.995).contains(&self.pct()) {
+            return None;
+        }
+        let secs = self.eta_secs;
+        let text = if secs >= 3600 {
+            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        } else if secs >= 60 {
+            format!("{}m {}s", secs / 60, secs % 60)
+        } else {
+            format!("{secs}s")
+        };
+        Some(if lang == "en-US" {
+            format!("{text} left")
+        } else {
+            format!("还剩 {text}")
+        })
+    }
+
     fn pct(&self) -> f32 {
         if self.total_bytes > 0 {
             (self.done_bytes as f32 / self.total_bytes as f32).clamp(0.0, 1.0)
@@ -492,6 +588,9 @@ fn main() -> Result<(), eframe::Error> {
     }
     let mut launch_open: Option<String> = None;
     let mut launch_add: Vec<String> = Vec::new();
+    // Set by the "解压到…" context-menu verb: open the archive and bring the
+    // extract dialog up with it, so the destination can be picked immediately.
+    let mut launch_extract = false;
     // `--register-integration` is what the installer runs after copying the
     // files: it claims the archive extensions and the context menus, so a
     // machine where the app is never opened still has them. No UI starts.
@@ -517,6 +616,10 @@ fn main() -> Result<(), eframe::Error> {
                 add_mode = true;
                 continue;
             }
+            if a == "--extract" {
+                launch_extract = true;
+                continue;
+            }
             if a.starts_with('-') {
                 continue;
             }
@@ -538,7 +641,11 @@ fn main() -> Result<(), eframe::Error> {
     // the job, so both can make progress. `--new-instance` opts out entirely.
     let force_new_instance = args.iter().any(|a| a == "--new-instance");
     let request = if let Some(path) = launch_open.clone() {
-        Some(single_instance::LaunchRequest::Open(path))
+        Some(if launch_extract {
+            single_instance::LaunchRequest::Extract(path)
+        } else {
+            single_instance::LaunchRequest::Open(path)
+        })
     } else if launch_add.is_empty() {
         None
     } else {
@@ -614,7 +721,9 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "ZipNest",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, launch_open, launch_add, is_primary)))),
+        Box::new(move |cc| {
+            Ok(Box::new(App::new(cc, launch_open, launch_add, launch_extract, is_primary)))
+        }),
     )
 }
 
@@ -647,6 +756,10 @@ struct ExtractRequest {
     on_conflict: String,
     /// Delete the source only after the whole extraction succeeds.
     delete_archive: bool,
+    /// Unpacking a double-clicked entry into a scratch folder, not a real
+    /// extract: no dialog asked for a destination, so the result must not be
+    /// reported as "extracted to <somewhere the user never chose>".
+    silent: bool,
 }
 
 /// A password prompt that is on screen right now.
@@ -759,9 +872,13 @@ struct App {
     settings: zipnest_ipc::Settings,
     launch_open: Option<String>,
     launch_add: Vec<String>,
+    /// Our own command line carried `--extract` ("解压到…"), so the archive it
+    /// names opens with the extract dialog up. Only the first request uses it.
+    launch_extract: bool,
     /// Archive a later launch asked for while a job was running; opened once
-    /// the job lets go of the archive.
-    pending_open: Option<String>,
+    /// the job lets go of the archive. The flag is the `--extract` intent, so a
+    /// "解压到…" click that had to wait for a job still ends in the dialog.
+    pending_open: Option<(String, bool)>,
     /// This window is the one later launches hand their requests to.
     is_primary: bool,
     /// Last published busy-marker state; `None` forces one write on becoming
@@ -793,6 +910,13 @@ struct App {
     /// refused after the job started can be answered without losing what the
     /// user picked.
     last_extract: Option<ExtractRequest>,
+    /// Set when a double-clicked entry is being unpacked so it can be handed to
+    /// its own program: the entry path inside the archive. Consumed by the job
+    /// result, which launches the file instead of drawing a progress window.
+    open_after_extract: Option<String>,
+    /// What the archive-wide filter box holds. Non-empty means `rows` is a
+    /// search result, not the contents of `cwd`.
+    search: String,
     cwd: String,
     rows: Vec<EntryDto>,
     selected: std::collections::HashSet<String>,
@@ -882,12 +1006,14 @@ fn new(
         cc: &eframe::CreationContext<'_>,
         launch_open: Option<String>,
         launch_add: Vec<String>,
+        launch_extract: bool,
         is_primary: bool,
     ) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         let mut app = Self::init(cc);
         app.launch_open = launch_open;
         app.launch_add = launch_add;
+        app.launch_extract = launch_extract;
         app.is_primary = is_primary;
         app
     }
@@ -986,6 +1112,7 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             settings,
             launch_open: None,
             launch_add: Vec::new(),
+            launch_extract: false,
             pending_open: None,
             is_primary: false,
             published_busy: None,
@@ -997,6 +1124,8 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
 
             archive: None,
             archive_path: String::new(),
+            open_after_extract: None,
+            search: String::new(),
             cwd: String::new(),
             rows: Vec::new(),
             archive_password: None,
@@ -1308,6 +1437,37 @@ fn t(&self, key: &str) -> String {
                     let delete_archive = self.job.as_ref().map(|j| j.delete_archive).unwrap_or(false);
                     let archive_released = (ok && delete_archive)
                         || (!ok && err_key.as_deref() == Some("error.archive_delete"));
+                    // The tab closes on success, on cancel, and on any real
+                    // failure (the box is drawn and then left behind).
+                    let silent = self.last_extract.as_ref().map(|r| r.silent).unwrap_or(false);
+                    if ok && silent {
+                        // A double-clicked entry was unpacked only so its own
+                        // program could open it. There is nothing to report:
+                        // hand the file over and leave no window behind.
+                        let name = self.open_after_extract.take();
+                        let dest = self.job.as_ref().map(|j| j.dest.clone()).unwrap_or_default();
+                        self.job = None;
+                        self.notice = None;
+                        self.last_extract = None;
+                        if let Some(name) = name {
+                            // A name Windows could not store was rewritten on
+                            // the way out; the pair list says what it became.
+                            let name = self
+                                .renamed_entries
+                                .iter()
+                                .find(|(from, _)| *from == name)
+                                .map(|(_, to)| to.clone())
+                                .unwrap_or(name);
+                            let file = std::path::Path::new(&dest).join(name);
+                            open_with_default_app(&file.to_string_lossy());
+                        }
+                        self.extract_skipped = 0;
+                        if archive_released {
+                            self.clear_archive_view();
+                        }
+                        continue;
+                    }
+                    self.open_after_extract = None;
                     if ok {
                         let renamed = self.job.as_ref().map(|j| j.renamed).unwrap_or(0);
                         self.notice = Some(
@@ -1397,14 +1557,10 @@ fn t(&self, key: &str) -> String {
     fn apply_launch(&mut self, request: single_instance::LaunchRequest) {
         match request {
             single_instance::LaunchRequest::Open(path) => {
-                if self.job_running() {
-                    // Remember it and open it once the job is done.
-                    self.pending_open = Some(path);
-                } else if !self.same_archive(&path) {
-                    self.open_archive(&path);
-                }
-                // Already showing this archive: the caller only wanted the
-                // window raised, so the selection and any open dialog stay.
+                self.apply_open(path, false);
+            }
+            single_instance::LaunchRequest::Extract(path) => {
+                self.apply_open(path, true);
             }
             single_instance::LaunchRequest::Add(paths) => {
                 self.create_sources = paths;
@@ -1412,6 +1568,25 @@ fn t(&self, key: &str) -> String {
                 self.show_create = true;
                 self.refresh_default_dest();
             }
+        }
+    }
+
+    /// Open an archive for a launch request, queueing it while a job runs.
+    /// `then_extract` brings the destination dialog up afterwards — the
+    /// "解压到…" context-menu verb, which has to survive the queue too.
+    fn apply_open(&mut self, path: String, then_extract: bool) {
+        if self.job_running() {
+            // Remember it and open it once the job is done.
+            self.pending_open = Some((path, then_extract));
+            return;
+        }
+        // Already showing this archive: the caller only wanted the window
+        // raised, so the selection and any open dialog stay.
+        if !self.same_archive(&path) {
+            self.open_archive(&path);
+        }
+        if then_extract && self.archive.is_some() {
+            self.begin_extract_dialog();
         }
     }
 
@@ -1425,6 +1600,7 @@ fn t(&self, key: &str) -> String {
         self.password_prompt = None;
         self.last_extract = None;
         self.cwd.clear();
+        self.search.clear();
         self.rows.clear();
         self.selected.clear();
         self.anchor = None;
@@ -1466,6 +1642,8 @@ fn t(&self, key: &str) -> String {
                 self.archive_password = password;
                 self.password_prompt = None;
                 self.cwd = String::new();
+                // The old archive's filter means nothing for this one.
+                self.search.clear();
                 self.dir_cache.insert(String::new(), root.clone());
                 self.rows = root;
                 self.selected.clear();
@@ -1508,6 +1686,10 @@ fn t(&self, key: &str) -> String {
         let Some(id) = self.archive.as_ref().map(|a| a.id) else {
             return;
         };
+        // Walking into a folder from a search result means the user is done
+        // searching: leave the box empty so the breadcrumb comes back and the
+        // listing below is that folder, not a stale set of hits.
+        self.search.clear();
         self.rows = match self.dir_cache.get(&dir) {
             Some(cached) => cached.clone(),
             None => {
@@ -1557,39 +1739,86 @@ fn t(&self, key: &str) -> String {
     }
 
     /// Up / root / breadcrumb strip, drawn above the file list once we are
-    /// inside the archive (at the root all three controls would be dead).
+    /// inside the archive (at the root all three controls would be dead). The
+    /// archive-wide search box shares the row, right-aligned, because it is
+    /// available everywhere — including the root, where this row otherwise
+    /// draws nothing.
     fn nav_row(&mut self, ui: &mut egui::Ui) {
-        if self.cwd.is_empty() {
-            return;
-        }
         // Compact: the breadcrumb is a row of chips, not a second toolbar.
         // Scoped to this child row so the list's own spacing is untouched.
         let mut target: Option<String> = None;
+        let mut clear = false;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            if theme::ghost_button(ui, &self.t("browser.up"))
-                .on_hover_text(self.t("browser.up_hint"))
-                .clicked()
-            {
-                target = parent_dir(&self.cwd);
-            }
-            if theme::ghost_button(ui, &self.t("browser.root")).clicked() {
-                target = Some(String::new());
-            }
-            ui.separator();
-            if crumb_button(ui, &self.t("browser.root")).clicked() {
-                target = Some(String::new());
-            }
-            for (label, path) in breadcrumb_segments(&self.cwd) {
-                ui.label(egui::RichText::new("/").weak());
-                if crumb_button(ui, &label).clicked() {
-                    target = Some(path);
+            if !self.cwd.is_empty() && !self.searching() {
+                if theme::ghost_button(ui, &self.t("browser.up"))
+                    .on_hover_text(self.t("browser.up_hint"))
+                    .clicked()
+                {
+                    target = parent_dir(&self.cwd);
+                }
+                if theme::ghost_button(ui, &self.t("browser.root")).clicked() {
+                    target = Some(String::new());
+                }
+                ui.separator();
+                if crumb_button(ui, &self.t("browser.root")).clicked() {
+                    target = Some(String::new());
+                }
+                for (label, path) in breadcrumb_segments(&self.cwd) {
+                    ui.label(egui::RichText::new("/").weak());
+                    if crumb_button(ui, &label).clicked() {
+                        target = Some(path);
+                    }
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.searching() && ui.small_button("×").clicked() {
+                    clear = true;
+                }
+                let hint = self.t("browser.search.hint");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .desired_width(170.0)
+                        .hint_text(hint),
+                );
+                if resp.changed() {
+                    self.run_search();
+                }
+            });
         });
         if let Some(dir) = target {
             self.navigate(&dir);
         }
+        if clear {
+            self.search.clear();
+            self.run_search();
+        }
+    }
+
+    /// A search is showing instead of a directory listing.
+    fn searching(&self) -> bool {
+        !self.search.trim().is_empty()
+    }
+
+    /// Recompute the list for the current query. An empty query restores the
+    /// directory the user was in.
+    fn run_search(&mut self) {
+        let Some(id) = self.archive.as_ref().map(|a| a.id) else {
+            return;
+        };
+        if !self.searching() {
+            let cwd = self.cwd.clone();
+            self.navigate(&cwd);
+            return;
+        }
+        // A search is a flat list from the whole archive, so it has no
+        // directory to be "in": the breadcrumb goes away with it.
+        self.rows = self
+            .svc
+            .search_entries(id, self.search.clone(), Self::SEARCH_MAX)
+            .unwrap_or_default();
+        self.selected.clear();
+        self.resort();
     }
 
     fn current_archive_dir(&self) -> String {
@@ -1662,13 +1891,7 @@ let extract_enabled = self.archive.is_some();
                     })
                     .clicked()
                 {
-                    self.extract_dest = self.default_extract_dest();
-                    // The dialog checkbox mirrors the saved policy; "ask" starts
-                    // from "do not overwrite", the safe default.
-                    self.overwrite = self.settings.overwrite_policy == "overwrite";
-                    // No selection → extract the whole archive (empty paths
-                    // tells the engine to unpack everything).
-                    self.show_extract = true;
+                    self.begin_extract_dialog();
                 }
                 ui.separator();
                 if let Some(a) = &self.archive {
@@ -1739,6 +1962,10 @@ let extract_enabled = self.archive.is_some();
     /// back-and-forth browsing, small enough that a deep walk through a huge
     /// archive cannot hold a copy of every listing it ever showed.
     const DIR_CACHE_MAX: usize = 64;
+    /// Rows a search may return. A one-letter query in a huge archive matches
+    /// thousands of entries; drawing all of them costs more than the filter is
+    /// worth, and no one scrolls past the first screenful anyway.
+    const SEARCH_MAX: usize = 1000;
 
     /// Drop the oldest cached icons. Runs at the start of the list, before any
     /// row is painted: egui frees a texture when its last handle goes, so
@@ -1910,6 +2137,12 @@ let extract_enabled = self.archive.is_some();
             // ---- rows ----
             let mut click_dir: Option<String> = None;
             let mut dbl: Option<String> = None;
+            // A double-clicked file: unpack it into a temp folder and let the
+            // OS open it, instead of opening the extract dialog.
+            let mut dbl_file: Option<String> = None;
+            // A flat list of hits shows the folder beside each name; a
+            // directory listing does not need to repeat where it is.
+            let search_hit = self.searching();
             // Shell icons cost a Win32 round trip each; resolve a handful per
             // frame and let the painted badge stand in until a row's turn
             // comes, so a 10 000-entry directory cannot stall the UI thread.
@@ -1927,6 +2160,11 @@ let extract_enabled = self.archive.is_some();
             // directory feel heavy.
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
+                // egui keeps each scroll area's offset under its own id, so
+                // salting the id with the folder gives every folder its own
+                // remembered position: walking down and back up no longer
+                // lands at the top of a listing the user had scrolled.
+                .id_salt(("zipnest-rows", &self.cwd, self.searching()))
                 .show_rows(ui, Self::ROW_H, rows.len(), |ui, range| {
                     for i in range {
                         let e = &rows[i];
@@ -1978,19 +2216,66 @@ let extract_enabled = self.archive.is_some();
                             None => paint_entry_icon(&painter, icon_rect, e, dark),
                         }
 
-                        // Name: one line, ellipsised inside its column.
+                        // Name: one line, ellipsised inside its column. In a
+                        // search result the name alone would not say where the
+                        // file lives, so the folder follows it in weak text.
                         let name_rect = egui::Rect::from_min_max(
                             egui::pos2(icon_rect.right() + 8.0, rect.top()),
                             egui::pos2(size_x - 12.0, rect.bottom()),
                         );
-                        paint_elided(
-                            ui,
-                            name_rect,
-                            &e.name,
-                            egui::FontId::proportional(13.5),
-                            text_color,
-                            egui::Align2::LEFT_CENTER,
-                        );
+                        let dir_of = search_hit
+                            .then(|| {
+                                std::path::Path::new(&e.path)
+                                    .parent()
+                                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                                    .unwrap_or_default()
+                            })
+                            .filter(|d| !d.is_empty());
+                        match dir_of {
+                            Some(dir) => {
+                                let font = egui::FontId::proportional(13.5);
+                                let name_w = ui
+                                    .painter()
+                                    .layout_no_wrap(
+                                        e.name.clone(),
+                                        font.clone(),
+                                        text_color,
+                                    )
+                                    .size()
+                                    .x
+                                    .min(name_rect.width());
+                                paint_elided(
+                                    ui,
+                                    egui::Rect::from_min_max(
+                                        name_rect.min,
+                                        egui::pos2(name_rect.left() + name_w + 1.0, name_rect.bottom()),
+                                    ),
+                                    &e.name,
+                                    font.clone(),
+                                    text_color,
+                                    egui::Align2::LEFT_CENTER,
+                                );
+                                paint_elided(
+                                    ui,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(name_rect.left() + name_w + 8.0, name_rect.top()),
+                                        name_rect.max,
+                                    ),
+                                    &format!("· {dir}"),
+                                    egui::FontId::proportional(11.5),
+                                    weak,
+                                    egui::Align2::LEFT_CENTER,
+                                );
+                            }
+                            None => paint_elided(
+                                ui,
+                                name_rect,
+                                &e.name,
+                                egui::FontId::proportional(13.5),
+                                text_color,
+                                egui::Align2::LEFT_CENTER,
+                            ),
+                        }
 
                         // Size: right-aligned against its column.
                         if !e.is_dir {
@@ -2031,6 +2316,8 @@ let extract_enabled = self.archive.is_some();
 
                         if resp.double_clicked() && e.is_dir {
                             dbl = Some(e.path.clone());
+                        } else if resp.double_clicked() {
+                            dbl_file = Some(e.path.clone());
                         } else if resp.clicked() {
                             // Ctrl toggles one row, Shift extends from the last
                             // clicked one, a plain click replaces the selection.
@@ -2074,7 +2361,69 @@ let extract_enabled = self.archive.is_some();
             if let Some(d) = dbl.or(click_dir) {
                 self.navigate(&d);
             }
+            if let Some(path) = dbl_file {
+                self.open_entry(path);
+            }
         });
+    }
+
+    /// Double-click on a file inside the archive: unpack just that entry into a
+    /// scratch folder and hand the result to its own program.
+    ///
+    /// The alternative — the extract dialog — asks the user where to put a file
+    /// they only wanted to look at. WinRAR and 7-Zip both do it this way.
+    fn open_entry(&mut self, path: String) {
+        let Some(id) = self.archive.as_ref().map(|a| a.id) else {
+            return;
+        };
+        if self.job_running() {
+            return;
+        }
+        // One folder per archive, so opening a second file from the same
+        // archive reuses the folder instead of scattering a new one per click.
+        let stem = std::path::Path::new(&self.archive_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir()
+            .join("ZipNest-open")
+            .join(if stem.is_empty() { "archive".to_string() } else { stem });
+        let dir = dir.to_string_lossy().into_owned();
+        let req = ExtractRequest {
+            archive_id: id,
+            sources: vec![path.clone()],
+            dest: dir,
+            // Looking at a file twice must not stop on a "file exists"
+            // question: the copy in a scratch folder is ours to replace.
+            on_conflict: "overwrite".into(),
+            delete_archive: false,
+            // Not a real extract: no dialog asked for a destination, so the
+            // result window would report a place the user never chose.
+            silent: true,
+        };
+        // The archive's own path for the entry, not its file name: extraction
+        // keeps the folder structure, so `docs/notes.txt` lands at
+        // `<dest>/docs/notes.txt` and joining only the name finds nothing.
+        self.open_after_extract = Some(path);
+        match self.begin_extract(req.clone(), self.archive_password.clone()) {
+            None => {}
+            Some(key) if is_password_key(&key) => {
+                // Encrypted archive, no password yet: ask, and replay this.
+                self.open_after_extract = None;
+                self.password_prompt = Some(PasswordPrompt {
+                    path: self.archive_path.clone(),
+                    text: String::new(),
+                    retry: key == "error.password_incorrect",
+                    focus: true,
+                    then: PasswordThen::Extract(req),
+                });
+            }
+            Some(key) => {
+                self.open_after_extract = None;
+                self.job = None;
+                self.error = Some(self.t(&key));
+            }
+        }
     }
 
     /// Shown when nothing is open. The window has always accepted drops, but
@@ -2164,6 +2513,19 @@ let extract_enabled = self.archive.is_some();
                 });
             });
         });
+    }
+
+    /// Open the extract dialog with its defaults filled in. Shared by the
+    /// toolbar button and the "解压到…" context-menu verb so the two cannot
+    /// drift: the destination and the overwrite default are decided here once.
+    fn begin_extract_dialog(&mut self) {
+        self.extract_dest = self.default_extract_dest();
+        // The dialog checkbox mirrors the saved policy; "ask" starts from "do
+        // not overwrite", the safe default.
+        self.overwrite = self.settings.overwrite_policy == "overwrite";
+        // No selection → extract the whole archive (empty paths tells the
+        // engine to unpack everything).
+        self.show_extract = true;
     }
 
     fn extract_dialog(&mut self, ctx: &egui::Context) {
@@ -2260,6 +2622,7 @@ let extract_enabled = self.archive.is_some();
                     dest,
                     on_conflict,
                     delete_archive: delete_clicked,
+                    silent: false,
                 };
                 // The password the archive was opened with, if any. The service
                 // also remembers it per archive, but passing it here keeps a
@@ -2310,6 +2673,7 @@ let extract_enabled = self.archive.is_some();
             job_id: 0,
             title: self.t("extract.title"),
             delete_archive: req.delete_archive,
+            dest: req.dest.clone(),
             ..Default::default()
         });
         // Last job's rename/failure lists belong to the last job.
@@ -2717,6 +3081,12 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                 self.job = Some(JobState {
                     job_id: 0,
                     title: self.t("create.title"),
+                    // The archive itself is the result, but the button next to
+                    // it opens a folder, so remember the folder it lands in.
+                    dest: std::path::Path::new(&self.create_dest)
+                        .parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
                     ..Default::default()
                 });
                 match svc.create_archive(
@@ -3225,6 +3595,21 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                             ok_color(ui),
                             self.notice_text().unwrap_or_else(|| self.t("job.ok")),
                         );
+                        // Where the files went. The app picks the folder, so it
+                        // is the one thing the user cannot work out themselves.
+                        if !j.dest.is_empty() {
+                            ui.add_space(2.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(&j.dest)
+                                        .size(11.5)
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            });
+                            if ui.button(self.t("job.open_folder")).clicked() {
+                                open_path_in_explorer(&j.dest);
+                            }
+                        }
                         // Entries whose archived name could not be stored as-is.
                         // They *are* on disk — under the name on the right — so
                         // this is information, not a warning.
@@ -3259,6 +3644,13 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                         format!("{} / {}", j.done_items, j.total_items)
                     };
                     ui.label(text);
+                    if let Some(eta) = j.eta_text(&self.lang) {
+                        ui.label(
+                            egui::RichText::new(eta)
+                                .size(12.0)
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    }
                     if ui.button(self.t("job.canceled")).clicked() {
                         cancel = true;
                     }
@@ -3518,7 +3910,14 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // launch forwarded through the single-instance queue (only the primary
         // window owns that queue).
         if let Some(path) = self.launch_open.take() {
-            self.apply_launch(single_instance::LaunchRequest::Open(path));
+            // Our own command line: `--extract` is the "解压到…" verb, and it
+            // has to open the dialog too — not just the archive.
+            let then_extract = std::mem::take(&mut self.launch_extract);
+            self.apply_launch(if then_extract {
+                single_instance::LaunchRequest::Extract(path)
+            } else {
+                single_instance::LaunchRequest::Open(path)
+            });
         }
         if !self.launch_add.is_empty() {
             let paths = std::mem::take(&mut self.launch_add);
@@ -3531,8 +3930,8 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         }
         // A request that arrived while a job was running waits for it.
         if !self.job_running() {
-            if let Some(path) = self.pending_open.take() {
-                self.open_archive(&path);
+            if let Some((path, then_extract)) = self.pending_open.take() {
+                self.apply_open(path, then_extract);
             }
         }
 
@@ -3612,11 +4011,17 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
                     self.empty_state(ui);
                 } else if self.rows.is_empty() {
                     theme::card(ui, |ui| {
-                        // The navigation row stays: an empty folder is exactly
-                        // where a user needs a way back to its parent.
+                        // The navigation row stays: an empty folder — or a
+                        // search with no hits — is exactly where a user needs
+                        // a way back out.
                         self.nav_row(ui);
                         ui.add_space(20.0);
-                        ui.vertical_centered(|ui| theme::hint(ui, &self.t("browser.empty_dir")));
+                        let empty = if self.searching() {
+                            self.t("browser.search.none")
+                        } else {
+                            self.t("browser.empty_dir")
+                        };
+                        ui.vertical_centered(|ui| theme::hint(ui, &empty));
                     });
                 } else {
                     self.browser(ui);
@@ -4647,6 +5052,43 @@ mod feedback_tests {
             "mailto must point at the feedback mailbox: {url}"
         );
         assert!(url.contains("subject=") && url.contains("&body="));
+    }
+}
+
+#[cfg(test)]
+mod eta_tests {
+    use super::JobState;
+
+    fn job(done: u64, total: u64, eta: u64) -> JobState {
+        JobState {
+            done_bytes: done,
+            total_bytes: total,
+            eta_secs: eta,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_eta_is_hidden_until_there_is_a_real_sample() {
+        // A 300 MB job one megabyte in has a "rate" measured over a few
+        // milliseconds; showing it produced "还剩 43 分钟" on ten seconds of
+        // work.
+        assert!(job(1 << 20, 300 << 20, 2600).eta_text("zh-CN").is_none());
+        // Nothing to divide by, or nothing left to do.
+        assert!(job(0, 100, 30).eta_text("zh-CN").is_none());
+        assert!(job(100, 100, 1).eta_text("zh-CN").is_none());
+        assert!(job(50, 100, 0).eta_text("zh-CN").is_none());
+    }
+
+    #[test]
+    fn the_eta_reads_as_time_and_goes_away_when_finished() {
+        assert_eq!(job(50, 100, 45).eta_text("zh-CN").as_deref(), Some("还剩 45s"));
+        assert_eq!(job(50, 100, 95).eta_text("zh-CN").as_deref(), Some("还剩 1m 35s"));
+        assert_eq!(job(50, 100, 3725).eta_text("zh-CN").as_deref(), Some("还剩 1h 2m"));
+        assert_eq!(job(50, 100, 45).eta_text("en-US").as_deref(), Some("45s left"));
+        let mut done = job(50, 100, 45);
+        done.finished = true;
+        assert!(done.eta_text("zh-CN").is_none());
     }
 }
 

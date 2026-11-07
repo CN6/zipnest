@@ -391,6 +391,15 @@ pub fn menu_ops(target: MenuTarget, exe: &std::path::Path) -> Vec<RegOp> {
                 None,
                 format!("{exe_q} --add {arg}"),
             ));
+            // "解压到…" — open the archive with the extract dialog already up,
+            // so the folder can be chosen without first finding the archive
+            // again by hand.
+            ops.push(RegOp::set(format!(r"{key}\shell\extract"), Some("MUIVerb"), "解压到…"));
+            ops.push(RegOp::set(
+                format!(r"{key}\shell\extract\command"),
+                None,
+                format!("{exe_q} --extract {arg}"),
+            ));
         }
     }
     ops
@@ -944,6 +953,30 @@ mod tests {
                 None
             ),
             Some(r#""C:\Program Files\ZipNest\ZipNest.exe" --add "%1""#)
+        );
+    }
+
+    #[test]
+    fn a_file_menu_entry_offers_unpacking_too() {
+        // The "解压到…" verb has to reach the same launcher with a different
+        // flag; without it the only way to unpack to a chosen folder is to
+        // open the app, find the archive again and use the dialog.
+        let ops = file_menu_ops(exe());
+        assert_eq!(
+            find_set(
+                &ops,
+                r"HKCU\Software\Classes\*\shell\ZipNest\shell\extract\command",
+                None
+            ),
+            Some(r#""C:\Program Files\ZipNest\ZipNest.exe" --extract "%1""#)
+        );
+        assert_eq!(
+            find_set(
+                &ops,
+                r"HKCU\Software\Classes\*\shell\ZipNest\shell\extract",
+                Some("MUIVerb")
+            ),
+            Some("解压到…")
         );
     }
 
