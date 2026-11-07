@@ -2445,68 +2445,97 @@ let extract_enabled = self.archive.is_some();
         let mut close = false;
         let svc = self.svc.clone();
         let t = self.t("create.title");
-        egui::Window::new(t).collapsible(false).open(&mut open).show(ctx, |ui| {
+        // Scrolls and resizes: the wizard is a dozen rows tall, and a long
+        // source list, a password confirmation or the overwrite warning all
+        // push the buttons at the bottom past the window edge — where they are
+        // unreachable rather than merely out of sight.
+        egui::Window::new(t)
+            .collapsible(false)
+            .resizable(true)
+            .vscroll(true)
+            .open(&mut open)
+            .show(ctx, |ui| {
             ui.label(self.t("create.sources"));
-            if ui.button(self.t("create.add_files")).clicked() {
-                let all = self.t("pick.all");
-                if let Some(files) = rfd::FileDialog::new()
-                    .add_filter(all, &["*"])
-                    .pick_files()
-                {
-                    for f in files {
-                        if let Some(s) = f.to_str() {
+            // Side by side, and the list scrolls on its own: this wizard has to
+            // fit the main window's default height, or its start button ends up
+            // below the edge of the screen.
+            ui.horizontal(|ui| {
+                if ui.button(self.t("create.add_files")).clicked() {
+                    let all = self.t("pick.all");
+                    if let Some(files) = rfd::FileDialog::new()
+                        .add_filter(all, &["*"])
+                        .pick_files()
+                    {
+                        for f in files {
+                            if let Some(s) = f.to_str() {
+                                if !self.create_sources.contains(&s.to_string()) {
+                                    self.create_sources.push(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                    self.refresh_default_dest();
+                }
+                if ui.button(self.t("create.add_folder")).clicked() {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        if let Some(s) = dir.to_str() {
                             if !self.create_sources.contains(&s.to_string()) {
                                 self.create_sources.push(s.to_string());
                             }
                         }
                     }
+                    self.refresh_default_dest();
                 }
-                self.refresh_default_dest();
-            }
-            if ui.button(self.t("create.add_folder")).clicked() {
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    if let Some(s) = dir.to_str() {
-                        if !self.create_sources.contains(&s.to_string()) {
-                            self.create_sources.push(s.to_string());
+            });
+            if !self.create_sources.is_empty() {
+                egui::ScrollArea::vertical()
+                    .id_salt("zipnest-create-sources")
+                    .max_height(72.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for s in &self.create_sources.clone() {
+                            ui.label(format!("• {s}"));
                         }
-                    }
-                }
-                self.refresh_default_dest();
-            }
-            for s in &self.create_sources.clone() {
-                ui.label(format!("• {s}"));
+                    });
             }
             ui.separator();
             let dest_label = self.t("create.dest");
-            ui.label(&dest_label);
             // Read-only on purpose. A bare name typed here used to be handed to
             // the engine as-is, so the archive was written relative to whatever
             // working directory the shell happened to pass us and the user could
             // not find it. The path is now always picked with 浏览…, or filled in
             // next to the sources before the dialog opens.
             let dest_hint = self.t("create.dest_hint");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.create_dest)
-                    .interactive(false)
-                    .desired_width(f32::INFINITY)
-                    .hint_text(dest_hint),
-            );
-            if ui.button(self.t("extract.browse")).clicked() {
-                // The Save-As dialog used to open with an empty file name and an
-                // "All files" filter, so 保存 did nothing until the user typed a
-                // name themselves — which reads as "browse cannot select
-                // anything". Pre-fill a sensible name and match the format.
-                let format = self.create_format.clone();
-                let (desc_key, exts) = format_filter(&format);
-                let desc = self.t(desc_key);
-                let picked = rfd::FileDialog::new()
-                    .set_file_name(suggested_archive_name(&self.create_sources, &format))
-                    .add_filter(desc, exts)
-                    .save_file();
-                if let Some(p) = picked {
-                    self.create_dest = p.to_str().unwrap_or("").to_string();
+            ui.horizontal(|ui| {
+                ui.label(&dest_label);
+                let browse_w = 64.0;
+                ui.add_sized(
+                    [ui.available_width() - browse_w - 4.0, 20.0],
+                    egui::TextEdit::singleline(&mut self.create_dest)
+                        .interactive(false)
+                        .hint_text(dest_hint),
+                );
+                if ui
+                    .add_sized([browse_w, 20.0], egui::Button::new(self.t("extract.browse")))
+                    .clicked()
+                {
+                    // The Save-As dialog used to open with an empty file name and
+                    // an "All files" filter, so 保存 did nothing until the user
+                    // typed a name themselves — which reads as "browse cannot
+                    // select anything". Pre-fill a sensible name, match the
+                    // format.
+                    let format = self.create_format.clone();
+                    let (desc_key, exts) = format_filter(&format);
+                    let desc = self.t(desc_key);
+                    let picked = rfd::FileDialog::new()
+                        .set_file_name(suggested_archive_name(&self.create_sources, &format))
+                        .add_filter(desc, exts)
+                        .save_file();
+                    if let Some(p) = picked {
+                        self.create_dest = p.to_str().unwrap_or("").to_string();
+                    }
                 }
-            }
+            });
 ui.horizontal(|ui| {
                 let label = self.t("create.format");
                 ui.label(&label);
@@ -2619,23 +2648,18 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
             // where an earlier archive of the same name usually sits, so this
             // is a realistic accident rather than a corner case.
             let replaces = dest_absolute && std::path::Path::new(&dest).is_file();
-            let start = ui
-                .add_enabled(can, egui::Button::new(self.t("create.start")))
-                .clicked();
-            let enter = can && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            // Pressing 开始创建 onto an existing archive arms the warning row
-            // below instead of launching, and the row stays until it is
-            // answered — a prompt that vanished on the next frame would be
-            // worse than none.
-            if replaces && (start || enter) {
-                self.create_confirm_overwrite = true;
-            }
+            // A destination that vanished between frames must not leave the
+            // question standing.
             if !replaces {
                 self.create_confirm_overwrite = false;
             }
-            let mut confirmed = false;
+            // Pressing 开始创建 onto an existing archive swaps the button for
+            // the confirmation row rather than adding a row below it: this
+            // wizard is already tall enough to run past the window edge, and a
+            // confirmation whose own buttons fall outside the dialog is worse
+            // than no confirmation at all.
+            let mut proceed = false;
             if self.create_confirm_overwrite {
-                ui.separator();
                 ui.colored_label(
                     error_color(ui),
                     self.t("create.overwrite_warning").replace("{path}", &dest),
@@ -2655,9 +2679,18 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                     // work in place for the user to point somewhere else.
                     self.create_confirm_overwrite = false;
                 }
-                confirmed = yes;
+                proceed = can && yes;
+            } else {
+                let start = ui
+                    .add_enabled(can, egui::Button::new(self.t("create.start")))
+                    .clicked();
+                let enter = can && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if replaces && (start || enter) {
+                    self.create_confirm_overwrite = true;
+                } else {
+                    proceed = start || enter;
+                }
             }
-            let proceed = can && (confirmed || ((start || enter) && !replaces));
             if proceed {
                 self.create_confirm_overwrite = false;
                 let volume_bytes = match self.create_volume.as_str() {
