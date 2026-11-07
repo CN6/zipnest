@@ -969,6 +969,10 @@ struct App {
     create_volume: String,
     create_custom_volume: String,
     create_sfx: bool,
+    /// Whether this opening of the wizard window has already asked for the
+    /// front. Windows creates a new OS window behind the main one; without
+    /// this it would appear underneath the app it belongs to.
+    create_raised: bool,
     show_settings: bool,
     /// Per-extension state for the Settings status line (is Windows' recorded
     /// handler ours?), re-read whenever the page opens, after a save, and
@@ -1162,6 +1166,7 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             create_volume: "off".into(),
             create_custom_volume: String::new(),
             create_sfx: false,
+            create_raised: false,
             show_settings: false,
             assoc_rows,
             show_donate: false,
@@ -2804,25 +2809,104 @@ let extract_enabled = self.archive.is_some();
         self.password_prompt = Some(prompt);
     }
 
+    /// The create wizard, as a window of its own.
+    ///
+    /// It used to be an `egui::Window` inside the main window, which made it a
+    /// prisoner of that window's rect: in a small window the bottom rows and
+    /// the start button were clipped by the edge, and dragging it outside was
+    /// impossible. A real OS window can be moved anywhere, resized, and put on
+    /// a second monitor — and the clipping problem stops existing.
+    ///
+    /// `show_viewport_immediate` falls back to an embedded window on a backend
+    /// without multi-viewport support, so the wizard still opens there.
     fn create_dialog(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_create;
-        let mut close = false;
+        if !self.show_create {
+            return;
+        }
+        let title = self.t("create.title");
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title.clone())
+            // Fits the wizard at its natural height, plus room for the
+            // password confirmation and the overwrite warning when they
+            // appear. The window is resizable and scrolls, so a smaller or a
+            // larger one both work; this is only where it starts.
+            .with_inner_size([470.0, 500.0])
+            .with_min_inner_size([380.0, 280.0])
+            .with_resizable(true);
+        let finished = ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("zipnest-create-wizard"),
+            builder,
+            |ctx, class| {
+                // Windows creates the new window *behind* the main one, so the
+                // first frame of each opening asks for the front. A fresh
+                // window has never been seen, and appearing underneath the
+                // app is the same occlusion this window exists to escape.
+                if !self.create_raised && class != egui::ViewportClass::Embedded {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.create_raised = true;
+                }
+                // The window's own close button.
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    return true;
+                }
+                if class != egui::ViewportClass::Embedded {
+                    // eframe clears an immediate viewport with `[0,0,0,0]`
+                    // rather than the app's clear colour, so anything not
+                    // painted here would be transparent and keep whatever the
+                    // compositor put behind it.
+                    let rect = ctx.screen_rect();
+                    ctx.layer_painter(egui::LayerId::background())
+                        .rect_filled(rect, 0.0, ctx.style().visuals.panel_fill);
+                }
+                let body = |ui: &mut egui::Ui| self.create_wizard_ui(ui);
+                if class == egui::ViewportClass::Embedded {
+                    egui::Window::new(title.clone())
+                        .collapsible(false)
+                        .resizable(true)
+                        .vscroll(true)
+                        .default_width(460.0)
+                        .show(ctx, body)
+                        .and_then(|r| r.inner)
+                        .unwrap_or(false)
+                } else {
+                    // A scroll area, not a bare panel: the wizard grows when
+                    // the password confirmation or the overwrite warning
+                    // appears, and on a short window the start button must stay
+                    // reachable rather than falling off the bottom edge — the
+                    // exact complaint that made this a separate window.
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, body)
+                                .inner
+                        })
+                        .inner
+                }
+            },
+        );
+        if finished {
+            self.show_create = false;
+            // The next opening is a brand-new window and must raise itself.
+            self.create_raised = false;
+            // An immediate viewport is destroyed on the *next* frame, and egui
+            // only draws when something asks it to. Clicking 取消 therefore
+            // left the window on screen until an unrelated event woke the
+            // loop. Ask for the frame that closes it.
+            ctx.request_repaint();
+        }
+    }
+
+    /// The wizard's contents. Returns true when it is done — started, or
+    /// cancelled — so the caller can close the window around it.
+    fn create_wizard_ui(&mut self, ui: &mut egui::Ui) -> bool {
         let svc = self.svc.clone();
-        let t = self.t("create.title");
-        // Scrolls and resizes: the wizard is a dozen rows tall, and a long
-        // source list, a password confirmation or the overwrite warning all
-        // push the buttons at the bottom past the window edge — where they are
-        // unreachable rather than merely out of sight.
-        egui::Window::new(t)
-            .collapsible(false)
-            .resizable(true)
-            .vscroll(true)
-            .open(&mut open)
-            .show(ctx, |ui| {
+        let mut finished = false;
+        {
             ui.label(self.t("create.sources"));
-            // Side by side, and the list scrolls on its own: this wizard has to
-            // fit the main window's default height, or its start button ends up
-            // below the edge of the screen.
+            // Side by side, and the list scrolls on its own: a hundred-file
+            // source list must not push the format and password rows out of
+            // reach.
             ui.horizontal(|ui| {
                 if ui.button(self.t("create.add_files")).clicked() {
                     let all = self.t("pick.all");
@@ -3104,17 +3188,18 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                         self.job = None;
                     }
                 }
-                self.show_create = false;
+                // The job owns the window from here: the progress window
+                // takes over and the wizard has said everything it has to say.
+                finished = true;
             }
             ui.separator();
             if ui.button(self.t("extract.cancel")).clicked()
                 || ui.input(|i| i.key_pressed(egui::Key::Escape))
             {
-                close = true;
+                finished = true;
             }
-        });
-        // Same overwrite-the-flag bug as the extract dialog: Cancel did nothing.
-        self.show_create = open && !close && self.job.is_none();
+        }
+        finished
     }
 
     /// The scrolling half of the Settings page.
