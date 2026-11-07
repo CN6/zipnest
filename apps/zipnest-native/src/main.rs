@@ -2753,6 +2753,11 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
     /// panels of the same window, so this body may take every point left over
     /// without pushing the footer out of sight.
     fn settings_body(&mut self, ui: &mut egui::Ui) {
+        // Padding only: the page owns the whole window now, so it needs the
+        // gutters the card used to supply, but not its border or rounding.
+        egui::Frame::none()
+            .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+            .show(ui, |ui| {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -2838,30 +2843,37 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                         let associate_label = self.t("settings.shell.associate");
                         ui.checkbox(&mut self.settings.associate, associate_label);
                         theme::hint(ui, &self.t("settings.shell.assoc_hint"));
+                        // The default-handler status and its button belong to
+                        // the association box above, so they sit directly under
+                        // it. They used to come after 右键菜单, which made the
+                        // line read as a claim about the context menu and sent
+                        // anyone whose default was still another app looking in
+                        // the wrong place.
+                        if self.settings.associate {
+                            // The button is the whole feature: it rewrites the
+                            // OS's own recorded handler for every format we
+                            // claim -- hash and all -- so nothing here sends the
+                            // user off to a Settings page they would have to
+                            // work out by themselves.
+                            let (status_key, status_exts) = self.assoc_status();
+                            match status_exts {
+                                Some(exts) => {
+                                    let msg = self.t(status_key).replace("{exts}", &exts);
+                                    theme::hint(ui, &msg);
+                                }
+                                None => {
+                                    ui.label(self.t(status_key));
+                                }
+                            }
+                            if theme::primary_button(ui, &self.t("settings.shell.set_default"))
+                                .clicked()
+                            {
+                                self.force_default_now();
+                            }
+                            theme::hint(ui, &self.t("settings.shell.set_default.hint"));
+                        }
                         let menu_label = self.t("settings.shell.context_menu");
                         ui.checkbox(&mut self.settings.context_menu, menu_label);
-                        // Does Windows open archives with us? The button below is
-                        // the whole feature: it rewrites the OS's own recorded
-                        // handler for every format we claim -- hash and all -- so
-                        // nothing here sends the user off to a Settings page they
-                        // would have to work out by themselves.
-                        let (status_key, status_exts) = self.assoc_status();
-                        match status_exts {
-                            Some(exts) => {
-                                let msg = self.t(status_key).replace("{exts}", &exts);
-                                theme::hint(ui, &msg);
-                            }
-                            None => {
-                                ui.label(self.t(status_key));
-                            }
-                        }
-                        if self.settings.associate
-                            && theme::primary_button(ui, &self.t("settings.shell.set_default"))
-                                .clicked()
-                        {
-                            self.force_default_now();
-                        }
-                        theme::hint(ui, &self.t("settings.shell.set_default.hint"));
 
                         theme::section(ui, &self.t("settings.section.about"));
                         let update_label = self.t("settings.auto_update");
@@ -2908,6 +2920,7 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
                         if ui.button(self.t("settings.feedback.mail")).clicked() {
                             self.send_feedback_mail(ui.ctx());
                         }
+            });
             });
     }
 
@@ -3054,7 +3067,12 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
             .show(ctx, |ui| self.settings_footer(ui))
             .inner;
         egui::CentralPanel::default().show(ctx, |ui| {
-            theme::card(ui, |ui| self.settings_body(ui));
+            // No card: Settings fills the window edge to edge, like a page of
+            // the app rather than a panel floating inside it. The rounded,
+            // bordered surface it used to sit on read as "a second window
+            // opened", which is the impression v0.4.14 set out to remove and
+            // only half did.
+            self.settings_body(ui);
         });
         // Escape leaves, Enter saves — what a settings surface is expected to do.
         let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
