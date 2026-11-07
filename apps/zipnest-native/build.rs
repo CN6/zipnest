@@ -9,8 +9,6 @@ use std::path::Path;
 
 /// Icon (and any other hand-written resources). Contains no VERSIONINFO.
 const APP_RC: &str = "src/assets/app.rc";
-/// Single source of truth for the shipped version number.
-const MAIN_RS: &str = "src/main.rs";
 
 fn main() {
     #[cfg(windows)]
@@ -18,10 +16,8 @@ fn main() {
         // Keep the hand-written resources (the icon) working exactly as before.
         embed_resource::compile(APP_RC, embed_resource::NONE);
 
-        // `CURRENT_VERSION` lives in src/main.rs, so the exe has to be rebuilt
-        // (and its resource recompiled) whenever that file changes.
         println!("cargo:rerun-if-changed={APP_RC}");
-        println!("cargo:rerun-if-changed={MAIN_RS}");
+        println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
 
         if let Some(out_dir) = env::var_os("OUT_DIR") {
             let rc = version_rc_path(Path::new(&out_dir));
@@ -96,53 +92,33 @@ fn version_numbers(version: &str) -> [u32; 4] {
     numbers
 }
 
-/// Reads `CURRENT_VERSION = "x.y.z"` out of src/main.rs. Never panics: if the
-/// file or the constant is missing (or the value is not a version), the build
-/// still succeeds and the exe simply reports 0.0.0.
+/// The version Cargo hands this crate from `[workspace.package].version`.
+///
+/// It used to be scraped out of `src/main.rs` with a string search for
+/// `CURRENT_VERSION = "x.y.z"`. That was correct until v0.4.11 replaced the
+/// literal with `env!("CARGO_PKG_VERSION")` — after which the search found
+/// nothing, every build from then on embedded `0.0.0`, and Explorer's Details
+/// tab and Windows' Apps list showed no version at all. Cargo already exports
+/// the value to the build script, so read it.
 #[cfg(windows)]
 fn read_current_version() -> String {
-    fs::read_to_string(MAIN_RS)
-        .ok()
-        .and_then(|source| extract_current_version(&source))
-        .unwrap_or_else(|| "0.0.0".to_string())
-}
-
-#[cfg(windows)]
-fn extract_current_version(source: &str) -> Option<String> {
-    let line = source
-        .lines()
-        .find(|line| line.contains("CURRENT_VERSION") && line.contains('='))?;
-    let (_, after_eq) = line.split_once('=')?;
-    let (_, after_quote) = after_eq.split_once('"')?;
-    let (value, _) = after_quote.split_once('"')?;
-    let value = value.trim();
-    // Guard against matching some other string on the same line.
-    let looks_like_version = !value.is_empty()
-        && value.split('.').count() >= 2
-        && value.chars().all(|c| c.is_ascii_digit() || c == '.');
-    if looks_like_version {
-        Some(value.to_string())
-    } else {
-        None
-    }
+    env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string())
 }
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{extract_current_version, version_numbers, version_rc};
+    use super::{read_current_version, version_numbers, version_rc};
 
     #[test]
-    fn reads_the_declaration_used_by_main_rs() {
-        let source = "//! doc\nconst UPDATE_UA: &str = \"ZipNest-Updater/0.3.5\";\nconst CURRENT_VERSION: &str = \"0.3.6\";\n";
-        assert_eq!(extract_current_version(source).as_deref(), Some("0.3.6"));
-    }
-
-    #[test]
-    fn missing_or_malformed_declarations_do_not_parse() {
-        assert_eq!(extract_current_version(""), None);
-        // Present, but not an assignment: must not be mistaken for the version.
-        assert_eq!(extract_current_version("let v = parse_version(CURRENT_VERSION);"), None);
-        assert_eq!(extract_current_version("const CURRENT_VERSION: &str = \"abc\";"), None);
+    fn the_embedded_version_is_the_crate_version() {
+        // The guard for the v0.4.11..v0.4.27 bug: the version resource was
+        // scraped out of main.rs, the literal there became
+        // `env!("CARGO_PKG_VERSION")`, and every exe after that shipped with
+        // 0.0.0 in its VersionInfo.
+        let v = read_current_version();
+        assert_ne!(v, "0.0.0", "build.rs could not read CARGO_PKG_VERSION");
+        assert_eq!(v, env!("CARGO_PKG_VERSION"));
+        assert!(version_numbers(&v)[0] > 0, "version {v} does not start at 1+");
     }
 
     #[test]

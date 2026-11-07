@@ -1,9 +1,9 @@
-﻿; ZipNest 0.4.27 native installer (NSIS Unicode)
+﻿; ZipNest 0.4.28 native installer (NSIS Unicode)
 Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.4.27"
+!define VERSION "0.4.28"
 ; This installer is a 32-bit process, so plain $PROGRAMFILES would resolve to
 ; "C:\Program Files (x86)" on 64-bit Windows. ZipNest ships as x64, so force
 ; the 64-bit location. InstallDirRegKey below still reads HKCU\...\ZipNest's
@@ -77,11 +77,22 @@ Unicode True
 !macroend
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.4.27_x64-setup.exe"
+OutFile "ZipNest_0.4.28_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
+
+; The setup exe's own version resource. Without this, right-click → 属性 →
+; 详细信息 on the downloaded installer shows no version at all, so two downloads
+; from different releases look identical in Explorer.
+VIProductVersion "0.4.28.0"
+VIAddVersionKey "ProductName" "ZipNest"
+VIAddVersionKey "FileDescription" "ZipNest 安装程序"
+VIAddVersionKey "FileVersion" "${VERSION}"
+VIAddVersionKey "ProductVersion" "${VERSION}"
+VIAddVersionKey "LegalCopyright" "MIT License"
+VIAddVersionKey "OriginalFilename" "ZipNest_${VERSION}_x64-setup.exe"
 
 ; The setup .exe's own icon, the MUI page icon, and the embedded uninstaller's
 ; icon. None of these existed before, so NSIS shipped its generic icon: that is
