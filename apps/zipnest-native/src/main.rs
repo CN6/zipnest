@@ -834,6 +834,13 @@ struct App {
     create_level: String,
     create_method: String,
     create_password: String,
+    /// Second entry of the same password. Typing an encrypted archive's key
+    /// wrong is not recoverable — the data is on disk and nobody holds it — so
+    /// the wizard asks twice before it starts.
+    create_password_confirm: String,
+    /// Set when 开始创建 was pressed on a destination that already exists: the
+    /// replacement is irreversible, so it takes a second, explicit click.
+    create_confirm_overwrite: bool,
     create_encrypt_names: bool,
     create_volume: String,
     create_custom_volume: String,
@@ -1020,6 +1027,8 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             create_level: "normal".into(),
             create_method: "auto".into(),
             create_password: String::new(),
+            create_password_confirm: String::new(),
+            create_confirm_overwrite: false,
             create_encrypt_names: false,
             create_volume: "off".into(),
             create_custom_volume: String::new(),
@@ -1313,6 +1322,13 @@ fn t(&self, key: &str) -> String {
                             }
                             .into(),
                         );
+                    } else if cancelled {
+                        // The user pressed 取消. Reporting it through the error
+                        // dialog told them the app had hit a problem when it had
+                        // done exactly what they asked, and the progress window
+                        // they had just dismissed came back with it.
+                        self.notice = Some("error.cancelled".into());
+                        self.job = None;
                     } else {
                         let key = err_key
                             .filter(|k| k.starts_with("error."))
@@ -1619,7 +1635,13 @@ fn t(&self, key: &str) -> String {
                 if theme::ghost_button(ui, &self.t("create.new")).clicked() {
                     self.show_create = true;
                     self.create_sources.clear();
-                    self.create_dest = self.current_archive_dir();
+                    // Empty, not the current archive's folder: the field holds a
+                    // whole archive path and `refresh_default_dest` only fills it
+                    // while it is blank. Seeding it with a bare directory left
+                    // "开始创建" enabled (a directory is absolute) and the job
+                    // failing for certain — and the field is read-only, so the
+                    // user could not even repair it by typing a file name.
+                    self.create_dest = String::new();
                 }
 let extract_enabled = self.archive.is_some();
                 let extract_btn = egui::Button::new(
@@ -2191,7 +2213,14 @@ let extract_enabled = self.archive.is_some();
                     self.t(&format!("settings.overwrite.{policy}"))
                 ));
             }
-            let can = !self.extract_dest.trim().is_empty();
+            let can = std::path::Path::new(self.extract_dest.trim()).is_absolute();
+            // A relative path is refused by the service too, but saying so here
+            // is the only place the user can act on it: a bare folder name used
+            // to extract into the process's own working directory and still
+            // report 完成.
+            if !self.extract_dest.trim().is_empty() && !can {
+                ui.colored_label(error_color(ui), self.t("extract.dest_absolute"));
+            }
             // Deleting the source is only safe when everything in it is being
             // extracted; a partial selection would lose the rest.
             let whole_archive = srcs.is_empty();
@@ -2523,8 +2552,29 @@ ui.horizontal(|ui| {
                 ui.label(&label);
                 let hint = self.t("help.password");
                 self.help_hint(ui, &label, &hint);
-                ui.text_edit_singleline(&mut self.create_password);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.create_password)
+                        .password(true)
+                        .desired_width(160.0),
+                );
             });
+            if !self.create_password.is_empty() {
+                // A typo here produces an archive nobody can open, and the
+                // mistake stays invisible until someone tries. The password
+                // itself is never stored anywhere, so there is no way to
+                // recover it after the fact.
+                ui.horizontal(|ui| {
+                    ui.label(self.t("create.password_confirm"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.create_password_confirm)
+                            .password(true)
+                            .desired_width(160.0),
+                    );
+                });
+                if self.create_password != self.create_password_confirm {
+                    ui.colored_label(error_color(ui), self.t("create.password_mismatch"));
+                }
+            }
             if self.create_format == "7z" {
                 let lbl = self.t("create.encrypt_names");
                 let hint = self.t("help.encrypt_names");
@@ -2557,13 +2607,59 @@ for v in ["off", "10m", "100m", "1g", "custom"] {
             // The engine resolves a relative destination against the process
             // working directory, which for a shell-launched window is nowhere
             // the user would look, so only a full path may start a job.
-            let dest_absolute = std::path::Path::new(self.create_dest.trim()).is_absolute();
-            let can = !self.create_sources.is_empty() && dest_absolute;
-            let clicked = ui
+            let dest = self.create_dest.trim().to_string();
+            let dest_absolute = std::path::Path::new(&dest).is_absolute();
+            let password_ok = self.create_password.is_empty()
+                || self.create_password == self.create_password_confirm;
+            let can = !self.create_sources.is_empty() && dest_absolute && password_ok;
+            // Writing over an existing archive replaces it atomically and
+            // irreversibly: `create.rs` renames the finished temp file onto the
+            // target, so the old one is gone whatever the user meant. The
+            // destination is pre-filled next to the sources, which is exactly
+            // where an earlier archive of the same name usually sits, so this
+            // is a realistic accident rather than a corner case.
+            let replaces = dest_absolute && std::path::Path::new(&dest).is_file();
+            let start = ui
                 .add_enabled(can, egui::Button::new(self.t("create.start")))
                 .clicked();
-            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if clicked || (can && enter) {
+            let enter = can && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // Pressing 开始创建 onto an existing archive arms the warning row
+            // below instead of launching, and the row stays until it is
+            // answered — a prompt that vanished on the next frame would be
+            // worse than none.
+            if replaces && (start || enter) {
+                self.create_confirm_overwrite = true;
+            }
+            if !replaces {
+                self.create_confirm_overwrite = false;
+            }
+            let mut confirmed = false;
+            if self.create_confirm_overwrite {
+                ui.separator();
+                ui.colored_label(
+                    error_color(ui),
+                    self.t("create.overwrite_warning").replace("{path}", &dest),
+                );
+                let (yes, no) = ui
+                    .horizontal(|ui| {
+                        (
+                            ui.button(self.t("create.overwrite_confirm")).clicked(),
+                            ui.button(self.t("create.overwrite_cancel")).clicked(),
+                        )
+                    })
+                    .inner;
+                if no {
+                    // Only the question is dismissed. Closing the wizard would
+                    // throw away the source list, and reopening it clears that
+                    // list too — so the answer to "not here" must leave the
+                    // work in place for the user to point somewhere else.
+                    self.create_confirm_overwrite = false;
+                }
+                confirmed = yes;
+            }
+            let proceed = can && (confirmed || ((start || enter) && !replaces));
+            if proceed {
+                self.create_confirm_overwrite = false;
                 let volume_bytes = match self.create_volume.as_str() {
                     "off" => None,
                     "10m" => Some(10 * 1024 * 1024),
@@ -3152,6 +3248,36 @@ fn pretty_size(b: u64) -> String {
     }
 }
 
+/// Does this path name an archive ZipNest can open?
+///
+/// A numeric suffix counts: the create wizard can split its output into
+/// numbered volumes, and the engine opens the set from any member. Recognising
+/// only the format extension meant dragging in a `.7z.001` the app had just
+/// produced offered to pack it into a new archive instead.
+fn looks_like_archive(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let ext = p
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if matches!(
+        ext.as_str(),
+        "zip" | "7z" | "rar" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "iso"
+    ) {
+        return true;
+    }
+    // `.001`, `.0001`, … — 7-Zip's Split handler needs at least two digits.
+    if ext.len() < 2 || !ext.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    // `<base>.<format>.001`: the part before the number has to be a format we
+    // know, otherwise `photo.001` (a raw photo sequence) would be swallowed.
+    p.file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .and_then(|s| s.rsplit('.').next().map(str::to_string))
+        .is_some_and(|inner| matches!(inner.as_str(), "zip" | "7z" | "rar" | "tar"))
+}
+
 /// Color + short label used on the painted file icon, by extension.
 fn entry_accent(ext: &str) -> (egui::Color32, Option<&'static str>) {
     match ext {
@@ -3370,15 +3496,7 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
                 .collect()
         });
         if !dropped.is_empty() {
-            let all_archives = dropped.iter().all(|p| {
-                std::path::Path::new(p)
-                    .extension()
-                    .map(|e| {
-                        let e = e.to_string_lossy().to_lowercase();
-                        matches!(e.as_str(), "zip" | "7z" | "rar" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "iso")
-                    })
-                    .unwrap_or(false)
-            });
+            let all_archives = dropped.iter().all(|p| looks_like_archive(p));
             if all_archives && dropped.len() == 1 {
                 self.open_archive(&dropped[0]);
             } else {
@@ -3459,7 +3577,18 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             self.open_picker = false;
             let archives = self.t("pick.archives");
             if let Some(path) = rfd::FileDialog::new()
-                .add_filter(archives, &["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "iso"])
+                // The numeric volume suffix is there because the create wizard
+                // can produce split archives: its second volume is
+                // `photos.7z.002`, and the engine opens the set from any
+                // member. Without these filters the app could not reopen what
+                // it had just written.
+                .add_filter(
+                    archives,
+                    &[
+                        "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "iso", "001", "002",
+                        "003",
+                    ],
+                )
                 .pick_file()
             {
                 self.open_archive(path.to_str().unwrap_or(""));
@@ -4099,7 +4228,30 @@ fn system_dpi_scale() -> f32 {
 
 #[cfg(test)]
 mod archive_path_tests {
-    use super::{breadcrumb_segments, join_dir, normalize_dir, parent_dir};
+    use super::{breadcrumb_segments, join_dir, looks_like_archive, normalize_dir, parent_dir};
+
+    #[test]
+    fn a_format_extension_is_an_archive() {
+        for p in ["a.zip", "A.7Z", r"C:\x\b.tar", r"C:\x\c.tar.gz", "d.iso"] {
+            assert!(looks_like_archive(p), "{p} should be an archive");
+        }
+    }
+
+    #[test]
+    fn a_numbered_volume_is_an_archive() {
+        // The create wizard writes these, so the app has to be able to open
+        // what it produced.
+        assert!(looks_like_archive(r"D:\out\photos.7z.001"));
+        assert!(looks_like_archive(r"D:\out\photos.7z.0002"));
+    }
+
+    #[test]
+    fn a_numbered_file_that_is_not_a_volume_is_not_an_archive() {
+        // `photo.001` is a raw camera frame, and plain `.txt` is not anything.
+        assert!(!looks_like_archive(r"D:\shots\photo.001"));
+        assert!(!looks_like_archive(r"D:\docs\notes.txt"));
+        assert!(!looks_like_archive(r"D:\docs\no-extension"));
+    }
 
     #[test]
     fn one_separator_shape_is_used_everywhere() {

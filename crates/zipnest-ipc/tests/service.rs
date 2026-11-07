@@ -157,6 +157,23 @@ fn extract_emits_progress_and_finished_ok() {
     std::fs::remove_dir_all(&dest).ok();
 }
 
+// A relative destination is resolved against the process working directory,
+// which for a shell launch is nowhere the user would look: the run would report
+// success and the files would be somewhere else. Refused up front.
+#[test]
+fn extract_refuses_a_relative_destination() {
+    let (svc, _events) = service();
+    let r = svc
+        .open_archive(fx("plain.zip").to_string_lossy().into(), None)
+        .unwrap();
+    for dest in ["out", r"out\sub", "."] {
+        let err = svc
+            .extract(r.id, vec![], dest.to_string(), Some("overwrite".into()), None)
+            .expect_err("a relative destination must not start a job");
+        assert_eq!(err.key, "error.io");
+    }
+}
+
 // Empty selection = "extract the whole archive". This is the one-click
 // "解压整个压缩包" path from the UI (no rows selected).
 #[test]

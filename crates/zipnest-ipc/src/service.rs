@@ -625,7 +625,13 @@ impl IpcService {
         password: Option<String>,
         delete_archive: bool,
     ) -> Result<u64, IpcError> {
-        if dest.trim().is_empty() {
+        // A relative destination is resolved by the OS against whatever working
+        // directory the process was started with — for an Explorer launch that
+        // is nowhere the user would look. The archive would be unpacked, the
+        // progress bar would say 完成, and the files would be somewhere else
+        // entirely. The create side has always required an absolute path; this
+        // is the same rule, enforced here so no caller can skip it.
+        if !std::path::Path::new(dest.trim()).is_absolute() {
             return Err(IpcError::new("error.io"));
         }
         let shared = self.lock_archive(id)?;

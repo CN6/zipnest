@@ -343,8 +343,18 @@ fn menu_key(target: MenuTarget) -> String {
     format!(r"{CLASSES}\{base}")
 }
 
-/// Context-menu ops for one target: a top-level "ZipNest" verb whose default
-/// action is open, plus a submenu "添加到压缩包…" that passes `--add "%1"`.
+/// Context-menu ops for one target.
+///
+/// A file gets a top-level "ZipNest" verb that opens it plus a submenu
+/// "添加到压缩包…" that passes `--add "%1"`.
+///
+/// A folder (and the desktop/folder background) gets **only** the packing verb,
+/// as its default action: a directory is not an archive, so there is nothing to
+/// open. It used to get the same "open" command as a file, which handed the
+/// launcher a directory — and `main()` accepts a path only when `is_file()`
+/// returns true, so the click started a process and then did nothing at all.
+/// A silently dead menu entry is worse than a missing one.
+///
 /// Files and folders get `%1`; the desktop/folder background gets `%V`.
 pub fn menu_ops(target: MenuTarget, exe: &std::path::Path) -> Vec<RegOp> {
     let (base, arg) = match target {
@@ -354,19 +364,36 @@ pub fn menu_ops(target: MenuTarget, exe: &std::path::Path) -> Vec<RegOp> {
     };
     let key = format!(r"{CLASSES}\{base}");
     let exe_q = quoted(exe);
-    vec![
-        // Top-level verb + default (open) command.
-        RegOp::set(key.clone(), Some("MUIVerb"), "ZipNest"),
-        RegOp::set(key.clone(), Some("Icon"), format!("{},0", exe_q)),
-        RegOp::set(format!(r"{key}\command"), None, format!("{exe_q} {arg}")),
-        // Submenu entry: "添加到压缩包…".
-        RegOp::set(
-            format!(r"{key}\shell\add"),
-            Some("MUIVerb"),
-            "添加到压缩包…",
-        ),
-        RegOp::set(format!(r"{key}\shell\add\command"), None, format!("{exe_q} --add {arg}")),
-    ]
+    let mut ops = vec![RegOp::set(
+        key.clone(),
+        Some("MUIVerb"),
+        match target {
+            MenuTarget::File => "ZipNest",
+            MenuTarget::Directory | MenuTarget::Background => "添加到压缩包…",
+        },
+    )];
+    ops.push(RegOp::set(key.clone(), Some("Icon"), format!("{},0", exe_q)));
+    match target {
+        MenuTarget::Directory | MenuTarget::Background => {
+            // Up to v0.4.27 a folder carried the same "open" default plus a
+            // `shell\add` submenu. That subkey is still on disk on an upgraded
+            // machine, and leaving it would show a second, duplicate 添加到压缩包…
+            // entry next to the new default one. Drop the whole subtree first:
+            // the ops below rebuilds this key from scratch.
+            ops.push(RegOp::DeleteKey { key: format!(r"{key}\shell") });
+            ops.push(RegOp::set(format!(r"{key}\command"), None, format!("{exe_q} --add {arg}")));
+        }
+        MenuTarget::File => {
+            ops.push(RegOp::set(format!(r"{key}\command"), None, format!("{exe_q} {arg}")));
+            ops.push(RegOp::set(format!(r"{key}\shell\add"), Some("MUIVerb"), "添加到压缩包…"));
+            ops.push(RegOp::set(
+                format!(r"{key}\shell\add\command"),
+                None,
+                format!("{exe_q} --add {arg}"),
+            ));
+        }
+    }
+    ops
 }
 
 pub fn file_menu_ops(exe: &std::path::Path) -> Vec<RegOp> {
@@ -900,30 +927,73 @@ mod tests {
     }
 
     #[test]
-    fn context_menu_uses_percent_one_and_percent_v() {
+    fn a_file_menu_entry_opens_the_file_and_offers_packing() {
         let file_ops = file_menu_ops(exe());
-        let bg_ops = background_menu_ops(exe());
-        let file = find_set(&file_ops, r"HKCU\Software\Classes\*\shell\ZipNest\command", None);
-        let bg = find_set(
-            &bg_ops,
-            r"HKCU\Software\Classes\Directory\Background\shell\ZipNest\command",
-            None,
+        assert_eq!(
+            find_set(&file_ops, r"HKCU\Software\Classes\*\shell\ZipNest\command", None),
+            Some(r#""C:\Program Files\ZipNest\ZipNest.exe" "%1""#)
         );
-        assert_eq!(file, Some(r#""C:\Program Files\ZipNest\ZipNest.exe" "%1""#));
-        assert_eq!(bg, Some(r#""C:\Program Files\ZipNest\ZipNest.exe" "%V""#));
         assert_eq!(
             find_set(&file_ops, r"HKCU\Software\Classes\*\shell\ZipNest", Some("MUIVerb")),
             Some("ZipNest")
         );
+        assert_eq!(
+            find_set(
+                &file_ops,
+                r"HKCU\Software\Classes\*\shell\ZipNest\shell\add\command",
+                None
+            ),
+            Some(r#""C:\Program Files\ZipNest\ZipNest.exe" --add "%1""#)
+        );
     }
 
     #[test]
-    fn directory_menu_uses_percent_one() {
+    fn a_folder_menu_entry_only_packs() {
+        // A directory is not an archive. Handing it to the launcher's "open"
+        // path produced a process that started and then did nothing, because
+        // `main()` accepts a positional path only when it is a file.
         let ops = directory_menu_ops(exe());
         assert_eq!(
             find_set(&ops, r"HKCU\Software\Classes\Directory\shell\ZipNest\command", None),
-            Some(r#""C:\Program Files\ZipNest\ZipNest.exe" "%1""#)
+            Some(r#""C:\Program Files\ZipNest\ZipNest.exe" --add "%1""#)
         );
+        assert_eq!(
+            find_set(&ops, r"HKCU\Software\Classes\Directory\shell\ZipNest", Some("MUIVerb")),
+            Some("添加到压缩包…")
+        );
+    }
+
+    #[test]
+    fn the_background_menu_entry_only_packs() {
+        let ops = background_menu_ops(exe());
+        assert_eq!(
+            find_set(
+                &ops,
+                r"HKCU\Software\Classes\Directory\Background\shell\ZipNest\command",
+                None
+            ),
+            Some(r#""C:\Program Files\ZipNest\ZipNest.exe" --add "%V""#)
+        );
+    }
+
+    #[test]
+    fn a_folder_menu_entry_drops_the_old_submenu() {
+        // Up to v0.4.27 a folder carried a `shell\add` subkey. Upgrading has to
+        // remove it, or the user sees two identical 添加到压缩包… entries.
+        for ops in [directory_menu_ops(exe()), background_menu_ops(exe())] {
+            let prefix = if ops.iter().any(|o| matches!(
+                o,
+                RegOp::SetValue { key, .. } if key.contains(r"Directory\Background")
+            )) {
+                r"HKCU\Software\Classes\Directory\Background\shell\ZipNest\shell"
+            } else {
+                r"HKCU\Software\Classes\Directory\shell\ZipNest\shell"
+            };
+            assert!(
+                ops.iter().any(|o| matches!(o, RegOp::DeleteKey { key } if key == prefix)),
+                "the stale submenu under {prefix} must be removed"
+            );
+        }
     }
 
     #[test]
