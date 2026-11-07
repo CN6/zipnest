@@ -87,7 +87,7 @@ fn visuals(mode: Mode) -> egui::Visuals {
     };
     let accent = if dark { ACCENT_DARK } else { ACCENT_LIGHT };
 
-    v.panel_fill = if dark { rgb(32, 32, 32) } else { rgb(250, 250, 250) };
+    v.panel_fill = if dark { rgb(32, 32, 32) } else { rgb(243, 243, 243) };
     v.window_fill = if dark { rgb(43, 43, 43) } else { rgb(255, 255, 255) };
     v.window_stroke = Stroke::new(1.0_f32, if dark { rgb(62, 62, 62) } else { rgb(230, 230, 230) });
     v.window_rounding = Rounding::same(10.0);
@@ -97,7 +97,11 @@ fn visuals(mode: Mode) -> egui::Visuals {
         spread: 0.0,
         color: Color32::from_black_alpha(if dark { 120 } else { 40 }),
     };
-    v.faint_bg_color = if dark { rgb(45, 45, 45) } else { rgb(245, 245, 245) };
+    // Zebra stripes and the status strip. In light mode this has to be darker
+    // than the white card it stripes: at 245 against a 255 card the rows were
+    // only 4% apart and the alternation was invisible, which is most of why the
+    // list looked washed out.
+    v.faint_bg_color = if dark { rgb(37, 37, 37) } else { rgb(247, 247, 247) };
     v.extreme_bg_color = if dark { rgb(26, 26, 26) } else { rgb(255, 255, 255) };
     v.selection.bg_fill = if dark { rgb(38, 79, 120) } else { rgb(205, 229, 255) };
     v.selection.stroke = Stroke::new(1.0_f32, accent);
@@ -173,10 +177,29 @@ fn tune(style: &mut egui::Style, mode: Mode) {
 
 /// Primary/accent button (filled accent, white text) for the toolbar.
 pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    let accent = ui.visuals().hyperlink_color;
-    ui.add(
-        egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE))
-            .fill(accent)
+    primary_button_enabled(ui, text, true)
+}
+
+/// The same button, but a disabled one actually looks disabled.
+///
+/// `ui.add_enabled(false, …)` greys the text it would have drawn, but an
+/// explicit `.fill()` on the button overrides the frame egui would have greyed —
+/// so a dead accent button kept its blue fill and only its label faded, which
+/// read as "this is the main action, and it did nothing when I clicked it".
+/// Picking the fill from `enabled` here is what fixes that.
+pub fn primary_button_enabled(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+    let (fill, ink) = if enabled {
+        (ui.visuals().hyperlink_color, Color32::WHITE)
+    } else {
+        (
+            ui.visuals().widgets.inactive.weak_bg_fill,
+            ui.visuals().weak_text_color(),
+        )
+    };
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(text).color(ink))
+            .fill(fill)
             .rounding(Rounding::same(6.0))
             .stroke(Stroke::NONE),
     )
@@ -196,6 +219,39 @@ pub fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     .inner
 }
 
+/// One option in a set of mutually exclusive choices — format, compression
+/// level, theme, and so on.
+///
+/// Every one of these used to be an `egui::selectable_label`, which paints a
+/// grey slab on *every* unselected option; five of them in a row turned the
+/// wizard into a wall of boxes, and the selected one was only faintly bluer.
+/// A chip is quiet until chosen and unmistakable when chosen.
+pub fn chip(ui: &mut egui::Ui, selected: bool, text: &str) -> egui::Response {
+    let accent = ui.visuals().hyperlink_color;
+    // The dark accent is a pale blue: white on it is unreadable, near-black is
+    // not.
+    let on_accent = if ui.visuals().dark_mode {
+        rgb(20, 20, 20)
+    } else {
+        Color32::WHITE
+    };
+    let idle_fill = ui.visuals().widgets.inactive.weak_bg_fill;
+    let idle_stroke = ui.visuals().widgets.inactive.bg_stroke.color;
+    let idle_text = ui.visuals().text_color();
+    let (fill, text_color, stroke) = if selected {
+        (accent, on_accent, Stroke::NONE)
+    } else {
+        (idle_fill, idle_text, Stroke::new(1.0_f32, idle_stroke))
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new(text).size(12.5).color(text_color))
+            .fill(fill)
+            .stroke(stroke)
+            .rounding(Rounding::same(6.0))
+            .min_size(egui::vec2(0.0, 24.0)),
+    )
+}
+
 /// A toolbar row drawn as a card strip matching the current theme.
 pub fn top_bar(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     let fill = ui.visuals().window_fill;
@@ -204,17 +260,27 @@ pub fn top_bar(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
         .inner_margin(Margin::symmetric(14.0, 10.0))
         .rounding(Rounding::ZERO)
         .stroke(Stroke::NONE)
-        .show(ui, add_contents);
+        .show(ui, |ui| {
+            // A frame is only as wide as what it holds, so a toolbar whose
+            // contents happened to be narrower than the window left a strip of
+            // the panel's own fill to the right of it — visible as a toolbar
+            // that stopped short of the window edge.
+            ui.set_min_width(ui.available_width());
+            add_contents(ui);
+        });
 }
 
 /// Bottom status bar strip.
+///
+/// No border: the `TopBottomPanel` it lives in already draws the hairline that
+/// separates it from the list. The frame's own stroke drew the other three
+/// sides too, which boxed the strip in and left a second line a few points from
+/// the card's border.
 pub fn status_bar(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-    let fill = ui.visuals().faint_bg_color;
-    let stroke = ui.visuals().widgets.inactive.bg_stroke.color;
+    let fill = ui.visuals().window_fill;
     egui::Frame::none()
         .fill(fill)
         .inner_margin(Margin::symmetric(14.0, 6.0))
-        .stroke(Stroke::new(1.0_f32, stroke))
         .show(ui, add_contents);
 }
 
@@ -224,31 +290,123 @@ pub fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     let stroke = ui.visuals().widgets.inactive.bg_stroke.color;
     egui::Frame::none()
         .fill(fill)
-        .inner_margin(Margin::symmetric(8.0, 6.0))
+        .inner_margin(Margin::symmetric(10.0, 8.0))
         .rounding(Rounding::same(8.0))
         .stroke(Stroke::new(1.0_f32, stroke))
         .show(ui, add_contents);
 }
 
+/// The label column of a form row: fixed width, right-aligned, so the controls
+/// under it all start at the same x. Left to themselves every row sized itself
+/// to its own caption and the wizard's controls stepped in and out by a few
+/// points per row — the "something looks off" that is hard to name.
+pub const FORM_LABEL_W: f32 = 84.0;
 
-/// A small section heading used inside dialogs, with a hairline under it.
+/// The "?" slot, reserved on every row whether or not it holds a mark. Without
+/// the reservation the rows that have a hint start their controls 22 points
+/// further right than the ones that do not, and the column zigzags again.
+const HELP_SLOT_W: f32 = 22.0;
+
+/// Start a form row: the right-aligned caption in the fixed column, the "?"
+/// slot, then the controls the caller adds.
+///
+/// The slot is reserved on every row whether or not `has_help` fills it: without
+/// that, the rows carrying a hint would start their controls 22 points further
+/// right than the ones that do not, and the column zigzags again — which is the
+/// fault the fixed caption column exists to remove. Returns the row's own result
+/// and the help mark, if this row has one to decorate.
+pub fn form_row<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    has_help: bool,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> (R, Option<egui::Response>) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [FORM_LABEL_W, 20.0],
+            egui::Label::new(
+                egui::RichText::new(label)
+                    .size(12.5)
+                    .color(ui.visuals().weak_text_color()),
+            )
+            .halign(egui::Align::RIGHT)
+            .truncate(),
+        );
+        let mark = if has_help {
+            let accent = ui.visuals().hyperlink_color;
+            let fill = ui.visuals().widgets.inactive.weak_bg_fill;
+            let stroke = ui.visuals().widgets.inactive.bg_stroke.color;
+            Some(
+                ui.add_sized(
+                    [HELP_SLOT_W - 8.0, 15.0],
+                    egui::Button::new(egui::RichText::new("?").size(11.0).color(accent))
+                        .rounding(Rounding::same(7.0))
+                        .fill(fill)
+                        .stroke(Stroke::new(1.0_f32, stroke)),
+                )
+                .on_hover_cursor(egui::CursorIcon::Help),
+            )
+        } else {
+            ui.add_space(HELP_SLOT_W);
+            None
+        };
+        let out = add_contents(ui);
+        (out, mark)
+    })
+    .inner
+}
+
+
+/// A small section heading used inside dialogs.
 pub fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(2.0);
+    // Breathing room above: the previous section's last row and this heading
+    // otherwise sit the same distance apart as two rows of that section, so the
+    // heading does not read as the start of anything.
+    ui.add_space(10.0);
     ui.label(
         egui::RichText::new(title)
             .size(12.0)
             .strong()
             .color(ui.visuals().weak_text_color()),
     );
+    ui.add_space(2.0);
 }
 
 /// Dimmed helper text (hints, footnotes).
 pub fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.label(
-        egui::RichText::new(text)
-            .size(12.0)
-            .color(ui.visuals().weak_text_color()),
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(11.5)
+                .color(ui.visuals().weak_text_color()),
+        )
+        // Explicit: inside the `ui.horizontal` below egui would otherwise give
+        // the label its full unwrapped width and paint it past the window edge —
+        // which is what every English hint did until this was set.
+        .wrap(),
     );
+}
+
+/// The same, indented to the control column so it reads as a note on the
+/// `form_row` above it rather than as the start of the next one.
+pub fn hint_indented(ui: &mut egui::Ui, text: &str) {
+    ui.horizontal(|ui| {
+        let indent = FORM_LABEL_W + HELP_SLOT_W + 8.0;
+        ui.add_space(indent);
+        // The width is pinned to what is left: a `horizontal` ui does not wrap
+        // on its own, and a hint long enough to need it (every English one) ran
+        // off the right edge of the window.
+        let w = (ui.available_width()).max(60.0);
+        ui.add_sized(
+            [w, ui.spacing().interact_size.y.min(15.0)],
+            egui::Label::new(
+                egui::RichText::new(text)
+                    .size(11.5)
+                    .color(ui.visuals().weak_text_color()),
+            )
+            .wrap(),
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
