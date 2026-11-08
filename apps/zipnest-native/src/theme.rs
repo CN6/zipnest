@@ -8,7 +8,7 @@
 //! the amber folder and the file-type accents.
 
 use eframe::egui;
-use egui::{Color32, Margin, Rounding, Stroke};
+use egui::{Color32, CornerRadius, Margin, Stroke};
 
 /// Accent used for primary actions and links (Windows 11 blue).
 const ACCENT_LIGHT: Color32 = Color32::from_rgb(0, 103, 192);
@@ -42,7 +42,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         let key = format!("sys-{file}");
         fonts
             .font_data
-            .insert(key.clone(), egui::FontData::from_owned(bytes));
+            .insert(key.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
         for family in families {
             let list = fonts.families.entry(family.clone()).or_default();
             if !list.contains(&key) {
@@ -118,11 +118,11 @@ fn visuals(mode: Mode) -> egui::Visuals {
             rgb(230, 230, 230)
         },
     );
-    v.window_rounding = Rounding::same(10.0);
+    v.window_corner_radius = CornerRadius::same(10);
     v.window_shadow = egui::epaint::Shadow {
-        offset: egui::vec2(0.0, 8.0),
-        blur: 24.0,
-        spread: 0.0,
+        offset: [0, 8],
+        blur: 24,
+        spread: 0,
         color: Color32::from_black_alpha(if dark { 120 } else { 40 }),
     };
     // Zebra stripes and the status strip. In light mode this has to be darker
@@ -197,11 +197,11 @@ fn tune(style: &mut egui::Style, mode: Mode) {
     // Show tooltips at once: the default half-second delay made the "?" hints
     // look like they did nothing at all when the pointer was only passing over.
     style.interaction.tooltip_delay = 0.0;
-    style.spacing.window_margin = Margin::same(14.0);
-    style.spacing.menu_margin = Margin::same(6.0);
-    style.visuals.widgets.inactive.rounding = Rounding::same(6.0);
-    style.visuals.widgets.hovered.rounding = Rounding::same(6.0);
-    style.visuals.widgets.active.rounding = Rounding::same(6.0);
+    style.spacing.window_margin = Margin::same(14);
+    style.spacing.menu_margin = Margin::same(6);
+    style.visuals.widgets.inactive.corner_radius = CornerRadius::same(6);
+    style.visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
+    style.visuals.widgets.active.corner_radius = CornerRadius::same(6);
     let dark = mode.is_dark();
     style.visuals.widgets.inactive.bg_stroke = Stroke::new(
         1.0_f32,
@@ -265,7 +265,7 @@ pub fn primary_button_enabled(ui: &mut egui::Ui, text: &str, enabled: bool) -> e
     ui.add(
         egui::Button::new(egui::RichText::new(text).color(ink))
             .fill(fill)
-            .rounding(Rounding::same(6.0))
+            .corner_radius(CornerRadius::same(6))
             .stroke(Stroke::NONE)
             .sense(sense),
     )
@@ -313,7 +313,7 @@ pub fn chip(ui: &mut egui::Ui, selected: bool, text: &str) -> egui::Response {
         egui::Button::new(egui::RichText::new(text).size(12.5).color(text_color))
             .fill(fill)
             .stroke(stroke)
-            .rounding(Rounding::same(6.0))
+            .corner_radius(CornerRadius::same(6))
             .min_size(egui::vec2(0.0, CONTROL_H)),
     )
 }
@@ -321,10 +321,10 @@ pub fn chip(ui: &mut egui::Ui, selected: bool, text: &str) -> egui::Response {
 /// A toolbar row drawn as a card strip matching the current theme.
 pub fn top_bar(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     let fill = ui.visuals().window_fill;
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(fill)
-        .inner_margin(Margin::symmetric(14.0, 10.0))
-        .rounding(Rounding::ZERO)
+        .inner_margin(Margin::symmetric(14, 10))
+        .corner_radius(CornerRadius::ZERO)
         .stroke(Stroke::NONE)
         .show(ui, |ui| {
             // A frame is only as wide as what it holds, so a toolbar whose
@@ -344,9 +344,9 @@ pub fn top_bar(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
 /// the card's border.
 pub fn status_bar(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     let fill = ui.visuals().window_fill;
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(fill)
-        .inner_margin(Margin::symmetric(14.0, 6.0))
+        .inner_margin(Margin::symmetric(14, 6))
         .show(ui, add_contents);
 }
 
@@ -354,10 +354,10 @@ pub fn status_bar(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
 pub fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     let fill = ui.visuals().window_fill;
     let stroke = ui.visuals().widgets.inactive.bg_stroke.color;
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(fill)
-        .inner_margin(Margin::symmetric(10.0, 8.0))
-        .rounding(Rounding::same(8.0))
+        .inner_margin(Margin::symmetric(10, 8))
+        .corner_radius(CornerRadius::same(8))
         .stroke(Stroke::new(1.0_f32, stroke))
         .show(ui, add_contents);
 }
@@ -414,7 +414,7 @@ pub fn field<R>(
             mark = Some(
                 ui.add(
                     egui::Button::new(egui::RichText::new("?").size(10.5).color(accent))
-                        .rounding(Rounding::same(7.0))
+                        .corner_radius(CornerRadius::same(7))
                         .min_size(egui::vec2(15.0, 15.0))
                         .fill(fill)
                         .stroke(Stroke::new(1.0_f32, stroke)),
@@ -451,7 +451,7 @@ pub fn check_field(
             mark = Some(
                 ui.add(
                     egui::Button::new(egui::RichText::new("?").size(10.5).color(accent))
-                        .rounding(Rounding::same(7.0))
+                        .corner_radius(CornerRadius::same(7))
                         .min_size(egui::vec2(15.0, 15.0))
                         .fill(fill)
                         .stroke(Stroke::new(1.0_f32, stroke)),
@@ -477,10 +477,10 @@ pub fn caption(ui: &mut egui::Ui, label: &str) {
 /// page never becomes a wall of evenly spaced, unrelated lines.
 pub fn group(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     let stroke = ui.visuals().widgets.inactive.bg_stroke.color;
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(ui.visuals().window_fill)
-        .inner_margin(Margin::symmetric(16.0, 14.0))
-        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::symmetric(16, 14))
+        .corner_radius(CornerRadius::same(6))
         .stroke(Stroke::new(1.0_f32, stroke))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());

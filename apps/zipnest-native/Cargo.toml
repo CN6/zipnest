@@ -7,8 +7,8 @@ description = "ZipNest native UI (egui) — no WebView2"
 
 [dependencies]
 zipnest-ipc = { path = "../../crates/zipnest-ipc" }
-eframe = "0.29"
-egui = "0.29"
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit", "links", "system_fonts", "x11", "wayland"] }
+egui = "0.37"
 rfd = "0.18"
 ureq = "3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

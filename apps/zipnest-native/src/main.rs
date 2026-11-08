@@ -1145,8 +1145,9 @@ impl App {
         // dragging, keyboard navigation and selection untouched, and it only
         // affects real notches: touchpad / high-resolution `Point` deltas are
         // already proportional and stay as they are.
-        cc.egui_ctx
-            .options_mut(|o| o.line_scroll_speed = scroll_points_per_notch(Self::ROW_H));
+        cc.egui_ctx.options_mut(|o| {
+            o.input_options.line_scroll_speed = scroll_points_per_notch(Self::ROW_H)
+        });
         let lang = match settings.language.as_str() {
             "zh-CN" => "zh-CN",
             "en-US" => "en-US",
@@ -2194,7 +2195,7 @@ impl App {
                     let clicked = ui
                         .interact(
                             rect,
-                            ui.id().with(("sort-column", slot)),
+                            ui.scope_id().with(("sort-column", slot)),
                             egui::Sense::click(),
                         )
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -2331,7 +2332,7 @@ impl App {
                         };
                         let dark = visuals.dark_mode;
                         let painter = ui.painter().clone();
-                        painter.rect_filled(rect, egui::Rounding::same(4.0), bg);
+                        painter.rect_filled(rect, egui::CornerRadius::same(4), bg);
 
                         let icon_rect = egui::Rect::from_min_size(
                             rect.min + egui::vec2(6.0, 3.0),
@@ -2623,7 +2624,7 @@ impl App {
                     egui::RichText::new(self.t("app.open")).color(egui::Color32::WHITE),
                 )
                 .fill(accent)
-                .rounding(egui::Rounding::same(6.0))
+                .corner_radius(egui::CornerRadius::same(6))
                 .stroke(egui::Stroke::NONE),
             )
             .clicked();
@@ -2696,7 +2697,7 @@ impl App {
         }
         let srcs = self.selected.clone();
         let t = self.t("extract.title");
-        let center = ctx.screen_rect().center() - egui::vec2(215.0, 110.0);
+        let center = ctx.content_rect().center() - egui::vec2(215.0, 110.0);
         egui::Window::new(t)
             .collapsible(false)
             .resizable(false)
@@ -2937,7 +2938,7 @@ impl App {
         let mut submit = false;
         let mut cancel = false;
         let title = self.t("password.title");
-        let center = ctx.screen_rect().center() - egui::vec2(190.0, 60.0);
+        let center = ctx.content_rect().center() - egui::vec2(190.0, 60.0);
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
@@ -3065,12 +3066,16 @@ impl App {
         let finished = ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("zipnest-create-wizard"),
             builder,
-            |ctx, class| {
+            |ui, class| {
+                // The callback hands us a `&mut Ui` since 0.34; the window
+                // commands and the nested containers still take a `&Context`.
+                let ctx = ui.ctx().clone();
+                let embedded = class == egui::ViewportClass::EmbeddedWindow;
                 // Windows creates the new window *behind* the main one, so the
                 // first frame of each opening asks for the front. A fresh
                 // window has never been seen, and appearing underneath the
                 // app is the same occlusion this window exists to escape.
-                if !self.create_raised && class != egui::ViewportClass::Embedded {
+                if !self.create_raised && !embedded {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     self.create_raised = true;
                 }
@@ -3078,26 +3083,24 @@ impl App {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     return true;
                 }
-                if class != egui::ViewportClass::Embedded {
+                if !embedded {
                     // eframe clears an immediate viewport with `[0,0,0,0]`
                     // rather than the app's clear colour, so anything not
                     // painted here would be transparent and keep whatever the
                     // compositor put behind it.
-                    let rect = ctx.screen_rect();
-                    ctx.layer_painter(egui::LayerId::background()).rect_filled(
-                        rect,
-                        0.0,
-                        ctx.style().visuals.panel_fill,
-                    );
+                    let rect = ui.max_rect();
+                    let fill = ctx.global_style().visuals.panel_fill;
+                    ctx.layer_painter(egui::LayerId::background())
+                        .rect_filled(rect, 0.0, fill);
                 }
                 let body = |ui: &mut egui::Ui| self.create_wizard_ui(ui);
-                if class == egui::ViewportClass::Embedded {
+                if embedded {
                     egui::Window::new(title.clone())
                         .collapsible(false)
                         .resizable(true)
                         .vscroll(true)
                         .default_width(460.0)
-                        .show(ctx, body)
+                        .show(&ctx, body)
                         .and_then(|r| r.inner)
                         .unwrap_or(false)
                 } else {
@@ -3107,7 +3110,7 @@ impl App {
                     // reachable rather than falling off the bottom edge — the
                     // exact complaint that made this a separate window.
                     egui::CentralPanel::default()
-                        .show(ctx, |ui| {
+                        .show(ui, |ui| {
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, body)
@@ -3514,8 +3517,8 @@ impl App {
     fn settings_body(&mut self, ui: &mut egui::Ui) {
         // Padding only: the page owns the whole window now, so it needs the
         // gutters the card used to supply, but not its border or rounding.
-        egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(24.0, 8.0))
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(24, 8))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -3927,22 +3930,23 @@ impl App {
     /// wrong, and why it briefly grew a window of its own before this.
     ///
     /// Returns `(save, close)`.
-    fn settings_page(&mut self, ctx: &egui::Context) -> (bool, bool) {
+    fn settings_page(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
+        let ctx = ui.ctx().clone();
         // The panel ids are the archive page's own ("toolbar" / "status"): only
         // one of the two branches draws per frame, so the page simply takes the
         // seats over instead of stacking extra bars underneath them.
-        let back = egui::TopBottomPanel::top("toolbar")
-            .show(ctx, |ui| {
+        let back = egui::Panel::top("toolbar")
+            .show(ui, |ui| {
                 ui.add_space(4.0);
                 let back = self.settings_header(ui);
                 ui.add_space(4.0);
                 back
             })
             .inner;
-        let (save, close) = egui::TopBottomPanel::bottom("status")
-            .show(ctx, |ui| self.settings_footer(ui))
+        let (save, close) = egui::Panel::bottom("status")
+            .show(ui, |ui| self.settings_footer(ui))
             .inner;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             // No card: Settings fills the window edge to edge, like a page of
             // the app rather than a panel floating inside it. The rounded,
             // bordered surface it used to sit on read as "a second window
@@ -3951,8 +3955,7 @@ impl App {
             self.settings_body(ui);
         });
         // Escape leaves, Enter saves — what a settings surface is expected to do.
-        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-        let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));        let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         (save || enter, close || back || escape)
     }
 
@@ -4001,7 +4004,7 @@ impl App {
                 egui::Window::new(title)
                     .collapsible(false)
                     .default_width(380.0)
-                    .default_pos(ctx.screen_rect().center() - egui::vec2(190.0, 60.0))
+                    .default_pos(ctx.content_rect().center() - egui::vec2(190.0, 60.0))
                     .open(&mut open)
                     .show(ctx, |ui| {
                         ui.label(found);
@@ -4083,9 +4086,9 @@ impl App {
         };
         let mut cancel = false;
         let mut close = false;
-        let center = ctx.screen_rect().center() - egui::vec2(190.0, 70.0);
+        let center = ctx.content_rect().center() - egui::vec2(190.0, 70.0);
         egui::Window::new(j.title.clone())
-            .id(egui::Id::new("zipnest-job-window"))
+            .id(egui::Id::unique("zipnest-job-window"))
             .collapsible(false)
             .resizable(false)
             .default_width(360.0)
@@ -4334,7 +4337,11 @@ fn parse_volume(input: &str) -> Option<u64> {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    // 0.34 split the old `update` into `logic` (no ui, may run while hidden)
+    // and `ui`. Everything this app does before drawing — polling jobs, taking
+    // launch requests, syncing the window geometry — belongs in `logic` so it
+    // keeps running while the window is hidden.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs();
 
         if self.show_on_first_frame {
@@ -4446,7 +4453,7 @@ impl eframe::App for App {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .map(|f| f.path().to_path_buf())
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect()
         });
@@ -4467,7 +4474,7 @@ impl eframe::App for App {
         // never navigates the browser behind the dialog.
         if self.archive.is_some()
             && !self.cwd.is_empty()
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && ctx.input(|i| i.key_pressed(egui::Key::Backspace))
         {
             self.go_up();
@@ -4484,32 +4491,40 @@ impl eframe::App for App {
             && !self.show_extract
             && !self.show_create
             && self.password_prompt.is_none()
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A))
         {
             self.selected = self.rows.iter().map(|e| e.path.clone()).collect();
             self.anchor = if self.rows.is_empty() { None } else { Some(0) };
         }
 
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // The panels below are shown *inside* the root ui, which is what 0.34
+        // changed them to take. The floating windows still want the context.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+
         if self.show_settings {
             // Settings is a page of this window, so it draws *instead of* the
             // archive view rather than on top of it.
-            let (save, close) = self.settings_page(ctx);
+            let (save, close) = self.settings_page(ui);
             if save {
                 self.save_settings();
             } else if close {
                 self.show_settings = false;
             }
         } else {
-            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            egui::Panel::top("toolbar").show(ui, |ui| {
                 ui.add_space(4.0);
                 self.toolbar(ui);
                 ui.add_space(4.0);
             });
-            egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            egui::Panel::bottom("status").show(ui, |ui| {
                 self.statusbar(ui);
             });
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 // Browser only — the preview side panel was removed (it showed
                 // raw hex/text that users found noisy; not worth the space).
                 if self.archive.is_none() {
@@ -4671,12 +4686,12 @@ fn paint_entry_icon(p: &egui::Painter, icon_rect: egui::Rect, e: &EntryDto, dark
         let amber = egui::Color32::from_rgb(236, 184, 70);
         p.rect_filled(
             egui::Rect::from_min_size(icon_rect.min + egui::vec2(3.0, 5.0), egui::vec2(16.0, 12.0)),
-            egui::Rounding::same(2.0),
+            egui::CornerRadius::same(2),
             amber,
         );
         p.rect_filled(
             egui::Rect::from_min_size(icon_rect.min + egui::vec2(3.0, 3.0), egui::vec2(6.0, 3.0)),
-            egui::Rounding::same(1.0),
+            egui::CornerRadius::same(1),
             amber,
         );
         return;
@@ -4700,15 +4715,16 @@ fn paint_entry_icon(p: &egui::Painter, icon_rect: egui::Rect, e: &EntryDto, dark
             egui::Color32::from_rgb(160, 160, 170),
         )
     };
-    p.rect_filled(page, egui::Rounding::same(2.0), fill);
+    p.rect_filled(page, egui::CornerRadius::same(2), fill);
     p.rect_stroke(
         page,
-        egui::Rounding::same(2.0),
+        egui::CornerRadius::same(2),
         egui::Stroke::new(1.0_f32, outline),
+        egui::StrokeKind::Inside,
     );
     p.rect_filled(
         egui::Rect::from_min_size(page.min + egui::vec2(2.0, 2.0), egui::vec2(10.0, 4.0)),
-        egui::Rounding::same(1.0),
+        egui::CornerRadius::same(1),
         accent,
     );
     if let Some(txt) = label {
@@ -5027,7 +5043,7 @@ fn paint_lock(p: &egui::Painter, center: egui::Pos2) {
     let red = egui::Color32::from_rgb(200, 60, 60);
     p.rect_filled(
         egui::Rect::from_center_size(center, egui::vec2(7.0, 6.0)),
-        egui::Rounding::same(1.0),
+        egui::CornerRadius::same(1),
         red,
     );
     p.circle_stroke(
@@ -5053,7 +5069,7 @@ fn paint_elided(
         text: text.to_string(),
         sections: vec![egui::text::LayoutSection {
             leading_space: 0.0,
-            byte_range: 0..text.len(),
+            byte_range: egui::text::ByteIndex(0)..egui::text::ByteIndex(text.len()),
             format: egui::TextFormat {
                 font_id: font,
                 color,
@@ -5068,7 +5084,9 @@ fn paint_elided(
         },
         ..Default::default()
     };
-    let galley = ui.fonts(|f| f.layout_job(job));
+    // 0.37 hands out a shared `FontsView`, so layout through the painter,
+    // which takes the mutable borrow egui already holds for this frame.
+    let galley = ui.painter().layout_job(job);
     // `anchor_size` anchors around a point, so pick the point the alignment
     // refers to (left edge, right edge or centre of the cell).
     let anchor = if align == egui::Align2::LEFT_CENTER {
