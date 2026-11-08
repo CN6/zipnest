@@ -176,16 +176,22 @@ fn is_newer(tag: &str) -> bool {
 }
 
 fn fetch_latest() -> Result<(String, String), String> {
-    let body = ureq::get(UPDATE_API)
-        .set("User-Agent", &UPDATE_UA)
-        // Without a timeout the check waits for Windows' TCP timeouts — on a
-        // machine whose network drops packets instead of refusing them, the
-        // spinner in the status bar never stopped. Both bounds are short
-        // because this is a background courtesy, never something to wait on.
-        .timeout(std::time::Duration::from_secs(10))
+    // ureq 3 takes the timeout on the agent, not on the request, so every call
+    // builds one. Without a timeout the check waits for Windows' TCP timeouts —
+    // on a machine whose network drops packets instead of refusing them, the
+    // spinner in the status bar never stopped. Both bounds are short because
+    // this is a background courtesy, never something to wait on.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .into();
+    let body = agent
+        .get(UPDATE_API)
+        .header("User-Agent", UPDATE_UA.as_str())
         .call()
         .map_err(|e| e.to_string())?
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| e.to_string())?;
     let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     let tag = v["tag_name"].as_str().unwrap_or("").to_string();
