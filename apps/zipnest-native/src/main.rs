@@ -3955,7 +3955,8 @@ impl App {
             self.settings_body(ui);
         });
         // Escape leaves, Enter saves — what a settings surface is expected to do.
-        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));        let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         (save || enter, close || back || escape)
     }
 
