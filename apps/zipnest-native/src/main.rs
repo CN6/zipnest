@@ -157,7 +157,10 @@ enum UpdateState {
     #[default]
     Idle,
     Checking,
-    Found { tag: String, url: String },
+    Found {
+        tag: String,
+        url: String,
+    },
     Failed(String),
 }
 
@@ -251,14 +254,24 @@ fn open_with_default_app(path: &str) {
         /// `SW_SHOWNORMAL`.
         const SW_SHOWNORMAL: i32 = 1;
         let wide = |s: &str| -> Vec<u16> {
-            std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+            std::ffi::OsStr::new(s)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
         };
         let op = wide("open");
         let file = wide(path);
         // Safe: two NUL-terminated buffers that outlive the call, and a null
         // parent window, which is what "no owner" means for the shell.
         unsafe {
-            ShellExecuteW(0, op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
+            ShellExecuteW(
+                0,
+                op.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            );
         }
     }
     #[cfg(not(windows))]
@@ -312,7 +325,10 @@ fn windows_version_string() -> String {
         csd: [0; 128],
     };
     if unsafe { RtlGetVersion(&mut info) } == 0 {
-        format!("Windows {}.{}.{} ({arch})", info.major, info.minor, info.build)
+        format!(
+            "Windows {}.{}.{} ({arch})",
+            info.major, info.minor, info.build
+        )
     } else {
         format!("Windows (build unknown) ({arch})")
     }
@@ -362,10 +378,7 @@ fn cap_cli_runtime() {
 ///   `--register-integration`) re-applies it, so a lost registration comes back
 ///   on reinstall; without `force` (a normal launch) nothing is touched, so a
 ///   deliberate opt-out is never undone.
-fn integration_plan(
-    settings: &zipnest_ipc::Settings,
-    force: bool,
-) -> Option<ShellOptions> {
+fn integration_plan(settings: &zipnest_ipc::Settings, force: bool) -> Option<ShellOptions> {
     if !force && settings.integration_applied {
         return None;
     }
@@ -398,7 +411,10 @@ fn integration_plan(
 /// writing our `ProgId` into `HKCU\Software\Classes` is not enough once Windows
 /// has recorded somebody else's handler for `.zip`, so
 /// [`zipnest_ipc::user_choice::claim_all`] replaces that record with a valid one.
-fn apply_integration(svc: &IpcService, force: bool) -> Option<zipnest_ipc::shell::ShellRegisterResult> {
+fn apply_integration(
+    svc: &IpcService,
+    force: bool,
+) -> Option<zipnest_ipc::shell::ShellRegisterResult> {
     let settings = svc.settings_get().ok()?;
     let opts = integration_plan(&settings, force)?;
     let exe = std::env::current_exe().unwrap_or_default();
@@ -568,7 +584,6 @@ impl JobState {
     }
 }
 
-
 fn load_app_icon() -> Option<egui::IconData> {
     let img = image::load_from_memory(include_bytes!("assets/icon.png")).ok()?;
     let rgba = img.to_rgba8();
@@ -599,16 +614,15 @@ fn main() -> Result<(), eframe::Error> {
         let unreleased = release_default_formats(&[]);
         let mut ops = zipnest_ipc::shell::context_menu_removals();
         ops.extend(zipnest_ipc::shell::assoc_removals());
-        let cleaned = match zipnest_ipc::shell::ShellApplier::run(
-            &zipnest_ipc::shell::WindowsRegistry,
-            &ops,
-        ) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("ZipNest: shell cleanup failed: {e}");
-                false
-            }
-        };
+        let cleaned =
+            match zipnest_ipc::shell::ShellApplier::run(&zipnest_ipc::shell::WindowsRegistry, &ops)
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("ZipNest: shell cleanup failed: {e}");
+                    false
+                }
+            };
         // A leftover `FileExts` record the user does not own is exactly the
         // dangling-ProgID bug this fixes, so surface it as a failure too.
         return if cleaned && unreleased.is_empty() {
@@ -631,7 +645,10 @@ fn main() -> Result<(), eframe::Error> {
             Arc::new(|_: &str, _: serde_json::Value| {}),
             std::time::Duration::ZERO,
         );
-        let already_applied = svc.settings_get().map(|s| s.integration_applied).unwrap_or(false);
+        let already_applied = svc
+            .settings_get()
+            .map(|s| s.integration_applied)
+            .unwrap_or(false);
         let applied = apply_integration(&svc, true);
         return if already_applied || applied.is_some() {
             Ok(())
@@ -765,7 +782,13 @@ fn main() -> Result<(), eframe::Error> {
         "ZipNest",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(App::new(cc, launch_open, launch_add, launch_extract, is_primary)))
+            Ok(Box::new(App::new(
+                cc,
+                launch_open,
+                launch_add,
+                launch_extract,
+                is_primary,
+            )))
         }),
     )
 }
@@ -994,6 +1017,10 @@ struct App {
     /// apart from `error` so a failure dialog can list them.
     error_detail: Vec<String>,
     overwrite: bool,
+    /// "Also delete the source archive" — a checkbox in the extract dialog, not
+    /// a third button beside the primary action: a destructive action sitting
+    /// next to the one the user meant to click is one slip away from data loss.
+    delete_source: bool,
     show_create: bool,
     create_sources: Vec<String>,
     create_dest: String,
@@ -1049,7 +1076,7 @@ struct App {
 }
 
 impl App {
-fn new(
+    fn new(
         cc: &eframe::CreationContext<'_>,
         launch_open: Option<String>,
         launch_add: Vec<String>,
@@ -1102,7 +1129,8 @@ fn new(
         let _ = std::fs::remove_file(std::env::temp_dir().join("zipnest-update-setup.exe"));
         // Fixed zoom from settings, applied ONCE at startup. Never re-zoom per
         // frame — that feedback loop made fullscreen flicker badly.
-        cc.egui_ctx.set_zoom_factor(settings.ui_zoom.clamp(100, 200) as f32 / 100.0);
+        cc.egui_ctx
+            .set_zoom_factor(settings.ui_zoom.clamp(100, 200) as f32 / 100.0);
         // One wheel notch should travel three rows, like Explorer. egui turns a
         // native `LineDelta` notch into `Options::line_scroll_speed` points (40
         // by default, about 1.5 rows here), which is why the list crawled.
@@ -1111,18 +1139,23 @@ fn new(
         // dragging, keyboard navigation and selection untouched, and it only
         // affects real notches: touchpad / high-resolution `Point` deltas are
         // already proportional and stay as they are.
-        cc.egui_ctx.options_mut(|o| o.line_scroll_speed = scroll_points_per_notch(Self::ROW_H));
+        cc.egui_ctx
+            .options_mut(|o| o.line_scroll_speed = scroll_points_per_notch(Self::ROW_H));
         let lang = match settings.language.as_str() {
             "zh-CN" => "zh-CN",
             "en-US" => "en-US",
             _ => i18n::os_language(),
         }
         .to_string();
-        let qr_wechat = i18n::load_image(include_bytes!("assets/donate/wechat.jpg"))
-            .map(|img| cc.egui_ctx.load_texture("wechat", img, egui::TextureOptions::NEAREST));
-        let qr_alipay = i18n::load_image(include_bytes!("assets/donate/alipay.jpg"))
-            .map(|img| cc.egui_ctx.load_texture("alipay", img, egui::TextureOptions::NEAREST));
-let update: Arc<Mutex<UpdateState>> = Default::default();
+        let qr_wechat = i18n::load_image(include_bytes!("assets/donate/wechat.jpg")).map(|img| {
+            cc.egui_ctx
+                .load_texture("wechat", img, egui::TextureOptions::NEAREST)
+        });
+        let qr_alipay = i18n::load_image(include_bytes!("assets/donate/alipay.jpg")).map(|img| {
+            cc.egui_ctx
+                .load_texture("alipay", img, egui::TextureOptions::NEAREST)
+        });
+        let update: Arc<Mutex<UpdateState>> = Default::default();
         // Auto-check is user-controllable in Settings (on by default). It is
         // silent: no window, no spinner, no error dialog — only a real newer
         // release opens anything (see spawn_update_check).
@@ -1183,7 +1216,9 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             sort_asc: true,
             anchor: None,
             error: None,
-            notice: settings_backup.as_ref().map(|_| "settings.corrupt".to_string()),
+            notice: settings_backup
+                .as_ref()
+                .map(|_| "settings.corrupt".to_string()),
             settings_backup,
             copied_at: None,
             lang,
@@ -1196,6 +1231,7 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
             renamed_entries: Vec::new(),
             error_detail: Vec::new(),
             overwrite: true,
+            delete_source: false,
             show_create: false,
             create_sources: Vec::new(),
             create_dest: String::new(),
@@ -1224,7 +1260,7 @@ let update: Arc<Mutex<UpdateState>> = Default::default();
         }
     }
 
-fn t(&self, key: &str) -> String {
+    fn t(&self, key: &str) -> String {
         i18n::tr(&self.lang, key)
     }
 
@@ -1262,7 +1298,11 @@ fn t(&self, key: &str) -> String {
             "[ZipNest v{CURRENT_VERSION}] {}",
             self.t("settings.feedback.mail_subject")
         );
-        open_shell_url(&zipnest_ipc::mailto_url(&feedback_email(), &subject, &report));
+        open_shell_url(&zipnest_ipc::mailto_url(
+            &feedback_email(),
+            &subject,
+            &report,
+        ));
     }
 
     /// Status text for the last job. `job.ok_skipped` carries the count as
@@ -1338,13 +1378,12 @@ fn t(&self, key: &str) -> String {
         Some(text)
     }
 
-    /// Attach an explanation to a form row's reserved "?" slot.
+    /// Attach an explanation to a field's help mark.
     ///
-    /// The mark itself is drawn by `theme::form_row`, because reserving the slot
-    /// on *every* row is what keeps the control column straight. Hovering shows
-    /// the text at once; clicking pins it in a small popup, because a hover-only
-    /// hint silently does nothing for anyone who (as most people do) clicks the
-    /// mark instead of hovering it.
+    /// The mark itself is drawn by `theme::field`, beside the caption. Hovering
+    /// shows the text at once; clicking pins it in a small popup, because a
+    /// hover-only hint silently does nothing for anyone who (as most people do)
+    /// clicks the mark instead of hovering it.
     fn help_hint(&mut self, ui: &egui::Ui, mark: Option<egui::Response>, label: &str, text: &str) {
         let Some(mark) = mark else { return };
         let mark = mark.on_hover_ui(|ui| {
@@ -1395,7 +1434,12 @@ fn t(&self, key: &str) -> String {
 
     /// Drain job events emitted by the service into UI state.
     fn poll_jobs(&mut self) {
-        let pending: Vec<_> = self.jobs.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
+        let pending: Vec<_> = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
         for (name, payload) in pending {
             match name.as_str() {
                 "job_progress" => {
@@ -1476,18 +1520,27 @@ fn t(&self, key: &str) -> String {
                         j.skipped = skipped;
                     }
                     let cancelled = !ok && err_key.as_deref() == Some("error.cancelled");
-                    let delete_archive = self.job.as_ref().map(|j| j.delete_archive).unwrap_or(false);
+                    let delete_archive =
+                        self.job.as_ref().map(|j| j.delete_archive).unwrap_or(false);
                     let archive_released = (ok && delete_archive)
                         || (!ok && err_key.as_deref() == Some("error.archive_delete"));
                     // The tab closes on success, on cancel, and on any real
                     // failure (the box is drawn and then left behind).
-                    let silent = self.last_extract.as_ref().map(|r| r.silent).unwrap_or(false);
+                    let silent = self
+                        .last_extract
+                        .as_ref()
+                        .map(|r| r.silent)
+                        .unwrap_or(false);
                     if ok && silent {
                         // A double-clicked entry was unpacked only so its own
                         // program could open it. There is nothing to report:
                         // hand the file over and leave no window behind.
                         let name = self.open_after_extract.take();
-                        let dest = self.job.as_ref().map(|j| j.dest.clone()).unwrap_or_default();
+                        let dest = self
+                            .job
+                            .as_ref()
+                            .map(|j| j.dest.clone())
+                            .unwrap_or_default();
                         self.job = None;
                         self.notice = None;
                         self.last_extract = None;
@@ -1565,9 +1618,8 @@ fn t(&self, key: &str) -> String {
                     // The window carries the "done" message (and the output
                     // path), so disappearing on its own hides the result.
                     if self.settings.auto_close_after_job && (ok || cancelled) {
-                        self.close_at = Some(
-                            std::time::Instant::now() + std::time::Duration::from_secs(2),
-                        );
+                        self.close_at =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
                     }
                     self.extract_skipped = 0;
                     if archive_released {
@@ -1769,7 +1821,10 @@ fn t(&self, key: &str) -> String {
             }
             self.mtime_cache.insert(ms, text);
         }
-        self.mtime_cache.get(&ms).map(String::as_str).unwrap_or(DASH)
+        self.mtime_cache
+            .get(&ms)
+            .map(String::as_str)
+            .unwrap_or(DASH)
     }
 
     /// Backspace and the "up" button. At the root there is nowhere to go, so
@@ -1895,8 +1950,6 @@ fn t(&self, key: &str) -> String {
         }
     }
 
-
-
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         theme::top_bar(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1962,16 +2015,14 @@ fn t(&self, key: &str) -> String {
                             // The archive *name* is what the user needs to
                             // see; the format alone ("zip") told them nothing.
                             ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(name).size(13.0).strong(),
-                                )
-                                .truncate(),
+                                egui::Label::new(egui::RichText::new(name).size(13.0).strong())
+                                    .truncate(),
                             )
                             .on_hover_text(path);
                             ui.add(egui::Label::new(
                                 egui::RichText::new(format)
                                     .size(11.0)
-                                    .color(ui.visuals().weak_text_color()),
+                                    .color(theme::secondary(ui)),
                             ));
                         },
                     );
@@ -1988,8 +2039,15 @@ fn t(&self, key: &str) -> String {
                     // showing a stale verdict.
                     self.refresh_assoc_status();
                 }
-                if theme::ghost_button(ui, if self.lang == "zh-CN" { "EN" } else { "中文" }).clicked() {
-                    self.lang = if self.lang == "zh-CN" { "en-US" } else { "zh-CN" }.into();
+                if theme::ghost_button(ui, if self.lang == "zh-CN" { "EN" } else { "中文" })
+                    .clicked()
+                {
+                    self.lang = if self.lang == "zh-CN" {
+                        "en-US"
+                    } else {
+                        "zh-CN"
+                    }
+                    .into();
                     self.settings.language = self.lang.clone();
                     let _ = self.svc.settings_set(SettingsPatch {
                         language: Some(self.lang.clone()),
@@ -2068,7 +2126,7 @@ fn t(&self, key: &str) -> String {
             let size_x = (full_w - Self::COL_ENC - Self::COL_MTIME - Self::COL_SIZE).max(140.0);
             let mtime_x = size_x + Self::COL_SIZE;
             let enc_x = mtime_x + Self::COL_MTIME;
-            let weak = ui.visuals().weak_text_color();
+            let weak = theme::secondary(ui);
             let text_color = ui.visuals().text_color();
             let hairline = ui.visuals().widgets.inactive.bg_stroke.color;
 
@@ -2088,7 +2146,10 @@ fn t(&self, key: &str) -> String {
                 // label.
                 let columns = [
                     (
-                        egui::Rect::from_min_max(head.left_top(), egui::pos2(size_x, head.bottom())),
+                        egui::Rect::from_min_max(
+                            head.left_top(),
+                            egui::pos2(size_x, head.bottom()),
+                        ),
                         0usize,
                         SortKey::Name,
                     ),
@@ -2189,8 +2250,11 @@ fn t(&self, key: &str) -> String {
                 self.resort();
             }
             let sep_y = ui.cursor().top();
-            ui.painter()
-                .hline(ui.max_rect().x_range(), sep_y, egui::Stroke::new(1.0_f32, hairline));
+            ui.painter().hline(
+                ui.max_rect().x_range(),
+                sep_y,
+                egui::Stroke::new(1.0_f32, hairline),
+            );
             ui.add_space(4.0);
 
             // ---- rows ----
@@ -2295,11 +2359,7 @@ fn t(&self, key: &str) -> String {
                                 let font = egui::FontId::proportional(13.5);
                                 let name_w = ui
                                     .painter()
-                                    .layout_no_wrap(
-                                        e.name.clone(),
-                                        font.clone(),
-                                        text_color,
-                                    )
+                                    .layout_no_wrap(e.name.clone(), font.clone(), text_color)
                                     .size()
                                     .x
                                     .min(name_rect.width());
@@ -2307,7 +2367,10 @@ fn t(&self, key: &str) -> String {
                                     ui,
                                     egui::Rect::from_min_max(
                                         name_rect.min,
-                                        egui::pos2(name_rect.left() + name_w + 1.0, name_rect.bottom()),
+                                        egui::pos2(
+                                            name_rect.left() + name_w + 1.0,
+                                            name_rect.bottom(),
+                                        ),
                                     ),
                                     &e.name,
                                     font.clone(),
@@ -2317,7 +2380,10 @@ fn t(&self, key: &str) -> String {
                                 paint_elided(
                                     ui,
                                     egui::Rect::from_min_max(
-                                        egui::pos2(name_rect.left() + name_w + 8.0, name_rect.top()),
+                                        egui::pos2(
+                                            name_rect.left() + name_w + 8.0,
+                                            name_rect.top(),
+                                        ),
                                         name_rect.max,
                                     ),
                                     &format!("· {dir}"),
@@ -2446,7 +2512,11 @@ fn t(&self, key: &str) -> String {
             .unwrap_or_default();
         let dir = std::env::temp_dir()
             .join("ZipNest-open")
-            .join(if stem.is_empty() { "archive".to_string() } else { stem });
+            .join(if stem.is_empty() {
+                "archive".to_string()
+            } else {
+                stem
+            });
         let dir = dir.to_string_lossy().into_owned();
         let req = ExtractRequest {
             archive_id: id,
@@ -2492,14 +2562,21 @@ fn t(&self, key: &str) -> String {
         let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
         let border = egui::Rect::from_center_size(
             rect.center(),
-            egui::vec2((rect.width() - 90.0).max(240.0), (rect.height() - 90.0).max(180.0)),
+            egui::vec2(
+                (rect.width() - 90.0).max(240.0),
+                (rect.height() - 90.0).max(180.0),
+            ),
         );
         let accent = ui.visuals().hyperlink_color;
-        let weak = ui.visuals().weak_text_color();
+        let weak = theme::secondary(ui);
         let text = ui.visuals().text_color();
         {
             let painter = ui.painter().clone();
-            dashed_rect(&painter, border, ui.visuals().widgets.inactive.bg_stroke.color);
+            dashed_rect(
+                &painter,
+                border,
+                ui.visuals().widgets.inactive.bg_stroke.color,
+            );
             painter.text(
                 border.center() - egui::vec2(0.0, 30.0),
                 egui::Align2::CENTER_CENTER,
@@ -2552,11 +2629,9 @@ fn t(&self, key: &str) -> String {
                             .replace("{count}", &self.rows.len().to_string())
                     }
                 });
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(status).color(ui.visuals().weak_text_color()),
-                    ),
-                );
+                ui.add(egui::Label::new(
+                    egui::RichText::new(status).color(theme::secondary(ui)),
+                ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let upd = self.update.lock().unwrap().clone();
                     if matches!(upd, UpdateState::Idle) {
@@ -2582,6 +2657,10 @@ fn t(&self, key: &str) -> String {
         // The dialog checkbox mirrors the saved policy; "ask" starts from "do
         // not overwrite", the safe default.
         self.overwrite = self.settings.overwrite_policy == "overwrite";
+        // Deleting the source is destructive, so it never starts ticked: the
+        // answer to "which folder" must not also authorise a deletion the user
+        // did not ask for.
+        self.delete_source = false;
         // No selection → extract the whole archive (empty paths tells the
         // engine to unpack everything).
         self.show_extract = true;
@@ -2605,47 +2684,64 @@ fn t(&self, key: &str) -> String {
             .default_pos(center)
             .open(&mut open)
             .show(ctx, |ui| {
-            // Selection is now a scope, not just a highlight: say so before the
-            // fields, because "Extract" with rows selected means "these rows".
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(if srcs.is_empty() {
-                        self.t("extract.scope_all")
-                    } else {
-                        self.t("extract.scope_selected")
-                            .replace("{n}", &srcs.len().to_string())
-                    })
-                    .size(12.5)
-                    .color(ui.visuals().weak_text_color()),
-                )
-                .wrap(),
-            );
-            ui.add_space(2.0);
-            // Same caption column as every other form in the app, and the field
-            // takes what is left rather than its natural width — a destination
-            // is the one thing in here the user has to read in full.
-            let label = self.t("extract.dest");
-            theme::form_row(ui, &label, false, |ui| {
-                ui.add_sized(
-                    [ui.available_width() - 68.0, 22.0],
-                    egui::TextEdit::singleline(&mut self.extract_dest),
+                // Selection is now a scope, not just a highlight: say so before the
+                // fields, because "Extract" with rows selected means "these rows".
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(if srcs.is_empty() {
+                            self.t("extract.scope_all")
+                        } else {
+                            self.t("extract.scope_selected")
+                                .replace("{n}", &srcs.len().to_string())
+                        })
+                        .size(12.5)
+                        .color(theme::secondary(ui)),
+                    )
+                    .wrap(),
                 );
-                if ui.button(self.t("extract.browse")).clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        self.extract_dest = dir.to_str().unwrap_or("").to_string();
-                    }
-                }
-            });
-            let can = std::path::Path::new(self.extract_dest.trim()).is_absolute();
-            // A relative path is refused by the service too, but saying so here
-            // is the only place the user can act on it: a bare folder name used
-            // to extract into the process's own working directory and still
-            // report 完成.
-            if !self.extract_dest.trim().is_empty() && !can {
-                // Red, not the usual dim hint: extracting into the wrong folder
-                // is a mistake the user can still fix, not a footnote.
-                ui.horizontal(|ui| {
-                    ui.add_space(theme::FORM_LABEL_W + 30.0);
+                ui.add_space(12.0);
+                // Caption above the field, field across the whole width: a
+                // destination path is the one thing here the user has to read in
+                // full, and a caption column beside it spent a third of the dialog
+                // on empty space and still cut long paths off.
+                let label = self.t("extract.dest");
+                theme::caption(ui, &label);
+                // Right-to-left: the button is placed first and the field takes
+                // the rest, so a long path can never squeeze it out. Laid out
+                // in a box exactly one control tall, because `with_layout`
+                // otherwise claims every point the window has and the dialog
+                // grows a hand's width of empty space below the form.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), theme::CONTROL_H),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui
+                            .add_sized(
+                                [72.0, theme::CONTROL_H],
+                                egui::Button::new(self.t("extract.browse")),
+                            )
+                            .clicked()
+                        {
+                            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                self.extract_dest = dir.to_str().unwrap_or("").to_string();
+                            }
+                        }
+                        let field_w = (ui.available_width() - 8.0).max(80.0);
+                        ui.add_sized(
+                            [field_w, theme::CONTROL_H],
+                            egui::TextEdit::singleline(&mut self.extract_dest),
+                        );
+                    },
+                );
+                let can = std::path::Path::new(self.extract_dest.trim()).is_absolute();
+                // A relative path is refused by the service too, but saying so here
+                // is the only place the user can act on it: a bare folder name used
+                // to extract into the process's own working directory and still
+                // report 完成.
+                if !self.extract_dest.trim().is_empty() && !can {
+                    // Red, not the usual dim hint: extracting into the wrong folder
+                    // is a mistake the user can still fix, not a footnote.
+                    ui.add_space(4.0);
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(self.t("extract.dest_absolute"))
@@ -2654,94 +2750,115 @@ fn t(&self, key: &str) -> String {
                         )
                         .wrap(),
                     );
-                });
-            }
-            // The saved conflict policy decides what this dialog offers: "ask"
-            // shows the checkbox, the other three are shown as a fixed setting
-            // so a saved policy is never silently ignored.
-            let policy = self.settings.overwrite_policy.clone();
-            let ask = policy == "ask";
-            let label = self.t("settings.overwrite");
-            if ask {
-                theme::form_row(ui, &label, false, |ui| {
+                }
+                ui.add_space(12.0);
+                // The saved conflict policy decides what this dialog offers: "ask"
+                // shows the checkbox, the other three are shown as a fixed setting
+                // so a saved policy is never silently ignored.
+                let policy = self.settings.overwrite_policy.clone();
+                let ask = policy == "ask";
+                if ask {
                     let overwrite_label = self.t("extract.overwrite");
                     ui.checkbox(&mut self.overwrite, overwrite_label);
-                });
-            } else {
-                theme::form_row(ui, &label, false, |ui| {
-                    ui.label(self.t(&format!("settings.overwrite.{policy}")));
-                });
-            }
-            ui.add_space(4.0);
-            // Deleting the source is only safe when everything in it is being
-            // extracted; a partial selection would lose the rest.
-            let whole_archive = srcs.is_empty();
-            let (clicked, delete_clicked) = ui.horizontal(|ui| {
-                let start = theme::primary_button_enabled(ui, &self.t("extract.start"), can);
-                let delete = ui
-                    .add_enabled(
-                        can && whole_archive,
-                        egui::Button::new(
-                            egui::RichText::new(self.t("extract.delete")).color(error_color(ui)),
-                        )
-                        .stroke(egui::Stroke::new(1.0_f32, error_color(ui))),
+                } else {
+                    // A saved policy is a fact, not a choice: say it on one line
+                    // instead of spending a caption and a value line on it.
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(self.t(&format!("settings.overwrite.{policy}")))
+                                .color(theme::secondary(ui)),
+                        );
+                        ui.label(self.t("extract.policy_saved"));
+                    });
+                }
+                ui.add_space(theme::FIELD_GAP);
+                // Deleting the source is only safe when everything in it is being
+                // extracted; a partial selection would lose the rest. It is a
+                // checkbox rather than a third button: a destructive action
+                // sitting next to the one the user meant to press is one slip
+                // away from losing the archive.
+                let whole_archive = srcs.is_empty();
+                if !whole_archive {
+                    // A partially selected extract cannot delete the archive:
+                    // the rest of it would go with it.
+                    self.delete_source = false;
+                }
+                let delete_label = self.t("extract.delete");
+                ui.add_enabled(
+                    can && whole_archive,
+                    egui::Checkbox::new(&mut self.delete_source, delete_label),
+                )
+                .on_hover_text(self.t("extract.delete_hint"));
+                ui.add_space(24.0);
+                // Windows' own order, left to right: the affirmative action
+                // first, Cancel last. The group sits against the dialog's right
+                // edge, which is where every Win11 dialog puts its actions.
+                // No separator: 24 points of air already say "these are the
+                // actions", and the old hairline also carried [取消] away on its
+                // own line below the form.
+                let clicked = ui
+                    .allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), theme::CONTROL_H),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.button(self.t("extract.cancel")).clicked() {
+                                close = true;
+                            }
+                            theme::primary_button_enabled(ui, &self.t("extract.start"), can)
+                                .clicked()
+                        },
                     )
-                    .on_hover_text(self.t("extract.delete_hint"));
-                if ui.button(self.t("extract.cancel")).clicked() {
+                    .inner;
+                // Enter confirms (that is what a dialog is expected to do) — but not
+                // while the password prompt is up: that prompt owns the keyboard,
+                // and a shared Enter would start the extract behind its back.
+                let prompt_open = self.password_prompt.is_some();
+                let enter = !prompt_open && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if clicked || (can && enter) {
+                    let dest = self.extract_dest.clone();
+                    let on_conflict = if ask {
+                        if self.overwrite {
+                            "overwrite"
+                        } else {
+                            "skip"
+                        }
+                    } else {
+                        policy.as_str()
+                    }
+                    .to_string();
+                    let req = ExtractRequest {
+                        archive_id: arch_id,
+                        sources: srcs.iter().cloned().collect(),
+                        dest,
+                        on_conflict,
+                        delete_archive: self.delete_source,
+                        silent: false,
+                    };
+                    // The password the archive was opened with, if any. The service
+                    // also remembers it per archive, but passing it here keeps a
+                    // re-opened archive (new id) working the same way.
+                    match self.begin_extract(req.clone(), self.archive_password.clone()) {
+                        None => {}
+                        Some(key) if is_password_key(&key) => {
+                            // Encrypted contents, no password yet: keep everything
+                            // this dialog collected and ask for the password rather
+                            // than making the user redo the dialog afterwards.
+                            self.password_prompt = Some(PasswordPrompt {
+                                path: self.archive_path.clone(),
+                                text: String::new(),
+                                retry: key == "error.password_incorrect",
+                                focus: true,
+                                then: PasswordThen::Extract(req),
+                            });
+                        }
+                        Some(key) => self.error = Some(self.t(&key)),
+                    }
+                    self.show_extract = false;
+                }
+                if !prompt_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     close = true;
                 }
-                (start.clicked(), delete.clicked())
-            }).inner;
-            // Enter confirms (that is what a dialog is expected to do) — but not
-            // while the password prompt is up: that prompt owns the keyboard,
-            // and a shared Enter would start the extract behind its back.
-            let prompt_open = self.password_prompt.is_some();
-            let enter = !prompt_open && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if clicked || delete_clicked || (can && enter) {
-                let dest = self.extract_dest.clone();
-                let on_conflict = if ask {
-                    if self.overwrite {
-                        "overwrite"
-                    } else {
-                        "skip"
-                    }
-                } else {
-                    policy.as_str()
-                }
-                .to_string();
-                let req = ExtractRequest {
-                    archive_id: arch_id,
-                    sources: srcs.iter().cloned().collect(),
-                    dest,
-                    on_conflict,
-                    delete_archive: delete_clicked,
-                    silent: false,
-                };
-                // The password the archive was opened with, if any. The service
-                // also remembers it per archive, but passing it here keeps a
-                // re-opened archive (new id) working the same way.
-                match self.begin_extract(req.clone(), self.archive_password.clone()) {
-                    None => {}
-                    Some(key) if is_password_key(&key) => {
-                        // Encrypted contents, no password yet: keep everything
-                        // this dialog collected and ask for the password rather
-                        // than making the user redo the dialog afterwards.
-                        self.password_prompt = Some(PasswordPrompt {
-                            path: self.archive_path.clone(),
-                            text: String::new(),
-                            retry: key == "error.password_incorrect",
-                            focus: true,
-                            then: PasswordThen::Extract(req),
-                        });
-                    }
-                    Some(key) => self.error = Some(self.t(&key)),
-                }
-                self.show_extract = false;
-            }
-            if !prompt_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                close = true;
-            }
-        });
+            });
         // Cancel used to set `show_extract` inside the closure, which the line
         // below then overwrote — the button did nothing at all.
         self.show_extract = open && !close && self.job.is_none();
@@ -2753,11 +2870,7 @@ fn t(&self, key: &str) -> String {
     /// password is left to the caller: that caller has the dialog's inputs and
     /// can reopen the password prompt with them intact, instead of showing an
     /// error the user can do nothing about.
-    fn begin_extract(
-        &mut self,
-        req: ExtractRequest,
-        password: Option<String>,
-    ) -> Option<String> {
+    fn begin_extract(&mut self, req: ExtractRequest, password: Option<String>) -> Option<String> {
         self.last_extract = Some(req.clone());
         self.job = Some(JobState {
             job_id: 0,
@@ -2812,10 +2925,7 @@ fn t(&self, key: &str) -> String {
             .default_pos(center)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.add(
-                    egui::Label::new(self.t("password.prompt"))
-                        .wrap(),
-                );
+                ui.add(egui::Label::new(self.t("password.prompt")).wrap());
                 // Which archive is asking. Names are the only thing the user
                 // can match against the window they dragged in.
                 let name = prompt
@@ -2827,13 +2937,13 @@ fn t(&self, key: &str) -> String {
                 ui.label(
                     egui::RichText::new(name)
                         .size(11.5)
-                        .color(ui.visuals().weak_text_color()),
+                        .color(theme::secondary(ui)),
                 );
                 if prompt.retry {
                     ui.colored_label(ui.visuals().error_fg_color, self.t("password.wrong"));
                 }
                 let field = ui.add_sized(
-                    [ui.available_width(), 22.0],
+                    [ui.available_width(), theme::CONTROL_H],
                     egui::TextEdit::singleline(&mut prompt.text)
                         .password(true)
                         .hint_text(self.t("password.hint")),
@@ -2844,7 +2954,9 @@ fn t(&self, key: &str) -> String {
                 }
                 let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let can = !prompt.text.is_empty();
-                ui.add_space(6.0);
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if theme::primary_button_enabled(ui, &self.t("password.ok"), can).clicked() {
                         submit = true;
@@ -2952,8 +3064,11 @@ fn t(&self, key: &str) -> String {
                     // painted here would be transparent and keep whatever the
                     // compositor put behind it.
                     let rect = ctx.screen_rect();
-                    ctx.layer_painter(egui::LayerId::background())
-                        .rect_filled(rect, 0.0, ctx.style().visuals.panel_fill);
+                    ctx.layer_painter(egui::LayerId::background()).rect_filled(
+                        rect,
+                        0.0,
+                        ctx.style().visuals.panel_fill,
+                    );
                 }
                 let body = |ui: &mut egui::Ui| self.create_wizard_ui(ui);
                 if class == egui::ViewportClass::Embedded {
@@ -3007,9 +3122,7 @@ fn t(&self, key: &str) -> String {
             ui.horizontal(|ui| {
                 if ui.button(self.t("create.add_files")).clicked() {
                     let all = self.t("pick.all");
-                    if let Some(files) = rfd::FileDialog::new()
-                        .add_filter(all, &["*"])
-                        .pick_files()
+                    if let Some(files) = rfd::FileDialog::new().add_filter(all, &["*"]).pick_files()
                     {
                         for f in files {
                             if let Some(s) = f.to_str() {
@@ -3043,7 +3156,7 @@ fn t(&self, key: &str) -> String {
                         }
                     });
             }
-            ui.separator();
+            ui.add_space(12.0);
             let dest_label = self.t("create.dest");
             // Read-only on purpose. A bare name typed here used to be handed to
             // the engine as-is, so the archive was written relative to whatever
@@ -3051,80 +3164,107 @@ fn t(&self, key: &str) -> String {
             // not find it. The path is now always picked with 浏览…, or filled in
             // next to the sources before the dialog opens.
             let dest_hint = self.t("create.dest_hint");
-            theme::form_row(ui, &dest_label, false, |ui| {
-                let browse_w = 64.0;
-                ui.add_sized(
-                    [ui.available_width() - browse_w - 4.0, 22.0],
-                    egui::TextEdit::singleline(&mut self.create_dest)
-                        .interactive(false)
-                        .hint_text(dest_hint),
-                );
-                if ui
-                    .add_sized([browse_w, 22.0], egui::Button::new(self.t("extract.browse")))
-                    .clicked()
-                {
-                    // The Save-As dialog used to open with an empty file name and
-                    // an "All files" filter, so 保存 did nothing until the user
-                    // typed a name themselves — which reads as "browse cannot
-                    // select anything". Pre-fill a sensible name, match the
-                    // format.
-                    let format = self.create_format.clone();
-                    let (desc_key, exts) = format_filter(&format);
-                    let desc = self.t(desc_key);
-                    let picked = rfd::FileDialog::new()
-                        .set_file_name(suggested_archive_name(&self.create_sources, &format))
-                        .add_filter(desc, exts)
-                        .save_file();
-                    if let Some(p) = picked {
-                        self.create_dest = p.to_str().unwrap_or("").to_string();
+            theme::caption(ui, &dest_label);
+            // Right-to-left, in a box exactly one control tall: egui's
+            // `with_layout` takes every point left in the ui, and inside a
+            // field that meant the row grew to fill the window. The button is
+            // placed first and the field takes the rest, so no translated
+            // label can push the button off the edge ("Browse…" in English
+            // used to).
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), theme::CONTROL_H),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let browse_w = 72.0;
+                    if ui
+                        .add_sized(
+                            [browse_w, theme::CONTROL_H],
+                            egui::Button::new(self.t("extract.browse")),
+                        )
+                        .clicked()
+                    {
+                        // The Save-As dialog used to open with an empty file name and
+                        // an "All files" filter, so 保存 did nothing until the user
+                        // typed a name themselves — which reads as "browse cannot
+                        // select anything". Pre-fill a sensible name, match the
+                        // format.
+                        let format = self.create_format.clone();
+                        let (desc_key, exts) = format_filter(&format);
+                        let desc = self.t(desc_key);
+                        let picked = rfd::FileDialog::new()
+                            .set_file_name(suggested_archive_name(&self.create_sources, &format))
+                            .add_filter(desc, exts)
+                            .save_file();
+                        if let Some(p) = picked {
+                            self.create_dest = p.to_str().unwrap_or("").to_string();
+                        }
                     }
-                }
-            });
-            // From here down every row is `form_row`: one caption column, the
-            // "?" slot, one control column — so the chips line up whether or not
-            // a row has an explanation.
+                    let field_w = (ui.available_width() - 8.0).max(80.0);
+                    ui.add_sized(
+                        [field_w, theme::CONTROL_H],
+                        egui::TextEdit::singleline(&mut self.create_dest)
+                            .interactive(false)
+                            .hint_text(dest_hint),
+                    );
+                },
+            );
+            ui.add_space(theme::FIELD_GAP);
+            // From here down every row is `theme::field`: caption, then the
+            // control across the full width. `horizontal_wrapped` is what lets
+            // the six format chips wrap onto a second line in a narrow window
+            // instead of running off the right edge — tar.xz used to be cut in
+            // half at the wizard's own minimum width.
             let label = self.t("create.format");
             let hint = self.t("help.format");
-            let (_, mark) = theme::form_row(ui, &label, true, |ui| {
-                for f in ["zip", "7z", "tar", "tar.gz", "tar.bz2", "tar.xz"] {
-                    let sel = self.create_format == f;
-                    if theme::chip(ui, sel, f).clicked() {
-                        self.create_format = f.to_string();
-                        self.create_dest = retarget_archive_ext(&self.create_dest, f);
-                        self.refresh_default_dest();
+            let (_, mark) = theme::field(ui, &label, true, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for f in ["zip", "7z", "tar", "tar.gz", "tar.bz2", "tar.xz"] {
+                        let sel = self.create_format == f;
+                        if theme::chip(ui, sel, f).clicked() {
+                            self.create_format = f.to_string();
+                            self.create_dest = retarget_archive_ext(&self.create_dest, f);
+                            self.refresh_default_dest();
+                        }
                     }
-                }
+                });
             });
             self.help_hint(ui, mark, &label, &hint);
             let label = self.t("create.level");
             let hint = self.t("help.level");
-            let (_, mark) = theme::form_row(ui, &label, true, |ui| {
-                for l in ["store", "fastest", "normal", "maximum", "ultra"] {
-                    let sel = self.create_level == l;
-                    let lbl = self.t(&format!("create.level.{l}"));
-                    if theme::chip(ui, sel, &lbl).clicked() {
-                        self.create_level = l.to_string();
+            let (_, mark) = theme::field(ui, &label, true, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for l in ["store", "fastest", "normal", "maximum", "ultra"] {
+                        let sel = self.create_level == l;
+                        let lbl = self.t(&format!("create.level.{l}"));
+                        if theme::chip(ui, sel, &lbl).clicked() {
+                            self.create_level = l.to_string();
+                        }
                     }
-                }
+                });
             });
             self.help_hint(ui, mark, &label, &hint);
             let label = self.t("create.method");
             let hint = self.t("help.method");
-            let (_, mark) = theme::form_row(ui, &label, true, |ui| {
-                for m in ["auto", "copy", "deflate", "lzma2", "bzip2"] {
-                    let sel = self.create_method == m;
-                    let lbl = self.t(&format!("create.method.{m}"));
-                    if theme::chip(ui, sel, &lbl).clicked() {
-                        self.create_method = m.to_string();
+            let (_, mark) = theme::field(ui, &label, true, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for m in ["auto", "copy", "deflate", "lzma2", "bzip2"] {
+                        let sel = self.create_method == m;
+                        let lbl = self.t(&format!("create.method.{m}"));
+                        if theme::chip(ui, sel, &lbl).clicked() {
+                            self.create_method = m.to_string();
+                        }
                     }
-                }
+                });
             });
             self.help_hint(ui, mark, &label, &hint);
             let label = self.t("create.password");
             let hint = self.t("help.password");
-            let (_, mark) = theme::form_row(ui, &label, true, |ui| {
+            let (_, mark) = theme::field(ui, &label, true, |ui| {
+                // 220 rather than the full width: a password field wider than
+                // the eye can follow reads as a text area, and the row would
+                // stretch to the window edge for nothing.
                 ui.add_sized(
-                    [180.0, 22.0],
+                    [220.0, theme::CONTROL_H],
                     egui::TextEdit::singleline(&mut self.create_password).password(true),
                 );
             });
@@ -3135,57 +3275,52 @@ fn t(&self, key: &str) -> String {
                 // itself is never stored anywhere, so there is no way to
                 // recover it after the fact.
                 let confirm = self.t("create.password_confirm");
-                theme::form_row(ui, &confirm, false, |ui| {
-                    ui.add_sized(
-                        [180.0, 22.0],
-                        egui::TextEdit::singleline(&mut self.create_password_confirm)
-                            .password(true),
-                    );
-                    if self.create_password != self.create_password_confirm
-                        && !self.create_password_confirm.is_empty()
-                    {
-                        ui.add(egui::Label::new(
-                            egui::RichText::new(self.t("create.password_mismatch"))
-                                .size(12.0)
-                                .color(error_color(ui)),
-                        ));
-                    }
-                });
+                theme::caption(ui, &confirm);
+                ui.add_sized(
+                    [220.0, theme::CONTROL_H],
+                    egui::TextEdit::singleline(&mut self.create_password_confirm).password(true),
+                );
+                if self.create_password != self.create_password_confirm
+                    && !self.create_password_confirm.is_empty()
+                {
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(self.t("create.password_mismatch"))
+                            .size(11.5)
+                            .color(error_color(ui)),
+                    ));
+                }
+                ui.add_space(theme::FIELD_GAP);
             }
             if self.create_format == "7z" {
                 let lbl = self.t("create.encrypt_names");
                 let hint = self.t("help.encrypt_names");
-                // The caption goes in the checkbox, so the label column stays
-                // free for the "?" and the tick still starts at the control
-                // column like every other control.
-                let (_, mark) = theme::form_row(ui, "", true, |ui| {
-                    ui.checkbox(&mut self.create_encrypt_names, &lbl);
-                });
+                let mark = theme::check_field(ui, &lbl, &mut self.create_encrypt_names, true);
                 self.help_hint(ui, mark, &lbl, &hint);
             }
             let label = self.t("create.volume");
             let hint = self.t("help.volume");
-            let (_, mark) = theme::form_row(ui, &label, true, |ui| {
-                for v in ["off", "10m", "100m", "1g", "custom"] {
-                    let sel = self.create_volume == v;
-                    let lbl = self.t(&format!("create.volume.{v}"));
-                    if theme::chip(ui, sel, &lbl).clicked() {
-                        self.create_volume = v.to_string();
+            let (_, mark) = theme::field(ui, &label, true, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for v in ["off", "10m", "100m", "1g", "custom"] {
+                        let sel = self.create_volume == v;
+                        let lbl = self.t(&format!("create.volume.{v}"));
+                        if theme::chip(ui, sel, &lbl).clicked() {
+                            self.create_volume = v.to_string();
+                        }
                     }
-                }
-                if self.create_volume == "custom" {
-                    ui.add_sized(
-                        [80.0, 22.0],
-                        egui::TextEdit::singleline(&mut self.create_custom_volume),
-                    );
-                }
+                    if self.create_volume == "custom" {
+                        ui.add_sized(
+                            [80.0, theme::CONTROL_H],
+                            egui::TextEdit::singleline(&mut self.create_custom_volume),
+                        );
+                    }
+                });
             });
             self.help_hint(ui, mark, &label, &hint);
             if self.create_format == "7z" {
                 let lbl = self.t("create.sfx");
-                theme::form_row(ui, "", false, |ui| {
-                    ui.checkbox(&mut self.create_sfx, lbl);
-                });
+                theme::check_field(ui, &lbl.clone(), &mut self.create_sfx, false);
             }
             ui.add_space(6.0);
             // The engine resolves a relative destination against the process
@@ -3244,13 +3379,11 @@ fn t(&self, key: &str) -> String {
                 }
                 proceed = can && yes;
             } else {
-                // Action first, then cancel, on one row: 取消 used to sit under
-                // a full-width separator on a line of its own, which made it
-                // read as an unrelated item at the bottom of a menu.
+                // Actions against the right edge, in Windows' order: the
+                // affirmative one first, then Cancel. The reason the main button
+                // is grey sits to their left, on the same line, so the user does
+                // not have to look somewhere else to find out why.
                 ui.horizontal(|ui| {
-                    start_clicked =
-                        theme::primary_button_enabled(ui, &self.t("create.start"), can).clicked();
-                    cancel_clicked = ui.button(self.t("extract.cancel")).clicked();
                     // Why the button is grey, said where it is grey rather than
                     // left for the user to work out.
                     if !can {
@@ -3265,11 +3398,21 @@ fn t(&self, key: &str) -> String {
                             egui::Label::new(
                                 egui::RichText::new(self.t(why))
                                     .size(11.5)
-                                    .color(ui.visuals().weak_text_color()),
+                                    .color(theme::secondary(ui)),
                             )
                             .truncate(),
                         );
                     }
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), theme::CONTROL_H),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            cancel_clicked = ui.button(self.t("extract.cancel")).clicked();
+                            start_clicked =
+                                theme::primary_button_enabled(ui, &self.t("create.start"), can)
+                                    .clicked();
+                        },
+                    );
                 });
                 let enter = can && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if replaces && (start_clicked || enter) {
@@ -3297,9 +3440,17 @@ fn t(&self, key: &str) -> String {
                     } else {
                         Some(self.create_password.clone())
                     },
-                    encrypt_names: if self.create_encrypt_names { Some(true) } else { None },
+                    encrypt_names: if self.create_encrypt_names {
+                        Some(true)
+                    } else {
+                        None
+                    },
                     volume_bytes,
-                    sfx: if self.create_sfx { Some("gui".into()) } else { None },
+                    sfx: if self.create_sfx {
+                        Some("gui".into())
+                    } else {
+                        None
+                    },
                 };
                 self.job = Some(JobState {
                     job_id: 0,
@@ -3312,11 +3463,8 @@ fn t(&self, key: &str) -> String {
                         .unwrap_or_default(),
                     ..Default::default()
                 });
-                match svc.create_archive(
-                    self.create_sources.clone(),
-                    self.create_dest.clone(),
-                    req,
-                ) {
+                match svc.create_archive(self.create_sources.clone(), self.create_dest.clone(), req)
+                {
                     Ok(jid) => {
                         if let Some(job) = self.job.as_mut() {
                             job.job_id = jid;
@@ -3349,188 +3497,279 @@ fn t(&self, key: &str) -> String {
         egui::Frame::none()
             .inner_margin(egui::Margin::symmetric(14.0, 8.0))
             .show(ui, |ui| {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                        theme::section(ui, &self.t("settings.section.general"));
-                        let label = self.t("settings.language");
-                        theme::form_row(ui, &label, false, |ui| {
-                            for (v, k) in [("system", "settings.language.system"), ("zh-CN", "settings.language.zh"), ("en-US", "settings.language.en")] {
-                                let sel = self.settings.language == v;
-                                if theme::chip(ui, sel, &self.t(k)).clicked() {
-                                    self.settings.language = v.to_string();
-                                }
-                            }
-                        });
-                        let label = self.t("settings.theme");
-                        theme::form_row(ui, &label, false, |ui| {
-                            for (v, k) in [("system", "settings.theme.system"), ("light", "settings.theme.light"), ("dark", "settings.theme.dark")] {
-                                let sel = self.settings.theme_mode == v;
-                                if theme::chip(ui, sel, &self.t(k)).clicked() {
-                                    self.settings.theme_mode = v.to_string();
-                                    // Apply at once so the choice is visible.
-                                    theme::apply_setting(&self.ctx.clone(), v);
-                                }
-                            }
-                        });
-                        let label = self.t("settings.ui_zoom");
-                        theme::form_row(ui, &label, false, |ui| {
-                            for z in [100u32, 125, 150, 175, 200] {
-                                let sel = self.settings.ui_zoom == z;
-                                let text = self.t("settings.ui_zoom.percent").replace("{percent}", &z.to_string());
-                                if theme::chip(ui, sel, &text).clicked() {
-                                    self.settings.ui_zoom = z;
-                                    self.ctx.set_zoom_factor(z as f32 / 100.0);
-                                    // The floor is in native points, so a zoom
-                                    // change moves it: without this, raising the
-                                    // zoom left the old floor behind and the
-                                    // toolbar could be squeezed past its minimum.
-                                    self.ctx.send_viewport_cmd(
-                                        egui::ViewportCommand::MinInnerSize(min_inner_size(
-                                            z as f32 / 100.0,
-                                        )),
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // A settings column has a natural width. Stretched across a
+                        // 1400-point window the cards would each be a wide empty box
+                        // with a chip row clinging to its left edge — the "hollow right
+                        // column" again, just bigger. Capped, the column keeps one
+                        // readable measure at every window size.
+                        let col = ui.available_width().min(760.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(col, f32::INFINITY),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                theme::section(ui, &self.t("settings.section.general"));
+                                theme::group(ui, |ui| {
+                                    let label = self.t("settings.language");
+                                    theme::field(ui, &label, false, |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (v, k) in [
+                                                ("system", "settings.language.system"),
+                                                ("zh-CN", "settings.language.zh"),
+                                                ("en-US", "settings.language.en"),
+                                            ] {
+                                                let sel = self.settings.language == v;
+                                                if theme::chip(ui, sel, &self.t(k)).clicked() {
+                                                    self.settings.language = v.to_string();
+                                                }
+                                            }
+                                        });
+                                    });
+                                    let label = self.t("settings.theme");
+                                    theme::field(ui, &label, false, |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (v, k) in [
+                                                ("system", "settings.theme.system"),
+                                                ("light", "settings.theme.light"),
+                                                ("dark", "settings.theme.dark"),
+                                            ] {
+                                                let sel = self.settings.theme_mode == v;
+                                                if theme::chip(ui, sel, &self.t(k)).clicked() {
+                                                    self.settings.theme_mode = v.to_string();
+                                                    // Apply at once so the choice is visible.
+                                                    theme::apply_setting(&self.ctx.clone(), v);
+                                                }
+                                            }
+                                        });
+                                    });
+                                    let label = self.t("settings.ui_zoom");
+                                    theme::field(ui, &label, false, |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            for z in [100u32, 125, 150, 175, 200] {
+                                                let sel = self.settings.ui_zoom == z;
+                                                let text = self
+                                                    .t("settings.ui_zoom.percent")
+                                                    .replace("{percent}", &z.to_string());
+                                                if theme::chip(ui, sel, &text).clicked() {
+                                                    self.settings.ui_zoom = z;
+                                                    self.ctx.set_zoom_factor(z as f32 / 100.0);
+                                                    // The floor is in native points, so a zoom
+                                                    // change moves it: without this, raising the
+                                                    // zoom left the old floor behind and the
+                                                    // toolbar could be squeezed past its minimum.
+                                                    self.ctx.send_viewport_cmd(
+                                                        egui::ViewportCommand::MinInnerSize(
+                                                            min_inner_size(z as f32 / 100.0),
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        });
+                                    });
+                                    // Whether a finished job takes its own window with it.
+                                    // Applies to create and extract alike.
+                                    let auto_close_label = self.t("settings.auto_close");
+                                    ui.checkbox(
+                                        &mut self.settings.auto_close_after_job,
+                                        auto_close_label,
                                     );
-                                }
-                            }
-                        });
+                                    ui.add_space(4.0);
+                                    theme::hint(ui, &self.t("settings.auto_close.hint"));
+                                });
 
-                        // Whether a finished job takes its own window with it.
-                        // Applies to create and extract alike.
-                        let auto_close_label = self.t("settings.auto_close");
-                        theme::form_row(ui, "", false, |ui| {
-                            ui.checkbox(&mut self.settings.auto_close_after_job, auto_close_label);
-                        });
-                        theme::hint_indented(ui, &self.t("settings.auto_close.hint"));
+                                theme::section(ui, &self.t("settings.section.extract"));
+                                theme::group(ui, |ui| {
+                                    let label = self.t("settings.default_dir");
+                                    theme::field(ui, &label, false, |ui| {
+                                        // Right-to-left, same reason as the wizard's
+                                        // destination row: the button is placed first
+                                        // and the field takes what is left, so no
+                                        // translated label can push the button off the
+                                        // edge.
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let browse_w = 72.0;
+                                                if ui
+                                                    .add_sized(
+                                                        [browse_w, theme::CONTROL_H],
+                                                        egui::Button::new(self.t("extract.browse")),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    if let Some(dir) =
+                                                        rfd::FileDialog::new().pick_folder()
+                                                    {
+                                                        self.settings.default_extract_dir =
+                                                            dir.to_str().unwrap_or("").to_string();
+                                                    }
+                                                }
+                                                let field_w =
+                                                    (ui.available_width() - 8.0).max(80.0);
+                                                ui.add_sized(
+                                                    [field_w, theme::CONTROL_H],
+                                                    egui::TextEdit::singleline(
+                                                        &mut self.settings.default_extract_dir,
+                                                    ),
+                                                );
+                                            },
+                                        );
+                                    });
+                                    theme::hint(ui, &self.t("settings.default_dir.hint"));
+                                    ui.add_space(theme::FIELD_GAP);
+                                    // 带语境：明确这是"文件已存在时"的处理方式
+                                    let label = self.t("settings.overwrite.hint");
+                                    theme::field(ui, &label, false, |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (v, k) in [
+                                                ("ask", "settings.overwrite.ask"),
+                                                ("overwrite", "settings.overwrite.overwrite"),
+                                                ("skip", "settings.overwrite.skip"),
+                                                ("rename", "settings.overwrite.rename"),
+                                            ] {
+                                                let sel = self.settings.overwrite_policy == v;
+                                                if theme::chip(ui, sel, &self.t(k)).clicked() {
+                                                    self.settings.overwrite_policy = v.to_string();
+                                                }
+                                            }
+                                        });
+                                    });
+                                    let label = self.t("settings.max_extract");
+                                    let hint = self.t("settings.max_extract.hint");
+                                    let (_, mark) = theme::field(ui, &label, true, |ui| {
+                                        let mut mb =
+                                            self.settings.max_extract_bytes / (1024 * 1024);
+                                        if ui
+                                            .add(egui::DragValue::new(&mut mb).speed(256.0))
+                                            .changed()
+                                        {
+                                            // Real clamping happens in Settings::apply on the way out.
+                                            self.settings.max_extract_bytes =
+                                                mb.max(1).saturating_mul(1024 * 1024);
+                                        }
+                                        ui.label("MB");
+                                    });
+                                    self.help_hint(ui, mark, &label, &hint);
+                                });
 
-                        theme::section(ui, &self.t("settings.section.extract"));
-                        let label = self.t("settings.default_dir");
-                        theme::form_row(ui, &label, false, |ui| {
-                            ui.add_sized(
-                                [ui.available_width() - 70.0, 22.0],
-                                egui::TextEdit::singleline(&mut self.settings.default_extract_dir),
-                            );
-                            if ui.button(self.t("extract.browse")).clicked() {
-                                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                                    self.settings.default_extract_dir =
-                                        dir.to_str().unwrap_or("").to_string();
-                                }
-                            }
-                        });
-                        theme::hint_indented(ui, &self.t("settings.default_dir.hint"));
-                        // 带语境：明确这是"文件已存在时"的处理方式
-                        let label = self.t("settings.overwrite.hint");
-                        theme::form_row(ui, &label, false, |ui| {
-                            for (v, k) in [("ask", "settings.overwrite.ask"), ("overwrite", "settings.overwrite.overwrite"), ("skip", "settings.overwrite.skip"), ("rename", "settings.overwrite.rename")] {
-                                let sel = self.settings.overwrite_policy == v;
-                                if theme::chip(ui, sel, &self.t(k)).clicked() {
-                                    self.settings.overwrite_policy = v.to_string();
-                                }
-                            }
-                        });
-                        let label = self.t("settings.max_extract");
-                        let hint = self.t("settings.max_extract.hint");
-                        let (_, mark) = theme::form_row(ui, &label, true, |ui| {
-                            let mut mb = self.settings.max_extract_bytes / (1024 * 1024);
-                            if ui.add(egui::DragValue::new(&mut mb).speed(256.0)).changed() {
-                                // Real clamping happens in Settings::apply on the way out.
-                                self.settings.max_extract_bytes = mb.max(1).saturating_mul(1024 * 1024);
-                            }
-                            ui.label("MB");
-                        });
-                        self.help_hint(ui, mark, &label, &hint);
+                                theme::section(ui, &self.t("settings.section.integration"));
+                                theme::group(ui, |ui| {
+                                    // The label belongs *in* the checkbox: an empty label left
+                                    // a stray tick floating above its own text.
+                                    let associate_label = self.t("settings.shell.associate");
+                                    ui.checkbox(&mut self.settings.associate, associate_label);
+                                    ui.add_space(4.0);
+                                    theme::hint(ui, &self.t("settings.shell.assoc_hint"));
+                                    // The default-handler status and its button belong to
+                                    // the association box above, so they sit directly under
+                                    // it. They used to come after 右键菜单, which made the
+                                    // line read as a claim about the context menu and sent
+                                    // anyone whose default was still another app looking in
+                                    // the wrong place.
+                                    if self.settings.associate {
+                                        // The button is the whole feature: it rewrites the
+                                        // OS's own recorded handler for every format we
+                                        // claim -- hash and all -- so nothing here sends the
+                                        // user off to a Settings page they would have to
+                                        // work out by themselves.
+                                        ui.add_space(8.0);
+                                        let (status_key, status_exts) = self.assoc_status();
+                                        match status_exts {
+                                            Some(exts) => {
+                                                let msg =
+                                                    self.t(status_key).replace("{exts}", &exts);
+                                                theme::hint(ui, &msg);
+                                            }
+                                            None => {
+                                                ui.label(self.t(status_key));
+                                            }
+                                        }
+                                        ui.add_space(8.0);
+                                        if theme::primary_button(
+                                            ui,
+                                            &self.t("settings.shell.set_default"),
+                                        )
+                                        .clicked()
+                                        {
+                                            self.force_default_now();
+                                        }
+                                        ui.add_space(6.0);
+                                        theme::hint(ui, &self.t("settings.shell.set_default.hint"));
+                                    }
+                                    ui.add_space(theme::FIELD_GAP);
+                                    let menu_label = self.t("settings.shell.context_menu");
+                                    ui.checkbox(&mut self.settings.context_menu, menu_label);
+                                });
 
-                        theme::section(ui, &self.t("settings.section.integration"));
-                        // The label belongs *in* the checkbox: an empty label left
-                        // a stray tick floating above its own text.
-                        let associate_label = self.t("settings.shell.associate");
-                        theme::form_row(ui, "", false, |ui| {
-                            ui.checkbox(&mut self.settings.associate, associate_label);
-                        });
-                        theme::hint_indented(ui, &self.t("settings.shell.assoc_hint"));
-                        // The default-handler status and its button belong to
-                        // the association box above, so they sit directly under
-                        // it. They used to come after 右键菜单, which made the
-                        // line read as a claim about the context menu and sent
-                        // anyone whose default was still another app looking in
-                        // the wrong place.
-                        if self.settings.associate {
-                            // The button is the whole feature: it rewrites the
-                            // OS's own recorded handler for every format we
-                            // claim -- hash and all -- so nothing here sends the
-                            // user off to a Settings page they would have to
-                            // work out by themselves.
-                            ui.add_space(2.0);
-                            let (status_key, status_exts) = self.assoc_status();
-                            match status_exts {
-                                Some(exts) => {
-                                    let msg = self.t(status_key).replace("{exts}", &exts);
-                                    theme::hint_indented(ui, &msg);
-                                }
-                                None => {
-                                    ui.label(self.t(status_key));
-                                }
-                            }
-                            if theme::primary_button(ui, &self.t("settings.shell.set_default"))
-                                .clicked()
-                            {
-                                self.force_default_now();
-                            }
-                            theme::hint_indented(ui, &self.t("settings.shell.set_default.hint"));
-                        }
-                        let menu_label = self.t("settings.shell.context_menu");
-                        theme::form_row(ui, "", false, |ui| {
-                            ui.checkbox(&mut self.settings.context_menu, menu_label);
-                        });
+                                theme::section(ui, &self.t("settings.section.about"));
+                                theme::group(ui, |ui| {
+                                    let update_label = self.t("settings.auto_update");
+                                    ui.checkbox(&mut self.settings.auto_check_update, update_label);
+                                    ui.add_space(theme::FIELD_GAP);
+                                    let label = self.t("settings.version");
+                                    theme::field(ui, &label, false, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("v{CURRENT_VERSION}"))
+                                                .strong(),
+                                        );
+                                    });
+                                });
 
-                        theme::section(ui, &self.t("settings.section.about"));
-                        let update_label = self.t("settings.auto_update");
-                        theme::form_row(ui, "", false, |ui| {
-                            ui.checkbox(&mut self.settings.auto_check_update, update_label);
-                        });
-                        let label = self.t("settings.version");
-                        theme::form_row(ui, &label, false, |ui| {
-                            ui.label(egui::RichText::new(format!("v{CURRENT_VERSION}")).strong());
-                        });
-
-                        theme::section(ui, &self.t("settings.section.feedback"));
-                        theme::hint_indented(ui, &self.t("settings.feedback.hint"));
-                        ui.horizontal(|ui| {
-                            if ui.button(self.t("settings.feedback.copy")).clicked() {
-                                // Everything the maintainer asks for first, and
-                                // nothing about what the user was working on.
-                                let report = self.diagnostics_report();
-                                ui.ctx().copy_text(report);
-                                self.copied_at = Some(std::time::Instant::now());
-                            }
-                            if let Some(at) = self.copied_at {
-                                if at.elapsed() < std::time::Duration::from_secs(4) {
-                                    ui.label(
-                                        egui::RichText::new(self.t("settings.feedback.copied"))
-                                            .italics(),
-                                    );
-                                }
-                            }
-                        });
-                        let label = self.t("settings.feedback.email");
-                        theme::form_row(ui, &label, false, |ui| {
-                            // Shown with the `@` broken up: a bare address in a UI
-                            // string is a ready-made scrape target. Selectable so
-                            // the user can copy it, with the real one only inside
-                            // the mailto link.
-                            let shown = format!(
-                                "{FEEDBACK_EMAIL_USER} @ {FEEDBACK_EMAIL_DOMAIN}"
-                            );
-                            ui.add(egui::Label::new(egui::RichText::new(shown).strong()).selectable(true));
-                            if ui.button(self.t("settings.feedback.copy_email")).clicked() {
-                                ui.ctx().copy_text(feedback_email());
-                                self.copied_at = Some(std::time::Instant::now());
-                            }
-                        });
-                        if ui.button(self.t("settings.feedback.mail")).clicked() {
-                            self.send_feedback_mail(ui.ctx());
-                        }
-                        ui.add_space(8.0);
-            });
+                                theme::section(ui, &self.t("settings.section.feedback"));
+                                theme::group(ui, |ui| {
+                                    theme::hint(ui, &self.t("settings.feedback.hint"));
+                                    ui.add_space(theme::FIELD_GAP);
+                                    ui.horizontal(|ui| {
+                                        if ui.button(self.t("settings.feedback.copy")).clicked() {
+                                            // Everything the maintainer asks for first, and
+                                            // nothing about what the user was working on.
+                                            let report = self.diagnostics_report();
+                                            ui.ctx().copy_text(report);
+                                            self.copied_at = Some(std::time::Instant::now());
+                                        }
+                                        if let Some(at) = self.copied_at {
+                                            if at.elapsed() < std::time::Duration::from_secs(4) {
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        self.t("settings.feedback.copied"),
+                                                    )
+                                                    .italics(),
+                                                );
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(theme::FIELD_GAP);
+                                    let label = self.t("settings.feedback.email");
+                                    theme::field(ui, &label, false, |ui| {
+                                        // Shown with the `@` broken up: a bare address in a UI
+                                        // string is a ready-made scrape target. Selectable so
+                                        // the user can copy it, with the real one only inside
+                                        // the mailto link.
+                                        let shown = format!(
+                                            "{FEEDBACK_EMAIL_USER} @ {FEEDBACK_EMAIL_DOMAIN}"
+                                        );
+                                        ui.add(
+                                            egui::Label::new(egui::RichText::new(shown).strong())
+                                                .selectable(true),
+                                        );
+                                        if ui
+                                            .button(self.t("settings.feedback.copy_email"))
+                                            .clicked()
+                                        {
+                                            ui.ctx().copy_text(feedback_email());
+                                            self.copied_at = Some(std::time::Instant::now());
+                                        }
+                                    });
+                                    if ui.button(self.t("settings.feedback.mail")).clicked() {
+                                        self.send_feedback_mail(ui.ctx());
+                                    }
+                                });
+                                ui.add_space(16.0);
+                            },
+                        );
+                    });
             });
     }
 
@@ -3546,7 +3785,9 @@ fn t(&self, key: &str) -> String {
                     back = true;
                 }
                 ui.add(egui::Label::new(
-                    egui::RichText::new(self.t("settings.title")).strong(),
+                    egui::RichText::new(self.t("settings.title"))
+                        .size(18.0)
+                        .strong(),
                 ));
             });
         });
@@ -3572,11 +3813,8 @@ fn t(&self, key: &str) -> String {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(text) = self.notice_text() {
                         ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(text)
-                                    .color(ui.visuals().weak_text_color()),
-                            )
-                            .truncate(),
+                            egui::Label::new(egui::RichText::new(text).color(theme::secondary(ui)))
+                                .truncate(),
                         );
                     }
                 });
@@ -3719,12 +3957,10 @@ fn t(&self, key: &str) -> String {
             UpdateState::Checking => {
                 let title = self.t("update.title");
                 let msg = self.t("update.checking");
-                egui::Window::new(title)
-                    .collapsible(false)
-                    .show(ctx, |ui| {
-                        ui.add(egui::Spinner::new());
-                        ui.label(msg);
-                    });
+                egui::Window::new(title).collapsible(false).show(ctx, |ui| {
+                    ui.add(egui::Spinner::new());
+                    ui.label(msg);
+                });
             }
             UpdateState::Found { tag, url } => {
                 let title = self.t("update.title");
@@ -3843,7 +4079,7 @@ fn t(&self, key: &str) -> String {
                                 ui.label(
                                     egui::RichText::new(&j.dest)
                                         .size(11.5)
-                                        .color(ui.visuals().weak_text_color()),
+                                        .color(theme::secondary(ui)),
                                 );
                             });
                             if ui.button(self.t("job.open_folder")).clicked() {
@@ -3888,7 +4124,7 @@ fn t(&self, key: &str) -> String {
                         ui.label(
                             egui::RichText::new(eta)
                                 .size(12.0)
-                                .color(ui.visuals().weak_text_color()),
+                                .color(theme::secondary(ui)),
                         );
                     }
                     if ui.button(self.t("job.canceled")).clicked() {
@@ -4063,11 +4299,14 @@ fn parse_volume(input: &str) -> Option<u64> {
     } else {
         (s.as_str(), 1u64)
     };
-    num.parse::<f64>().ok().map(|n| (n * mult as f64) as u64).filter(|n| *n > 0)
+    num.parse::<f64>()
+        .ok()
+        .map(|n| (n * mult as f64) as u64)
+        .filter(|n| *n > 0)
 }
 
 impl eframe::App for App {
-fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs();
 
         if self.show_on_first_frame {
@@ -4115,8 +4354,6 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
                 }
             }
         }
-
-
 
         // Take the primary role if it is free: the window that holds it is the
         // one later launches reuse, so an existing window should pick it up
@@ -4302,17 +4539,6 @@ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
 /// Whether an error key means "a password is needed", rather than a failure
 /// worth an error dialog.
 ///
@@ -4433,7 +4659,8 @@ fn paint_entry_icon(p: &egui::Painter, icon_rect: egui::Rect, e: &EntryDto, dark
         .map(|(_, s)| s.to_lowercase())
         .unwrap_or_default();
     let (accent, label) = entry_accent(&ext);
-    let page = egui::Rect::from_min_size(icon_rect.min + egui::vec2(4.0, 2.0), egui::vec2(14.0, 16.0));
+    let page =
+        egui::Rect::from_min_size(icon_rect.min + egui::vec2(4.0, 2.0), egui::vec2(14.0, 16.0));
     let (fill, outline) = if dark {
         (
             egui::Color32::from_rgb(226, 228, 234),
@@ -4446,7 +4673,11 @@ fn paint_entry_icon(p: &egui::Painter, icon_rect: egui::Rect, e: &EntryDto, dark
         )
     };
     p.rect_filled(page, egui::Rounding::same(2.0), fill);
-    p.rect_stroke(page, egui::Rounding::same(2.0), egui::Stroke::new(1.0_f32, outline));
+    p.rect_stroke(
+        page,
+        egui::Rounding::same(2.0),
+        egui::Stroke::new(1.0_f32, outline),
+    );
     p.rect_filled(
         egui::Rect::from_min_size(page.min + egui::vec2(2.0, 2.0), egui::vec2(10.0, 4.0)),
         egui::Rounding::same(1.0),
@@ -4771,7 +5002,11 @@ fn paint_lock(p: &egui::Painter, center: egui::Pos2) {
         egui::Rounding::same(1.0),
         red,
     );
-    p.circle_stroke(center + egui::vec2(0.0, -4.0), 3.0, egui::Stroke::new(1.5_f32, red));
+    p.circle_stroke(
+        center + egui::vec2(0.0, -4.0),
+        3.0,
+        egui::Stroke::new(1.5_f32, red),
+    );
 }
 
 /// One line of text inside `rect`, ellipsised when it does not fit.
@@ -5107,7 +5342,10 @@ mod geometry_tests {
     fn a_broken_scale_does_not_corrupt_the_geometry() {
         let inner = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         for ppp in [0.0, -1.0, f32::NAN] {
-            assert_eq!(physical_geometry(inner, egui::Pos2::ZERO, ppp).0, (800, 600));
+            assert_eq!(
+                physical_geometry(inner, egui::Pos2::ZERO, ppp).0,
+                (800, 600)
+            );
         }
         assert_eq!(physical_to_logical(900.0, 1.25), 720.0);
         for scale in [0.0, -1.0, f32::NAN] {
@@ -5171,9 +5409,18 @@ mod create_form_tests {
     #[test]
     fn the_extension_follows_the_chosen_format() {
         assert_eq!(retarget_archive_ext(r"C:\out\a.zip", "7z"), r"C:\out\a.7z");
-        assert_eq!(retarget_archive_ext(r"C:\out\a.7z", "tar.gz"), r"C:\out\a.tar.gz");
-        assert_eq!(retarget_archive_ext(r"C:\out\a.tar.gz", "zip"), r"C:\out\a.zip");
-        assert_eq!(retarget_archive_ext(r"C:\out\a.TAR.XZ", "zip"), r"C:\out\a.zip");
+        assert_eq!(
+            retarget_archive_ext(r"C:\out\a.7z", "tar.gz"),
+            r"C:\out\a.tar.gz"
+        );
+        assert_eq!(
+            retarget_archive_ext(r"C:\out\a.tar.gz", "zip"),
+            r"C:\out\a.zip"
+        );
+        assert_eq!(
+            retarget_archive_ext(r"C:\out\a.TAR.XZ", "zip"),
+            r"C:\out\a.zip"
+        );
         // A name the user typed themselves is left alone.
         assert_eq!(retarget_archive_ext(r"C:\out\notes", "7z"), r"C:\out\notes");
         assert_eq!(retarget_archive_ext("", "zip"), "");
@@ -5209,7 +5456,11 @@ mod integration_tests {
         let plan = integration_plan(&settings(false, false, false), false).unwrap();
         assert_eq!(
             plan,
-            ShellOptions { associate: true, context_menu: true, extensions: all_exts() }
+            ShellOptions {
+                associate: true,
+                context_menu: true,
+                extensions: all_exts()
+            }
         );
     }
 
@@ -5229,19 +5480,31 @@ mod integration_tests {
         let plan = integration_plan(&settings(true, true, true), true).unwrap();
         assert_eq!(
             plan,
-            ShellOptions { associate: true, context_menu: true, extensions: all_exts() }
+            ShellOptions {
+                associate: true,
+                context_menu: true,
+                extensions: all_exts()
+            }
         );
         // ... and an explicit opt-out still wins over the installer.
         let off = integration_plan(&settings(true, false, false), true).unwrap();
         assert_eq!(
             off,
-            ShellOptions { associate: false, context_menu: false, extensions: all_exts() }
+            ShellOptions {
+                associate: false,
+                context_menu: false,
+                extensions: all_exts()
+            }
         );
         // Half-registered is a state the user can legitimately choose.
         let partial = integration_plan(&settings(true, true, false), true).unwrap();
         assert_eq!(
             partial,
-            ShellOptions { associate: true, context_menu: false, extensions: all_exts() }
+            ShellOptions {
+                associate: true,
+                context_menu: false,
+                extensions: all_exts()
+            }
         );
     }
 
@@ -5266,7 +5529,10 @@ mod feedback_tests {
         // silently swallows every report, so it is worth asserting.
         let addr = feedback_email();
         assert_eq!(addr.matches('@').count(), 1, "exactly one @: {addr}");
-        assert!(!addr.contains(char::is_whitespace), "no spaces in an address");
+        assert!(
+            !addr.contains(char::is_whitespace),
+            "no spaces in an address"
+        );
         let (user, domain) = addr.split_once('@').unwrap();
         assert!(!user.is_empty(), "local part is empty");
         assert!(domain.contains('.'), "domain has no dot: {domain}");
@@ -5281,7 +5547,10 @@ mod feedback_tests {
         let shown = format!("{FEEDBACK_EMAIL_USER} @ {FEEDBACK_EMAIL_DOMAIN}");
         let real = feedback_email();
         assert_ne!(shown, real);
-        assert!(!shown.contains(&real), "split form must not contain the whole address");
+        assert!(
+            !shown.contains(&real),
+            "split form must not contain the whole address"
+        );
     }
 
     #[test]
@@ -5322,10 +5591,22 @@ mod eta_tests {
 
     #[test]
     fn the_eta_reads_as_time_and_goes_away_when_finished() {
-        assert_eq!(job(50, 100, 45).eta_text("zh-CN").as_deref(), Some("还剩 45s"));
-        assert_eq!(job(50, 100, 95).eta_text("zh-CN").as_deref(), Some("还剩 1m 35s"));
-        assert_eq!(job(50, 100, 3725).eta_text("zh-CN").as_deref(), Some("还剩 1h 2m"));
-        assert_eq!(job(50, 100, 45).eta_text("en-US").as_deref(), Some("45s left"));
+        assert_eq!(
+            job(50, 100, 45).eta_text("zh-CN").as_deref(),
+            Some("还剩 45s")
+        );
+        assert_eq!(
+            job(50, 100, 95).eta_text("zh-CN").as_deref(),
+            Some("还剩 1m 35s")
+        );
+        assert_eq!(
+            job(50, 100, 3725).eta_text("zh-CN").as_deref(),
+            Some("还剩 1h 2m")
+        );
+        assert_eq!(
+            job(50, 100, 45).eta_text("en-US").as_deref(),
+            Some("45s left")
+        );
         let mut done = job(50, 100, 45);
         done.finished = true;
         assert!(done.eta_text("zh-CN").is_none());
@@ -5400,7 +5681,10 @@ mod sort_tests {
 
     #[test]
     fn the_name_order_is_stable_for_names_differing_only_in_case() {
-        let mut rows = vec![entry("b.txt", false, 0, None), entry("B.txt", false, 0, None)];
+        let mut rows = vec![
+            entry("b.txt", false, 0, None),
+            entry("B.txt", false, 0, None),
+        ];
         sort_rows(&mut rows, SortKey::Name, true);
         // `natural_cmp` calls these equal, so the tie-break has to decide, and
         // it has to decide the same way every time: uppercase sorts first.

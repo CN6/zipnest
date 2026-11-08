@@ -57,7 +57,11 @@ pub fn load_image(bytes: &[u8]) -> Option<egui::ColorImage> {
 }
 
 pub fn tr(lang: &str, key: &str) -> String {
-    let table: &HashMap<&'static str, &'static str> = if lang == "en-US" { EN.deref() } else { ZH.deref() };
+    let table: &HashMap<&'static str, &'static str> = if lang == "en-US" {
+        EN.deref()
+    } else {
+        ZH.deref()
+    };
     table.get(key).copied().unwrap_or(key).to_string()
 }
 
@@ -70,8 +74,8 @@ macro_rules! table {
 }
 
 #[allow(dead_code)]
-static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
-    std::sync::LazyLock::new(|| {
+static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> = std::sync::LazyLock::new(
+    || {
         table! {
             "app.open" => "打开压缩包",
             "create.new" => "新建压缩包",
@@ -96,6 +100,7 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "extract.dest" => "目标文件夹",
             "extract.browse" => "浏览…",
             "extract.overwrite" => "覆盖已存在文件",
+            "extract.policy_saved" => "（设置里定的）",
             "extract.start" => "开始解压",
             "extract.delete" => "解压并删除",
             "extract.delete_hint" => "解压成功后会永久删除原压缩包；仅在整个压缩包一起解压时可用，失败或取消时保留。",
@@ -258,15 +263,16 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "update.found" => "发现新版本",
             "update.download" => "前往下载",
             "update.hint" => "点「前往下载」会在浏览器中打开 GitHub 下载页，下载安装包后手动安装即可。",
-"update.ready" => "新版本已下载。点击安装后软件会自动退出并静默安装，不弹黑色命令框；安装完成后重新打开就是新版本。",
+        "update.ready" => "新版本已下载。点击安装后软件会自动退出并静默安装，不弹黑色命令框；安装完成后重新打开就是新版本。",
             "update.install" => "立即安装",
             "update.failed" => "检查更新失败",
         }
-    });
+    },
+);
 
 #[allow(dead_code)]
-static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
-    std::sync::LazyLock::new(|| {
+static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> = std::sync::LazyLock::new(
+    || {
         table! {
             "app.open" => "Open archive",
             "create.new" => "New archive",
@@ -291,6 +297,7 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "extract.dest" => "Destination folder",
             "extract.browse" => "Browse…",
             "extract.overwrite" => "Overwrite existing files",
+            "extract.policy_saved" => "(from Settings)",
             "extract.start" => "Extract",
             "extract.delete" => "Extract and delete",
             "extract.delete_hint" => "Deletes the source archive after a successful extraction. Only available when extracting the whole archive; failed or cancelled runs keep it.",
@@ -365,7 +372,7 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "create.volume.custom" => "Custom",
             "create.password" => "Password",
             "create.encrypt_names" => "Encrypt file names (7z only)",
-"create.sfx" => "Self-extracting (7z only)",
+        "create.sfx" => "Self-extracting (7z only)",
             "create.start" => "Create",
             "create.need_sources" => "Add something to pack first",
             "create.need_dest" => "Choose where to save it",
@@ -452,11 +459,12 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             "update.found" => "A new version is available",
             "update.download" => "Download",
             "update.hint" => "Clicking Download opens the GitHub releases page in your browser; download the installer and run it to update.",
-"update.ready" => "New version downloaded. Install will exit and install silently (no console window); reopening after install gives you the new version.",
+        "update.ready" => "New version downloaded. Install will exit and install silently (no console window); reopening after install gives you the new version.",
             "update.install" => "Install now",
             "update.failed" => "Update check failed",
         }
-    });
+    },
+);
 
 #[cfg(test)]
 mod tests {
@@ -507,7 +515,11 @@ mod tests {
         only_en.sort();
         assert!(only_zh.is_empty(), "only in zh-CN: {only_zh:?}");
         assert!(only_en.is_empty(), "only in en-US: {only_en:?}");
-        assert!(zh.len() > 100, "the table looks truncated: {} keys", zh.len());
+        assert!(
+            zh.len() > 100,
+            "the table looks truncated: {} keys",
+            zh.len()
+        );
     }
 
     #[test]
@@ -580,5 +592,3 @@ mod tests {
         assert_eq!(super::tr("en-US", "nope.not.here"), "nope.not.here");
     }
 }
-
-
