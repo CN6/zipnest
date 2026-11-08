@@ -1992,6 +1992,10 @@ impl App {
                 // group was painted put "nested.zip" straight through 设置 / EN /
                 // 支持我们 in a narrow window. `TOOLBAR_RIGHT_W` is that cluster's
                 // own width (three ghost buttons plus their spacing).
+                // Only a reserve for measuring the title, not a layout
+                // constraint: the cluster itself is placed against the right
+                // edge (see below), so this number being a few points generous
+                // costs nothing but a slightly shorter name.
                 const TOOLBAR_RIGHT_W: f32 = 210.0;
                 // The archive title gets a child `ui` of the width the
                 // right-hand cluster leaves. `Label::truncate()` shortens
@@ -2027,36 +2031,46 @@ impl App {
                         },
                     );
                 }
-                // Whatever the name did not use pushes the right-hand cluster
-                // to the far edge.
-                ui.add_space((ui.available_width() - TOOLBAR_RIGHT_W).max(0.0));
-                // The toolbar reads 设置 · EN · 支持我们, so they are added in
-                // that order: this row lays out left to right.
-                if theme::ghost_button(ui, &self.t("settings.title")).clicked() {
-                    self.show_settings = true;
-                    // The user may have changed the default in Windows
-                    // Settings since we last looked; refresh instead of
-                    // showing a stale verdict.
-                    self.refresh_assoc_status();
-                }
-                if theme::ghost_button(ui, if self.lang == "zh-CN" { "EN" } else { "中文" })
-                    .clicked()
-                {
-                    self.lang = if self.lang == "zh-CN" {
-                        "en-US"
-                    } else {
-                        "zh-CN"
-                    }
-                    .into();
-                    self.settings.language = self.lang.clone();
-                    let _ = self.svc.settings_set(SettingsPatch {
-                        language: Some(self.lang.clone()),
-                        ..Default::default()
-                    });
-                }
-                if theme::ghost_button(ui, &self.t("settings.donate")).clicked() {
-                    self.show_donate = true;
-                }
+                // The right-hand cluster is laid out against the edge itself
+                // instead of being pushed there by a spacer. The spacer used the
+                // cluster's *reserved* width, and the reserve has to be larger
+                // than the buttons really are (translations change their width),
+                // so every millimetre the reserve overshot showed up as a strip
+                // of empty toolbar to the right of 支持我们.
+                let rest = ui.available_width();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(rest, theme::CONTROL_H),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        // Added in reverse, because the layout runs right to
+                        // left: the row still reads 设置 · EN · 支持我们.
+                        if theme::ghost_button(ui, &self.t("settings.donate")).clicked() {
+                            self.show_donate = true;
+                        }
+                        if theme::ghost_button(ui, if self.lang == "zh-CN" { "EN" } else { "中文" })
+                            .clicked()
+                        {
+                            self.lang = if self.lang == "zh-CN" {
+                                "en-US"
+                            } else {
+                                "zh-CN"
+                            }
+                            .into();
+                            self.settings.language = self.lang.clone();
+                            let _ = self.svc.settings_set(SettingsPatch {
+                                language: Some(self.lang.clone()),
+                                ..Default::default()
+                            });
+                        }
+                        if theme::ghost_button(ui, &self.t("settings.title")).clicked() {
+                            self.show_settings = true;
+                            // The user may have changed the default in Windows
+                            // Settings since we last looked; refresh instead of
+                            // showing a stale verdict.
+                            self.refresh_assoc_status();
+                        }
+                    },
+                );
             });
         });
     }
@@ -3495,17 +3509,23 @@ impl App {
         // Padding only: the page owns the whole window now, so it needs the
         // gutters the card used to supply, but not its border or rounding.
         egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+            .inner_margin(egui::Margin::symmetric(24.0, 8.0))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // A settings column has a natural width. Stretched across a
-                        // 1400-point window the cards would each be a wide empty box
-                        // with a chip row clinging to its left edge — the "hollow right
-                        // column" again, just bigger. Capped, the column keeps one
-                        // readable measure at every window size.
-                        let col = ui.available_width().min(760.0);
+                        // The column follows the window, and when the window is
+                        // wider than a readable measure it is *centred* rather
+                        // than pinned left. Pinned left, every point past the cap
+                        // piled up on the right as a dead strip (at 1500 wide
+                        // that was a third of the page); centred, the same gap is
+                        // split evenly and reads as a margin.
+                        let avail = ui.available_width();
+                        let col = avail.min(1064.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(avail, f32::INFINITY),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
                         ui.allocate_ui_with_layout(
                             egui::vec2(col, f32::INFINITY),
                             egui::Layout::top_down(egui::Align::Min),
@@ -3767,6 +3787,8 @@ impl App {
                                     }
                                 });
                                 ui.add_space(16.0);
+                            },
+                        );
                             },
                         );
                     });
