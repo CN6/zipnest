@@ -256,14 +256,30 @@ unsafe extern "system" fn cb_op_result(this: *mut c_void, op_res: i32) -> Hresul
 
 /// Map `NExtract::NOperationResult` to a `ZipnestError`.
 ///
-/// `password_provided` matters: the 7z handler reports a wrong AES key as
-/// `kDataError` (2), not `kWrongPassword` (9) — indistinguishable from real
-/// corruption at this layer. For encrypted extracts we surface the data/CRC
-/// classes as `password_incorrect` so the UI can offer a retry (matching
-/// 7-Zip's re-prompt behavior); without a password they stay engine errors.
-fn map_op_res(op_res: i32, password_provided: bool) -> ZipnestError {
+/// 三种结果，处理方式必须不同：
+///
+/// * `kWrongPassword`(9) —— 引擎自己判定「密钥不对」，依据是条目里存的校验值
+///   （WinZip AES 的 2 字节校验值、ZipCrypto 的检查字节）。直接回
+///   [`ZipnestError::PasswordIncorrect`]，让 UI 再问一次密码。
+/// * `kDataError`(2) / `kCRCError`(3) —— 解出来的内容对不上，**既可能是密钥错，
+///   也可能是数据坏**。分两种情况：
+///   - `key_checked` 为真（ZIP 家族，见 `Archive::key_verified`）：引擎在解码
+///     每条数据前已经验过密钥，密钥不对时它早就报 9 了。能走到这里说明密钥是
+///     对的，坏的是数据 → [`ZipnestError::Corrupt`]。这正是本缺陷要的效果：
+///     密码正确却遇到坏数据，用户不会再被反复要求重输密码。
+///   - `key_checked` 为假（7z、RAR 等没有校验值的格式）：错密钥同样会落到
+///     2/3。实测 7z 用 Copy 存数据时错密码报 3、用 LZMA2 压缩时报 2，与真的
+///     数据损坏完全同形。既然分不开，就按「可能是密码错」处理 —— 宁可让打错
+///     密码的人多试一次，也不能把密码打错的包判成「已损坏」而让他再也不试。
+///
+/// 没提供密码时维持原来的泛化错误：那条路径不涉及密钥，不属本次改动。
+fn map_op_res(op_res: i32, password_provided: bool, key_checked: bool) -> ZipnestError {
     match op_res {
         OP_WRONG_PASSWORD => ZipnestError::PasswordIncorrect,
+        OP_DATA_ERROR | OP_CRC_ERROR if password_provided && key_checked => {
+            // 条目列表由 `extract_to_disk` 补上：它手上才有这次没写出来的条目。
+            ZipnestError::Corrupt(Vec::new())
+        }
         OP_DATA_ERROR | OP_CRC_ERROR if password_provided => ZipnestError::PasswordIncorrect,
         _ => ZipnestError::Engine(E_FAIL),
     }
@@ -329,7 +345,7 @@ pub(crate) fn read_entry(
         return Err(if op_res < 0 {
             ZipnestError::Engine(E_FAIL)
         } else {
-            map_op_res(op_res, password_provided)
+            map_op_res(op_res, password_provided, arc.key_verified())
         });
     }
 
@@ -1052,6 +1068,15 @@ unsafe extern "system" fn disk_op_result(this: *mut c_void, op_res: i32) -> Hres
             }
         } else {
             let _ = std::fs::remove_file(os_path(&pw.tmp));
+            // 引擎说这个条目的数据不对（CRC/解码失败）或密码不对 —— 两种情况
+            // 下这个文件都没写出来。记进 failed，`extract_to_disk` 才能把它们
+            // 连同最终错误一起交给 UI，而不是在致命路径上丢掉这份名单。
+            if op_res != OP_OK
+                && st.cancelled.load(Ordering::SeqCst) == 0
+                && st.blocked.load(Ordering::SeqCst) == BLOCK_NONE
+            {
+                st.record_failure(&pw.raw, "error.corrupt", None);
+            }
         }
     }
 
@@ -1200,7 +1225,16 @@ pub(crate) fn extract_to_disk(
     }
     let op_res = state.first_op_res.load(Ordering::SeqCst);
     if op_res != 0 {
-        return Err(map_op_res(op_res, password.is_some()));
+        let mut err = map_op_res(op_res, password.is_some(), arc.key_verified());
+        // 条目名单一走致命路径就会丢：下面那些 `?` 之外没人再读 `state.failed`。
+        // 「哪些条目没写出来」是用户唯一的线索，所以在这里把名单挂到错误上，
+        // 让 UI 能像 `error.entries_failed` 那样逐条列出来。
+        if let ZipnestError::Corrupt(ref mut entries) = err {
+            if let Ok(mut f) = state.failed.lock() {
+                entries.append(&mut f);
+            }
+        }
+        return Err(err);
     }
     if hr < 0 {
         return Err(crate::error::map_hresult(hr));

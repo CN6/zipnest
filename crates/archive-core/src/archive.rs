@@ -34,7 +34,30 @@ pub struct Archive {
     /// read-only for as long as it is open, so a cached list cannot go stale
     /// and the enumeration only ever has to happen once.
     entries: OnceLock<Arc<Vec<ArchiveEntry>>>,
+    /// 这个 handler 在解码每条数据之前会先校验密钥。
+    ///
+    /// 只有 ZIP 家族为真：WinZip AES 条目带 2 字节密钥校验值，ZipCrypto 带检查
+    /// 字节，7-Zip 的 Zip 解码器在它们对不上时报 `kWrongPassword`(9)，因此
+    /// 走到 `kDataError`/`kCRCError` 时密钥一定是对的，坏的是数据。
+    /// 7z 没有这类校验值，错密钥会直接漏成 2/3，两者无法区分。
+    /// 实测见 `crates/archive-core/src/extract.rs` 的 `map_op_res`。
+    key_verified: bool,
     _not_send: *mut (),  // keep !Send/!Sync: IInArchive is not thread-safe
+}
+
+/// 这个 handler 会不会在解码数据**之前**校验密钥？
+///
+/// 只有 ZIP 家族会：WinZip AES 条目带 2 字节密钥校验值，ZipCrypto 条目带检查
+/// 字节，两者的密钥不对时 Zip 解码器报 `kWrongPassword`(9) 而不是数据错误。
+/// 因此 ZIP 走到 `kDataError`/`kCRCError` 时，密钥已通过校验，坏的是数据。
+///
+/// 7z / RAR / TAR / ISO 等没有这类校验值：错密钥会直接漏成数据错误或 CRC 错误，
+/// 和真的数据损坏无法区分。这条判定的依据是实测（Zip 家族用错密码 400/400 次
+/// 全报 9，7z 用错密码 20/20 次全报 2/3），不是读文档猜的。
+///
+/// 只按格式判定，不看密码：本条只用于把「密钥已确认正确」这个结论传下去。
+fn key_verified_for(clsid: &Guid) -> bool {
+    *clsid == CLSID_FORMAT_ZIP
 }
 
 /// Strip a numeric multi-volume suffix (`.001`, `.0001`, ...). 7-Zip's
@@ -160,6 +183,7 @@ impl Archive {
                     raw,
                     stream: stream.into_raw(),
                     entries: OnceLock::new(),
+                    key_verified: key_verified_for(clsid),
                     _not_send: std::ptr::null_mut(),
                 });
             }
@@ -289,6 +313,7 @@ impl Archive {
                     raw,
                     stream: combined,
                     entries: OnceLock::new(),
+                    key_verified: key_verified_for(clsid),
                     _not_send: std::ptr::null_mut(),
                 });
             }
@@ -427,6 +452,11 @@ impl Archive {
         max_bytes: Option<u64>,
     ) -> Result<Vec<u8>, ZipnestError> {
         crate::extract::read_entry(self, index, opts.password.clone(), max_bytes)
+    }
+
+    /// 这个 handler 是否在解码每条数据前校验过密钥（见 [`key_verified_for`]）。
+    pub(crate) fn key_verified(&self) -> bool {
+        self.key_verified
     }
 
     /// Extract entries to disk with security/progress/cancel (Task 8).

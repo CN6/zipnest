@@ -58,6 +58,77 @@ fn list_children_returns_dir_children() {
     assert!(kids[0].path.ends_with("b.txt"));
 }
 
+/// 列目录和搜索必须能在归档锁被 worker 线程一直握着的时候照常返回。
+///
+/// 回归场景（已核实的缺陷）：extract 的 worker 从 `shared.lock()` 起一直握着
+/// 归档的 `Mutex` 到解压结束，从前 `list_children` / `search_entries` 在同一把
+/// 锁上同步阻塞，而 UI 线程在 navigate / run_search 里直接调用它们 —— 解压运行中
+/// 翻一个目录，窗口就整块冻住，连取消按钮都点不到。现在两条路径都只读打开时缓存
+/// 的条目列表，完全不碰那把锁。
+#[test]
+fn listing_and_search_do_not_wait_for_the_archive_lock() {
+    let svc = std::sync::Arc::new(zipnest_ipc::IpcService::with_settings_path(
+        Arc::new(|_: &str, _: serde_json::Value| {}),
+        std::time::Duration::ZERO,
+        std::env::temp_dir().join(format!("zipnest-lock-{}.json", std::process::id())),
+    ));
+    let r = svc
+        .open_archive(fx("plain.zip").to_string_lossy().into(), None)
+        .unwrap();
+
+    // 让另一个线程把归档锁整段握住，模拟正在解压的 worker。握住之前、放下之前
+    // 都用一次握手确认，测试才不会在"还没锁上"的情况下侥幸通过。
+    let shared = svc.registry.get(r.id).expect("the archive must be registered");
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = held_tx.send(());
+        let _ = release_rx.recv();
+    });
+    held_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the helper thread never took the lock");
+
+    // 锁确实被别的线程握着。这两次调用必须立刻返回：若实现退回成"列目录要取
+    // 归档锁"，它们会超时失败，而不是把整个测试挂死。
+    let (tx, rx) = std::sync::mpsc::channel();
+    let caller = std::sync::Arc::clone(&svc);
+    std::thread::spawn(move || {
+        let kids = caller.list_children(r.id, "sub/".into());
+        let hits = caller.search_entries(r.id, "b.txt".into(), 100);
+        let _ = tx.send((kids, hits));
+    });
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("list_children / search_entries blocked on the archive lock");
+    let kids = got.0.expect("listing must succeed while a job holds the lock");
+    assert!(kids.iter().any(|e| e.path.ends_with("b.txt")));
+    let hits = got.1.expect("search must succeed while a job holds the lock");
+    assert!(hits.iter().any(|e| e.path.ends_with("b.txt")), "got {hits:?}");
+
+    let _ = release_tx.send(());
+    let _ = holder.join();
+}
+
+/// 关闭归档必须把打开时缓存的条目列表一并丢掉，否则一个已关闭的归档的全部条目
+/// 会按 id 永远留在进程里 —— 又一个泄漏，只是这次漏的是条目而不是句柄。
+#[test]
+fn closing_an_archive_drops_its_cached_entry_list() {
+    let (svc, _) = service();
+    let r = svc
+        .open_archive(fx("plain.zip").to_string_lossy().into(), None)
+        .unwrap();
+    assert!(svc.registry.entries(r.id).is_some(), "open must cache the list");
+
+    svc.close_archive(r.id);
+    assert!(
+        svc.registry.entries(r.id).is_none(),
+        "closed archive must not keep its entry list"
+    );
+    assert_eq!(svc.open_archive_count(), 0);
+}
+
 #[test]
 fn closing_an_archive_really_releases_it() {
     // The UI closes the archive it is replacing; without that, every archive a
@@ -426,6 +497,63 @@ fn extract_wrong_password_reports_key() {
     assert_eq!(fin.1["ok"], false);
     assert_eq!(fin.1["error_key"].as_str(), Some("error.password_incorrect"));
     std::fs::remove_dir_all(&dest).ok();
+}
+
+/// 加密 ZIP 内容坏了 + 密码正确：必须报 `error.corrupt`，并且把没写出来的
+/// 条目随事件交出去。
+///
+/// 用户侧的差别很大：「密码错误」意味着再输一次就有救，`error.password_incorrect`
+/// 也确实会被 UI 变成第二个密码框；「已损坏」才是真的，再输多少次也没用。
+/// 同时这条致命路径以前会丢掉 failed 名单 —— 用户只知道少了东西，不知道少了什么。
+#[test]
+fn extract_damaged_encrypted_zip_reports_corrupt_with_entry_list() {
+    let (svc, events) = service();
+    // 在测试里现场改坏密文字节（AES 密文区从偏移 64 开始），不依赖额外的 fixture。
+    let tmp = std::env::temp_dir().join(format!("zipnest-bad-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let damaged = tmp.join("damaged.zip");
+    let mut bytes = std::fs::read(fx("enc.zip")).unwrap();
+    bytes[70] ^= 0xFF;
+    std::fs::write(&damaged, &bytes).unwrap();
+
+    let r = svc
+        .open_archive(damaged.to_string_lossy().into(), None)
+        .unwrap();
+    let dest = tmp.join("out");
+    let job = svc
+        .extract(
+            r.id,
+            vec!["a.txt".into()],
+            dest.to_string_lossy().into(),
+            Some("overwrite".into()),
+            Some("secret".into()),
+        )
+        .unwrap();
+    wait_events(&events, 5000, |v| {
+        v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job)
+    });
+    let v = events.lock().unwrap();
+    let fin = v.iter().find(|(n, _)| n == "job_finished").unwrap();
+    assert_eq!(fin.1["ok"], false);
+    assert_eq!(
+        fin.1["error_key"].as_str(),
+        Some("error.corrupt"),
+        "密码对了、数据坏了，不能报成密码错误"
+    );
+    // 没写出来的条目要能列出来。
+    let failed = v
+        .iter()
+        .find(|(n, _)| n == "extract_failed")
+        .expect("损坏时也要发出 extract_failed，带上没法写出来的条目");
+    assert_eq!(failed.1["count"].as_u64(), Some(1));
+    assert_eq!(failed.1["entries"][0]["path"].as_str(), Some("a.txt"));
+    assert_eq!(failed.1["entries"][0]["reason"].as_str(), Some("error.corrupt"));
+    drop(v);
+
+    assert!(!dest.join("a.txt").exists(), "坏掉的数据不该落盘");
+    svc.close_archive(r.id);
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 // The password given at open time must carry over to extract — the UI has

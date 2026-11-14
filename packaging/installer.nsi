@@ -3,7 +3,7 @@ Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.4.34"
+!define VERSION "0.4.35"
 ; This installer is a 32-bit process, so plain $PROGRAMFILES would resolve to
 ; "C:\Program Files (x86)" on 64-bit Windows. ZipNest ships as x64, so force
 ; the 64-bit location. InstallDirRegKey below still reads HKCU\...\ZipNest's
@@ -77,7 +77,7 @@ Unicode True
 !macroend
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.4.34_x64-setup.exe"
+OutFile "ZipNest_0.4.35_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -86,7 +86,7 @@ SetCompressor /SOLID lzma
 ; The setup exe's own version resource. Without this, right-click → 属性 →
 ; 详细信息 on the downloaded installer shows no version at all, so two downloads
 ; from different releases look identical in Explorer.
-VIProductVersion "0.4.34.0"
+VIProductVersion "0.4.35.0"
 VIAddVersionKey "ProductName" "ZipNest"
 VIAddVersionKey "FileDescription" "ZipNest 安装程序"
 VIAddVersionKey "FileVersion" "${VERSION}"
@@ -265,6 +265,7 @@ zn_copy_retry:
   Delete "$INSTDIR\zipnest.exe"
   Delete "$INSTDIR\zipnest_shell.dll"
   Delete "$INSTDIR\uninstall.exe"
+  RMDir /r "$INSTDIR\Assets"
   Delete "$INSTDIR\Win11Shell\ZipNestShell.msix"
   Delete "$INSTDIR\Win11Shell\install.ps1"
   Delete "$INSTDIR\Win11Shell\uninstall.ps1"
@@ -310,6 +311,12 @@ zn_copy_files:
   ; the signed Win11Shell\ZipNestShell.msix carries the manifest + assets.
   SetOutPath "$INSTDIR"
   File "..\dist-portable\ZipNest\zipnest_shell.dll"
+  ; The logo assets the shell resolves the package's Square44x44Logo against.
+  ; With `-ExternalLocation $INSTDIR` the manifest's relative `Assets\…` paths
+  ; point here, not into the .msix; without this folder the taskbar draws its
+  ; generic grey square for context-menu launches.
+  SetOutPath "$INSTDIR\Assets"
+  File "..\dist-portable\ZipNest\Assets\*.png"
   SetOutPath "$INSTDIR\Win11Shell"
   File "..\dist-portable\ZipNest\Win11Shell\ZipNestShell.msix"
   File "..\dist-portable\ZipNest\Win11Shell\ZipNestCodesign.cer"

@@ -172,6 +172,32 @@ UI that lived in `apps/zipnest` was removed in v0.4.22; it was never shipped.
   `ViewportCommand::Focus` and its own background fill (eframe clears immediate
   viewports with `[0,0,0,0]`, not the app's clear colour). A page needs none of
   that, which is why it won.
+- **The create wizard is an owned window, not a sibling** (v0.4.35). It is still
+  an immediate viewport, so it is a separate top-level window, but
+  `dialog_window::attach` sets `GWL_HWNDPARENT` (= *owner* for a top-level HWND)
+  to the main window and `create_window_position` centres it on the main window's
+  outer rect. Before that, Windows cascaded it anywhere (measured: main at
+  507,587, wizard at 338,338), clicking the main window dropped it behind, and it
+  took a taskbar button of its own. eframe/egui expose no owner API, hence the raw
+  Win32 call. Re-set per opening: the HWND is new every time, so `create_owned` is
+  cleared when the wizard finishes.
+- **Window icons must be set on both sizes, and the package logo is a separate
+  thing** (v0.4.35). `window_icon::apply_to_all_windows` loads this exe's `ICON`
+  resource at `SM_CXICON`/`SM_CXSMALL` and applies it (plus the window-class
+  default) to every top-level window, because winit's `with_icon` sets only
+  `ICON_SMALL` and eframe's setter only touches `GetActiveWindow` — which is the
+  wizard when a context-menu launch creates it first. `WM_SETICON` is `0x80`;
+  `0x7F` is `WM_GETICON` and silently reads instead of writing. That alone is not
+  enough for context-menu launches: those inherit MSIX package identity, and the
+  taskbar then draws the **package** logo, resolved from
+  `packaging\win11-shell\Assets\*.png` **in the install directory** (the package
+  is registered with `-ExternalLocation $INSTDIR`, so the manifest's relative
+  `Assets\…` paths point there, not into the .msix). Without that folder the
+  button is Windows' generic grey square. `installer.nsi` and
+  `stage-portable.ps1` both stage the folder;
+  `SetCurrentProcessExplicitAppUserModelID` does **not** fix it (Windows ignores
+  it for a process that has package identity — read back with
+  `GetApplicationUserModelId` after setting it).
 - **`shell_register` refuses a `target/` exe path** (`error.shell.dev_path`), so a
   `cargo run` / `cargo test` build can never become the system handler. To exercise
   the real registration path by hand, copy the binary somewhere else first

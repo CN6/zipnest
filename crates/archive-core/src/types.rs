@@ -228,6 +228,23 @@ pub struct CreateSource {
     pub node: String,
 }
 
+/// 创建时被跳过的符号链接 / 目录联接（junction）。
+///
+/// 打包只跟随真实目录树，不跟随链接：跟随会让同一个文件在包里出现两次
+/// （链接 + 目标），也可能把用户没选的目录卷进来。跳过是既定策略，但必须
+/// 让对方看得见 —— 否则一个只装着链接的目录会得到「完成」，而实际什么都没
+/// 进包。进程内的 junction 在 `symlink_metadata` 里同样算 symlink，所以它
+/// 连同整棵子树都会被记在这里。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedLink {
+    /// 链接本身的路径（与传给 `collect_sources` 的输入同一形式）。
+    pub path: PathBuf,
+    /// 链接指向目录（目录符号链接 / junction）时为 `true`。
+    ///
+    /// 由跟随链接后的元数据判定；悬空链接读不到目标，按文件计。
+    pub is_dir: bool,
+}
+
 /// Progress snapshot handed to the create callback.
 #[derive(Debug, Clone)]
 pub struct CreateProgress {
@@ -242,4 +259,10 @@ pub struct CreateStats {
     pub files: u32,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// 分卷覆盖后删不掉的旧卷备份数（`<dest>.old-<tag>.NNN`）。
+    ///
+    /// 备份删除是收尾的 best-effort：文件被别的程序占住时删不掉，但**新卷已经
+    /// 就位、旧内容也还在磁盘上**，所以这不是失败。非零时调用方应当如实告诉
+    /// 用户「旧卷留在 `<name>.old-…` 里，可以手动删」，而不是一声不吭。
+    pub kept_backup_files: u32,
 }

@@ -80,5 +80,11 @@ if ($Sign) {
     if ($LASTEXITCODE -ne 0) { throw "sign-package failed ($LASTEXITCODE)" }
 }
 
+# The stage is build input. `-OutDir` is sometimes the payload folder that gets
+# copied into the installer and the portable zip (stage-portable.ps1 passes
+# Win11Shell), so leaving it behind shipped a second copy of the manifest and
+# assets under Win11Shell\pkg.
+Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+
 Write-Host "Built $msix"
 Write-Host "Register with:  .\install.ps1 -InstallDir <app install dir>"

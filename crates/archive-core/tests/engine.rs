@@ -475,6 +475,53 @@ fn encrypted_zip_extract_with_password_succeeds() {
     assert!(dest.join("a.txt").exists());
     let _ = std::fs::remove_dir_all(&dest);
 }
+
+/// 加密 ZIP 里的数据坏了，必须报「已损坏」，不能报「密码错误」。
+///
+/// 缺陷的现场：`map_op_res` 把任何 `kDataError`/`kCRCError` 都当成密码不对，
+/// 于是用户输对了密码、包里的数据却坏了时，界面只会说「密码错误」并再要一次
+/// 密码 —— 他要输入多少遍才会明白是文件坏了。
+///
+/// 破坏方式是在测试里现场改密文字节，而不是往 fixtures/ 里塞一个翻过位的样本：
+/// 坏在哪一位、怎么坏，读代码就一清二楚，也不依赖某个二进制文件恰好被怎么改过。
+/// 翻转点选在 AES 的密文区（本地头 30 + 文件名 5 + extra 11 = 46，salt 16 +
+/// 校验值 2 → 密文从偏移 64 开始），避开头部的密钥校验值，否则引擎会先发现
+/// 密钥不对而报 `kWrongPassword` —— 那是另一条路径。
+#[test]
+fn encrypted_zip_with_correct_password_and_bad_data_is_reported_as_damaged() {
+    let dir = tmpdir("zpwbad");
+    std::fs::create_dir_all(&dir).unwrap();
+    let damaged = dir.join("enc-damaged.zip");
+    let mut bytes = std::fs::read(fx("enc.zip")).expect("read fixture");
+    bytes[70] ^= 0xFF; // AES 密文区中间的一个字节
+    std::fs::write(&damaged, &bytes).unwrap();
+
+    let arc = Archive::open(&damaged, ArchiveOpenOptions::default()).expect("zip still opens");
+    let dest = dir.join("out");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        on_conflict: OnConflict::Overwrite,
+    };
+    let err = arc
+        .extract(&opts, Some("secret"), &mut |_p| true)
+        .expect_err("damaged data must fail");
+
+    assert_eq!(
+        err.error_key(),
+        "error.corrupt",
+        "用对密码却遇到坏数据，必须说「已损坏」；说成密码错误会让用户永远重输密码。got {err:?}"
+    );
+    // 而且它不能被当成密码问题：UI 据此决定「再问一次密码」还是「告诉他文件坏了」。
+    assert_ne!(err.error_key(), "error.password_incorrect");
+    // 没写出来的条目要能被列出来（fatal 路径以前会把这份名单丢掉）。
+    assert!(
+        !dest.join("a.txt").exists(),
+        "坏掉的条目不该出现在目标里"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
 // ---- Task 10: centralized HRESULT mapping ----
 
 #[test]

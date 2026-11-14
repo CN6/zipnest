@@ -2,9 +2,11 @@
 //! Windows GUI subsystem: no console window pops up during normal use.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod dialog_window;
 mod i18n;
 mod single_instance;
 mod theme;
+mod window_icon;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -22,6 +24,10 @@ const DESIGN_WIDTH: f32 = 900.0;
 /// list itself would survive a narrower window; the chrome around it does not.
 const MIN_WIDTH: f32 = 720.0;
 const MIN_HEIGHT: f32 = 420.0;
+
+/// 结果窗口里逐条列出的行数上限（没进包的链接）。再多就一行「还有 N 项」，
+/// 因为一个装满 junction 的目录能有上万条，全画出来只会让窗口卡住。
+const SKIPPED_LIST_MAX: usize = 200;
 
 /// The same floor in the units the viewport asks for.
 ///
@@ -539,6 +545,9 @@ struct JobState {
     skipped: u64,
     /// Entries written under a rewritten name. All of them are on disk.
     renamed: u64,
+    /// 创建时被跳过、没有进包的链接数（符号链接 / 目录联接）。非 0 表示这个
+    /// 压缩包不完整 —— 内容仍然可用，但用户必须看见少了什么。
+    create_skipped: u64,
     /// This extract asked the IPC layer to remove its source on success.
     delete_archive: bool,
     title: String,
@@ -938,6 +947,14 @@ fn sort_rows(rows: &mut [EntryDto], key: SortKey, ascending: bool) {
     });
 }
 
+/// 任务运行期间被挡下的视图切换，任务结束后补做。
+enum PendingView {
+    /// 翻到某个目录。
+    Dir(String),
+    /// 按搜索框里的当前内容重新过滤（词本身还在 `App::search` 里）。
+    Search,
+}
+
 struct App {
     ctx: egui::Context,
     svc: Arc<IpcService>,
@@ -989,6 +1006,12 @@ struct App {
     /// What the archive-wide filter box holds. Non-empty means `rows` is a
     /// search result, not the contents of `cwd`.
     search: String,
+    /// 搜索框最后一次被敲字的时刻。输入停顿 150ms 才真正过滤一次，否则每敲一个
+    /// 字都会把整份条目列表过一遍。
+    search_typed_at: Option<std::time::Instant>,
+    /// 有任务在跑时被挡下的那一次翻目录 / 搜索。任务一结束就补上，否则搜索框里
+    /// 是新词、列表还是旧词的结果，用户只能再敲一次才看得到。
+    pending_view: Option<PendingView>,
     cwd: String,
     rows: Vec<EntryDto>,
     selected: std::collections::HashSet<String>,
@@ -1019,6 +1042,10 @@ struct App {
     /// `(name in the archive, name on disk)` for entries the last extraction
     /// had to rewrite so they could be written at all.
     renamed_entries: Vec<(String, String)>,
+    /// 上一次创建时因为是指向别处的链接而没有进包的条目：`(路径, 是否目录)`。
+    /// 由 `create_skipped` 事件填，与 `renamed_entries` 一样属于「那一次任务」，
+    /// 新任务开始时清空。
+    skipped_links: Vec<(String, bool)>,
     /// Extra lines under an error message: which entries failed and why. Kept
     /// apart from `error` so a failure dialog can list them.
     error_detail: Vec<String>,
@@ -1040,7 +1067,18 @@ struct App {
     create_password_confirm: String,
     /// Set when 开始创建 was pressed on a destination that already exists: the
     /// replacement is irreversible, so it takes a second, explicit click.
+    ///
+    /// 分卷时被替换的是 `<dest>.001`、`.002`…，不带后缀的 `dest` 从不生成 ——
+    /// 这道确认必须分开问，否则分卷覆盖别人的旧卷序列时一个字都不提示。
     create_confirm_overwrite: bool,
+    /// 当前这道确认说的是哪个分卷序列：0 表示问的是不带后缀的那个文件，大于 0
+    /// 表示问的是那串已有分卷，文案里的 N 就是提出问题时数到的卷数。存下来是
+    /// 为了让文案与用户按下开始创建那一刻看到的情况一致。
+    create_confirm_volumes: u32,
+    /// 提出这道确认时 `create_dest` 是什么。目标框在确认框挂着时仍然可以用
+    /// 「浏览…」改掉，换了位置 `create_confirm_volumes` 里的 N 就成了旧地方的
+    /// 数字 —— 比对一下，不相同就撤掉问题，让用户在新位置再按一次。
+    create_confirm_dest: String,
     create_encrypt_names: bool,
     create_volume: String,
     create_custom_volume: String,
@@ -1049,6 +1087,9 @@ struct App {
     /// front. Windows creates a new OS window behind the main one; without
     /// this it would appear underneath the app it belongs to.
     create_raised: bool,
+    /// Whether the wizard window has been made an owned window of the main one
+    /// yet (see `dialog_window`). Reset on every opening: the HWND is new.
+    create_owned: bool,
     show_settings: bool,
     /// Per-extension state for the Settings status line (is Windows' recorded
     /// handler ours?), re-read whenever the page opens, after a save, and
@@ -1213,6 +1254,8 @@ impl App {
             archive_path: String::new(),
             open_after_extract: None,
             search: String::new(),
+            search_typed_at: None,
+            pending_view: None,
             cwd: String::new(),
             rows: Vec::new(),
             archive_password: None,
@@ -1236,6 +1279,7 @@ impl App {
             extract_dest: String::new(),
             extract_skipped: 0,
             renamed_entries: Vec::new(),
+            skipped_links: Vec::new(),
             error_detail: Vec::new(),
             overwrite: true,
             delete_source: false,
@@ -1248,11 +1292,14 @@ impl App {
             create_password: String::new(),
             create_password_confirm: String::new(),
             create_confirm_overwrite: false,
+            create_confirm_volumes: 0,
+            create_confirm_dest: String::new(),
             create_encrypt_names: false,
             create_volume: "off".into(),
             create_custom_volume: String::new(),
             create_sfx: false,
             create_raised: false,
+            create_owned: false,
             show_settings: false,
             assoc_rows,
             show_donate: false,
@@ -1378,6 +1425,10 @@ impl App {
             let n = self.job.as_ref().map(|j| j.renamed).unwrap_or(0);
             text = text.replace("{count}", &n.to_string());
         }
+        if key == "job.ok_create_skipped" {
+            let n = self.job.as_ref().map(|j| j.create_skipped).unwrap_or(0);
+            text = text.replace("{count}", &n.to_string());
+        }
         if key == "settings.corrupt" {
             let path = self.settings_backup.clone().unwrap_or_default();
             text = text.replace("{path}", &path);
@@ -1489,6 +1540,29 @@ impl App {
                     }
                     self.renamed_entries = pairs;
                 }
+                "create_skipped" => {
+                    // 符号链接 / 目录联接没有进包。和 `extract_renamed` 同一套
+                    // 写法：整份列表留在这里，结果窗口逐条列出，条数另记一份供
+                    // 文案用（列表可能被截断）。
+                    let links: Vec<(String, bool)> = payload["entries"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(|e| {
+                                    (
+                                        e["path"].as_str().unwrap_or_default().to_string(),
+                                        e["is_dir"].as_bool().unwrap_or(false),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let count = payload["count"].as_u64().unwrap_or(0);
+                    if let Some(j) = self.job.as_mut() {
+                        j.create_skipped = count;
+                    }
+                    self.skipped_links = links;
+                }
                 "extract_failed" => {
                     // Files are missing. Build the lines the error dialog shows:
                     // the OS's own words (when it had any) plus one line per
@@ -1572,9 +1646,15 @@ impl App {
                     self.open_after_extract = None;
                     if ok {
                         let renamed = self.job.as_ref().map(|j| j.renamed).unwrap_or(0);
+                        let skipped_links =
+                            self.job.as_ref().map(|j| j.create_skipped).unwrap_or(0);
                         self.notice = Some(
                             if delete_archive {
                                 "job.ok_deleted"
+                            } else if skipped_links > 0 {
+                                // 创建成功，但包是「缺了一部分」的：链接没跟进。
+                                // 用单独一句话说清楚，不能只报「完成」。
+                                "job.ok_create_skipped"
                             } else if renamed > 0 {
                                 "job.ok_renamed"
                             } else if skipped > 0 {
@@ -1624,7 +1704,15 @@ impl App {
                     // Done or cancelled: close only when the user asked for it.
                     // The window carries the "done" message (and the output
                     // path), so disappearing on its own hides the result.
-                    if self.settings.auto_close_after_job && (ok || cancelled) {
+                    //
+                    // 有链接没进包时窗口不自动关：那几条路径和「哪些没打进去」
+                    // 只在这个窗口里，两秒后就没了，用户会以为备份是完整的。
+                    let incomplete = self
+                        .job
+                        .as_ref()
+                        .map(|j| j.create_skipped > 0)
+                        .unwrap_or(false);
+                    if self.settings.auto_close_after_job && (ok || cancelled) && !incomplete {
                         self.close_at =
                             Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
                     }
@@ -1702,6 +1790,8 @@ impl App {
         self.last_extract = None;
         self.cwd.clear();
         self.search.clear();
+        self.search_typed_at = None;
+        self.pending_view = None;
         self.rows.clear();
         self.selected.clear();
         self.anchor = None;
@@ -1745,6 +1835,9 @@ impl App {
                 self.cwd = String::new();
                 // The old archive's filter means nothing for this one.
                 self.search.clear();
+                self.search_typed_at = None;
+                // 上一个归档里被挡下的翻目录对新归档毫无意义。
+                self.pending_view = None;
                 self.dir_cache.insert(String::new(), root.clone());
                 self.rows = root;
                 self.selected.clear();
@@ -1787,6 +1880,17 @@ impl App {
         let Some(id) = self.archive.as_ref().map(|a| a.id) else {
             return;
         };
+        // A heavy job still owns the archive engine. Listing goes through the
+        // open-time entry cache now and can no longer block, but while a job
+        // runs the view stays where it is: moving it would leave the user
+        // looking at a folder whose files are being written underneath them.
+        if self.job_running() {
+            self.notice = Some("browser.busy".into());
+            // 任务一结束就把这次翻目录补上。
+            self.pending_view = Some(PendingView::Dir(dir));
+            return;
+        }
+        self.pending_view = None;
         // Walking into a folder from a search result means the user is done
         // searching: leave the box empty so the breadcrumb comes back and the
         // listing below is that folder, not a stale set of hits.
@@ -1886,7 +1990,14 @@ impl App {
                         .hint_text(hint),
                 );
                 if resp.changed() {
+                    // Record the keystroke; the filter itself runs once typing
+                    // pauses (see `App::run_search`).
+                    self.search_typed_at = Some(std::time::Instant::now());
                     self.run_search();
+                    // egui sleeps while nothing happens, so without this the
+                    // debounced pass would only run on the next unrelated
+                    // repaint — or never, leaving the stale rows on screen.
+                    self.ctx.request_repaint_after(Self::SEARCH_DEBOUNCE);
                 }
             });
         });
@@ -1895,6 +2006,8 @@ impl App {
         }
         if clear {
             self.search.clear();
+            // 点 × 是明确的一次操作，不等防抖。
+            self.search_typed_at = None;
             self.run_search();
         }
     }
@@ -1906,6 +2019,10 @@ impl App {
 
     /// Recompute the list for the current query. An empty query restores the
     /// directory the user was in.
+    ///
+    /// 输入停顿 `SEARCH_DEBOUNCE` 之后才真正过滤：每敲一个字都过一遍整份条目
+    /// 列表，在大压缩包上是白白加重每一次按键的负担。防抖只影响"什么时候算"，
+    /// 不影响算出来的结果。
     fn run_search(&mut self) {
         let Some(id) = self.archive.as_ref().map(|a| a.id) else {
             return;
@@ -1915,6 +2032,22 @@ impl App {
             self.navigate(&cwd);
             return;
         }
+        if self
+            .search_typed_at
+            .is_some_and(|t| t.elapsed() < Self::SEARCH_DEBOUNCE)
+        {
+            // 还停在输入里：等这一轮打字结束再算。
+            return;
+        }
+        self.search_typed_at = None;
+        if self.job_running() {
+            // Same rule as `navigate`: the rows stay as they were, and the
+            // user is told why instead of watching a frozen window.
+            self.notice = Some("browser.busy".into());
+            self.pending_view = Some(PendingView::Search);
+            return;
+        }
+        self.pending_view = None;
         // A search is a flat list from the whole archive, so it has no
         // directory to be "in": the breadcrumb goes away with it.
         self.rows = self
@@ -2104,6 +2237,9 @@ impl App {
     /// thousands of entries; drawing all of them costs more than the filter is
     /// worth, and no one scrolls past the first screenful anyway.
     const SEARCH_MAX: usize = 1000;
+    /// 搜索框输入停顿多久才真正过滤一次。手打一个字大约 100–200ms 一个，150ms
+    /// 让连续输入只算最后一次，停顿一下又不会觉得卡。
+    const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
     /// Drop the oldest cached icons. Runs at the start of the list, before any
     /// row is painted: egui frees a texture when its last handle goes, so
@@ -2903,6 +3039,8 @@ impl App {
         // Last job's rename/failure lists belong to the last job.
         self.renamed_entries.clear();
         self.error_detail.clear();
+        // 跳过链接的列表是创建任务的产物；解压窗口不该把它当成自己的。
+        self.skipped_links.clear();
         match self.svc.extract_with_delete(
             req.archive_id,
             req.sources,
@@ -3047,7 +3185,13 @@ impl App {
             return;
         }
         let title = self.t("create.title");
-        let builder = egui::ViewportBuilder::default()
+        // Where the wizard opens. It is an immediate viewport, i.e. a window of
+        // its own, and Windows would otherwise place it by its own cascade rule
+        // — measured drifting away from the main window (main at 507,587,
+        // wizard at 338,338), which reads as "a second program opened". Centred
+        // on the main window it reads as what it is: a dialog of this app.
+        let position = self.create_window_position();
+        let mut builder = egui::ViewportBuilder::default()
             .with_title(title.clone())
             // Fits the wizard at its natural height, plus room for the
             // password confirmation and the overwrite warning when they
@@ -3063,6 +3207,12 @@ impl App {
                 egui::vec2(430.0, 340.0) * (self.settings.ui_zoom.clamp(100, 200) as f32 / 100.0),
             )
             .with_resizable(true);
+        // The wizard is a dialog of the main window: owned by it (stays on top
+        // of it, minimizes with it, no taskbar button of its own) and centred
+        // on it. See `dialog_window`.
+        if let Some(position) = position {
+            builder = builder.with_position(position);
+        }
         let finished = ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("zipnest-create-wizard"),
             builder,
@@ -3075,9 +3225,29 @@ impl App {
                 // first frame of each opening asks for the front. A fresh
                 // window has never been seen, and appearing underneath the
                 // app is the same occlusion this window exists to escape.
-                if !self.create_raised && !embedded {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    self.create_raised = true;
+                if !embedded {
+                    // Own it outright: that is what keeps it above the main
+                    // window when the main window is clicked, and what stops
+                    // Windows from giving it a separate taskbar button.
+                    // Retried every frame until it sticks — the wizard's HWND
+                    // does not exist on the frame the request arrives.
+                    if !self.create_owned {
+                        self.create_owned = dialog_window::attach(&title, single_instance::WINDOW_TITLE);
+                        // The wizard is created after the first-frame icon pass,
+                        // so on every opening but the first it would come up
+                        // with no large icon of its own. Re-run the pass now
+                        // that its window exists.
+                        window_icon::apply_to_all_windows();
+                    }
+                    // Windows creates the new window *behind* the main one, so
+                    // the first frame of each opening asks for the front. A
+                    // fresh window has never been seen, and appearing
+                    // underneath the app is the same occlusion this window
+                    // exists to escape.
+                    if !self.create_raised {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.create_raised = true;
+                    }
                 }
                 // The window's own close button.
                 if ctx.input(|i| i.viewport().close_requested()) {
@@ -3122,14 +3292,51 @@ impl App {
         );
         if finished {
             self.show_create = false;
-            // The next opening is a brand-new window and must raise itself.
+            // The next opening is a brand-new window: it must raise itself and
+            // be owned again (the HWND that carried the old owner is gone).
             self.create_raised = false;
+            self.create_owned = false;
             // An immediate viewport is destroyed on the *next* frame, and egui
             // only draws when something asks it to. Clicking 取消 therefore
             // left the window on screen until an unrelated event woke the
             // loop. Ask for the frame that closes it.
             ctx.request_repaint();
         }
+    }
+
+    /// Where to open the create wizard, in the logical points `ViewportBuilder`
+    /// wants: centred on the main window, and clamped to the desktop.
+    ///
+    /// The wizard is a window of its own, and without a position Windows picks
+    /// one by its cascade rule — measured with the main window at (507,587) and
+    /// the wizard at (338,338), i.e. two windows drifting apart. Centring it on
+    /// the main window is what makes it read as a dialog of this app rather
+    /// than a second program.
+    ///
+    /// `None` (the first frame, before the viewport reports a geometry) simply
+    /// leaves placement to Windows for that frame; the user never sees it,
+    /// because the wizard is drawn from the second frame on anyway.
+    fn create_window_position(&self) -> Option<egui::Pos2> {
+        let rect = self.ctx.input(|i| i.viewport().outer_rect)?;
+        // The wizard is 470 wide and starts at 520 tall, but the form grows
+        // (a password confirmation, an overwrite warning); chaining height
+        // would make it jump when one appears, so it is placed by its default
+        // size.
+        const WIZARD: egui::Vec2 = egui::vec2(470.0, 520.0);
+        let desktop = self.ctx.input(|i| {
+            i.viewport()
+                .monitor_size
+                .unwrap_or_else(|| egui::vec2(1920.0, 1080.0))
+        });
+        // Top-left of the wizard: centred on the main window's outer rect.
+        let mut pos = rect.center() - WIZARD * 0.5;
+        // A main window right at a screen edge would push the wizard off it.
+        // Keep its title bar on screen with a margin, so it can always be
+        // grabbed and dragged.
+        let margin = 8.0;
+        pos.x = pos.x.clamp(margin, (desktop.x - WIZARD.x - margin).max(margin));
+        pos.y = pos.y.clamp(margin, (desktop.y - WIZARD.y - margin).max(margin));
+        Some(pos)
     }
 
     /// The wizard's contents. Returns true when it is done — started, or
@@ -3360,11 +3567,36 @@ impl App {
             // destination is pre-filled next to the sources, which is exactly
             // where an earlier archive of the same name usually sits, so this
             // is a realistic accident rather than a corner case.
-            let replaces = dest_absolute && std::path::Path::new(&dest).is_file();
+            //
+            // 分卷时落盘的是 `<dest>.001`、`.002`…，不带后缀的 `dest` 既不生成
+            // 也不会被碰 —— 只看那个文件，分卷覆盖掉别人的整串旧卷时一个字都
+            // 不会提示。所以两支互斥：不分卷问那个文件，分卷问那串同名卷。
+            let replaces_file = dest_absolute && std::path::Path::new(&dest).is_file();
+            let volume_bytes = match self.create_volume.as_str() {
+                "off" => None,
+                "10m" => Some(10 * 1024 * 1024),
+                "100m" => Some(100 * 1024 * 1024),
+                "1g" => Some(1024 * 1024 * 1024),
+                "custom" => parse_volume(&self.create_custom_volume),
+                _ => None,
+            };
             // A destination that vanished between frames must not leave the
-            // question standing.
-            if !replaces {
-                self.create_confirm_overwrite = false;
+            // question standing. 分卷那一支也是：确认框挂着的每一帧都会走到这里，
+            // 所以这里只查一个 `.001` 的 metadata，不扫目录 —— 数卷只在用户
+            // 按下开始创建的那一刻做一次。用户把分卷关掉也撤掉这个问题。
+            if self.create_confirm_overwrite {
+                let still = if self.create_confirm_volumes > 0 {
+                    volume_bytes.is_some()
+                        && self.create_confirm_dest == dest
+                        && std::path::Path::new(&format!("{dest}.001")).is_file()
+                } else {
+                    volume_bytes.is_none() && replaces_file
+                };
+                if !still {
+                    self.create_confirm_overwrite = false;
+                    self.create_confirm_volumes = 0;
+                    self.create_confirm_dest.clear();
+                }
             }
             // Pressing 开始创建 onto an existing archive swaps the button for
             // the confirmation row rather than adding a row below it: this
@@ -3375,13 +3607,21 @@ impl App {
             let mut start_clicked = false;
             let mut cancel_clicked = false;
             if self.create_confirm_overwrite {
+                // 分卷与单文件是两件事，文案必须分开：单文件那份说的是「这里
+                // 已经有一个压缩包」，对着五个 `.001..005` 说这句会让用户以为
+                // 要动的只是一样东西。
+                let warning = if self.create_confirm_volumes > 0 {
+                    self.t("create.overwrite_warning_volumes")
+                        .replace("{path}", &dest)
+                        .replace("{count}", &self.create_confirm_volumes.to_string())
+                } else {
+                    self.t("create.overwrite_warning").replace("{path}", &dest)
+                };
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            self.t("create.overwrite_warning").replace("{path}", &dest),
-                        )
-                        .size(12.0)
-                        .color(error_color(ui)),
+                        egui::RichText::new(warning)
+                            .size(12.0)
+                            .color(error_color(ui)),
                     )
                     .wrap(),
                 );
@@ -3399,6 +3639,8 @@ impl App {
                     // list too — so the answer to "not here" must leave the
                     // work in place for the user to point somewhere else.
                     self.create_confirm_overwrite = false;
+                    self.create_confirm_volumes = 0;
+                    self.create_confirm_dest.clear();
                 }
                 proceed = can && yes;
             } else {
@@ -3438,22 +3680,33 @@ impl App {
                     );
                 });
                 let enter = can && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if replaces && (start_clicked || enter) {
-                    self.create_confirm_overwrite = true;
-                } else {
-                    proceed = start_clicked || enter;
+                // 扫目录只发生在「用户按下开始创建」这一刻：每帧都数一遍会在
+                // 拖动窗口里反复 IO。分卷时只看那串卷（不带后缀的 `dest` 这一支
+                // 不会被写，问了反而是假警报），否则只看那个文件。
+                if start_clicked || enter {
+                    let volumes = if volume_bytes.is_some() {
+                        existing_volumes(&dest)
+                    } else {
+                        0
+                    };
+                    let collides = if volume_bytes.is_some() {
+                        volumes > 0
+                    } else {
+                        replaces_file
+                    };
+                    if collides {
+                        self.create_confirm_overwrite = true;
+                        self.create_confirm_volumes = volumes;
+                        self.create_confirm_dest = dest.clone();
+                    } else {
+                        proceed = true;
+                    }
                 }
             }
             if proceed {
                 self.create_confirm_overwrite = false;
-                let volume_bytes = match self.create_volume.as_str() {
-                    "off" => None,
-                    "10m" => Some(10 * 1024 * 1024),
-                    "100m" => Some(100 * 1024 * 1024),
-                    "1g" => Some(1024 * 1024 * 1024),
-                    "custom" => parse_volume(&self.create_custom_volume),
-                    _ => None,
-                };
+                self.create_confirm_volumes = 0;
+                self.create_confirm_dest.clear();
                 let req = CreateRequest {
                     format: self.create_format.clone(),
                     level: self.create_level.clone(),
@@ -3486,6 +3739,8 @@ impl App {
                         .unwrap_or_default(),
                     ..Default::default()
                 });
+                // 上一次任务的跳过列表属于上一次任务。
+                self.skipped_links.clear();
                 match svc.create_archive(self.create_sources.clone(), self.create_dest.clone(), req)
                 {
                     Ok(jid) => {
@@ -4081,12 +4336,55 @@ impl App {
         }
     }
 
+    /// 列出没有进包的链接（符号链接 / 目录联接）。
+    ///
+    /// 与 `job.renamed.header` 那块同一个画法：一句说明加一个有高度的滚动
+    /// 列表。链接很多时（一个装满 junction 的目录）不滚动的话窗口会被撑到
+    /// 屏幕外；条数再多也只在滚动区里画前 [`SKIPPED_LIST_MAX`] 条，剩下的用
+    /// 一行「还有 N 项」带过 —— 每帧画一万个标签比看不见更糟。
+    fn skipped_links_list(&self, ui: &mut egui::Ui, links: &[(String, bool)]) {
+        ui.separator();
+        let header = self
+            .t("job.create_skipped.header")
+            .replace("{count}", &links.len().to_string());
+        ui.add(egui::Label::new(egui::RichText::new(header).color(warning_color(ui))).wrap());
+        egui::ScrollArea::vertical()
+            .id_salt("zipnest-create-skipped-list")
+            .max_height(140.0)
+            .show(ui, |ui| {
+                for (path, is_dir) in links.iter().take(SKIPPED_LIST_MAX) {
+                    // 目录联接和文件链接对用户是两件事：前者「整个文件夹没进包」。
+                    let line = if *is_dir {
+                        format!("{path}  {}", self.t("job.create_skipped.dir"))
+                    } else {
+                        path.clone()
+                    };
+                    ui.add(egui::Label::new(line).wrap());
+                }
+                if links.len() > SKIPPED_LIST_MAX {
+                    let rest = (links.len() - SKIPPED_LIST_MAX).to_string();
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                self.t("job.create_skipped.more").replace("{count}", &rest),
+                            )
+                            .color(theme::secondary(ui)),
+                        )
+                        .wrap(),
+                    );
+                }
+            });
+    }
+
     fn job_window(&mut self, ctx: &egui::Context) {
         let Some(j) = self.job.clone() else {
             return;
         };
         let mut cancel = false;
         let mut close = false;
+        // 本任务要列出的跳过项先拷一份快照：窗口闭包里同时要用它和 `self` 上的
+        // 翻译方法，快照让借用关系简单，也不怕闭包执行期间列表被清空。
+        let skipped_links = self.skipped_links.clone();
         let center = ctx.content_rect().center() - egui::vec2(190.0, 70.0);
         egui::Window::new(j.title.clone())
             .id(egui::Id::unique("zipnest-job-window"))
@@ -4099,8 +4397,15 @@ impl App {
                 ui.add_sized([360.0, 22.0], egui::ProgressBar::new(bar).show_percentage());
                 if j.finished {
                     if j.ok {
+                        // 有链接没进包时这一行不是「完成」该有的绿色：包是好的，
+                        // 但它不是用户以为的那份完整备份。
+                        let colour = if j.create_skipped > 0 {
+                            warning_color(ui)
+                        } else {
+                            ok_color(ui)
+                        };
                         ui.colored_label(
-                            ok_color(ui),
+                            colour,
                             self.notice_text().unwrap_or_else(|| self.t("job.ok")),
                         );
                         // Where the files went. The app picks the folder, so it
@@ -4117,6 +4422,11 @@ impl App {
                             if ui.button(self.t("job.open_folder")).clicked() {
                                 open_path_in_explorer(&j.dest);
                             }
+                        }
+                        // 指向别处的链接没有跟进：逐条列出来，别让用户以为它们
+                        // 已经进包了。
+                        if !skipped_links.is_empty() {
+                            self.skipped_links_list(ui, &skipped_links);
                         }
                         // Entries whose archived name could not be stored as-is.
                         // They *are* on disk — under the name on the right — so
@@ -4136,6 +4446,10 @@ impl App {
                     } else {
                         let k = j.error_key.clone().unwrap_or_else(|| "error.engine".into());
                         ui.colored_label(error_color(ui), self.t(&k));
+                        // 「全是链接」这一类失败同样要说清是哪几条。
+                        if !skipped_links.is_empty() {
+                            self.skipped_links_list(ui, &skipped_links);
+                        }
                     }
                     if ui.button(self.t("job.close")).clicked() {
                         close = true;
@@ -4337,6 +4651,185 @@ fn parse_volume(input: &str) -> Option<u64> {
         .filter(|n| *n > 0)
 }
 
+/// 目标位置上已有的、下一次分卷压缩会替换掉的卷数量。
+///
+/// 为什么界面得自己数：分卷时真正落盘的是 `<dest>.001`、`.002`…，不带后缀的
+/// `dest` 从不生成，所以「目标已存在」不能只看那个文件。判定必须和后端
+/// `outstream::clear_volumes` 一致 —— 一边是「用户确认要替换的东西」，另一边
+/// 是「真的会被删掉的东西」，两者不一致就会出现「没问就把人东西删了」或
+/// 「问了却什么也没删」：
+/// - `dest` 必须是绝对路径（相对路径下「同目录」没有确定含义，后端同样拒绝）；
+/// - 只认文件名形如 `<dest 的文件名>.<3 位以上 ASCII 数字>` 的**普通文件**，
+///   文件名部分大小写不敏感（Windows 文件系统本来如此，这里显式折叠一次，
+///   不依赖文件系统的行为）；
+/// - 只数从 `.001` 起连续的那一段：缺号就停，数字更长（`.0001`）或更短
+///   （`.01`）都不算，同名目录/链接也到此为止，间隔之外的编号留给别人。
+///
+/// 返回 0 表示没有会被替换的分卷，也包括目录读不了、名字不是 UTF-8 这类拿不
+/// 准的情况：拿不准就不吓唬用户，后端动手前自己还会做一遍同样的判断。
+fn existing_volumes(dest: &str) -> u32 {
+    let dest = std::path::Path::new(dest);
+    if !dest.is_absolute() {
+        return 0;
+    }
+    let Some(name) = dest.file_name().and_then(|n| n.to_str()) else {
+        return 0;
+    };
+    let Some(dir) = dest.parent() else {
+        return 0;
+    };
+    let prefix = format!("{}.", name.to_ascii_lowercase());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    // 先把符合「<文件名>.<3 位以上纯数字>」的编号收起来，再用编号顺序走连续
+    // 性，这样 `.001` 之外的东西（`.999`、`.0001`、`.bak`）混不进序列。
+    let mut present = std::collections::HashSet::new();
+    for entry in entries.flatten() {
+        // 只数普通文件：同名目录或链接不算。`file_type` 不跟随链接，和后端用的
+        // `symlink_metadata` 是同一个口径：看到的是链接本身，不是它指向的目标。
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        let Some(suffix) = lower.strip_prefix(&prefix) else {
+            continue;
+        };
+        if suffix.len() >= 3 && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            present.insert(suffix.to_string());
+        }
+    }
+    // 卷名是 `{:03}`：1..=999 是三位、1000 起是四位，用格式化后的字符串去查
+    // 表，两种长度都对（与后端同一算法）。
+    let mut count = 0u32;
+    while present.contains(&format!("{:03}", count + 1)) {
+        count += 1;
+    }
+    count
+}
+
+#[cfg(test)]
+mod overwrite_volume_tests {
+    use super::existing_volumes;
+    use std::path::{Path, PathBuf};
+
+    /// 现建现删的临时目录：带上进程号，并行跑的测试也不会撞名。
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("zn-volask-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(path: &Path) {
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    /// 目录里的 `name` 作为目标时，会被替换的分卷数。
+    fn count(dir: &Path, name: &str) -> u32 {
+        existing_volumes(&dir.join(name).to_string_lossy())
+    }
+
+    #[test]
+    fn a_contiguous_run_counts_every_volume() {
+        let dir = temp_dir("run");
+        touch(&dir.join("backup.7z.001"));
+        touch(&dir.join("backup.7z.002"));
+        assert_eq!(count(&dir, "backup.7z"), 2);
+        touch(&dir.join("backup.7z.003"));
+        assert_eq!(count(&dir, "backup.7z"), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_count_stops_at_the_first_missing_number() {
+        // 缺号之后是别人的卷，后端删到缺号就停，所以这里也只能数到那里。
+        let dir = temp_dir("gap");
+        touch(&dir.join("backup.7z.001"));
+        touch(&dir.join("backup.7z.002"));
+        touch(&dir.join("backup.7z.004"));
+        assert_eq!(count(&dir, "backup.7z"), 2);
+        // 缺的正好是 `.001`：一段卷序列都提示不了。
+        let lone = temp_dir("gap2");
+        touch(&lone.join("backup.7z.002"));
+        assert_eq!(count(&lone, "backup.7z"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&lone);
+    }
+
+    #[test]
+    fn a_name_that_only_looks_like_a_volume_is_ignored() {
+        let dir = temp_dir("lookalike");
+        touch(&dir.join("backup.7z.bak"));
+        touch(&dir.join("backup.7z.01"));
+        touch(&dir.join("backup.7z.0001"));
+        touch(&dir.join("backup.7z.0010"));
+        touch(&dir.join("other.7z.001"));
+        touch(&dir.join("backup.7z2.001"));
+        assert_eq!(count(&dir, "backup.7z"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_is_not_a_volume() {
+        let dir = temp_dir("dir");
+        // 同名文件夹不能被当成「第 1 卷」去提示用户替换。
+        std::fs::create_dir_all(dir.join("backup.7z.001")).unwrap();
+        assert_eq!(count(&dir, "backup.7z"), 0);
+        std::fs::remove_dir_all(dir.join("backup.7z.001")).unwrap();
+        // 序列中间冒出目录：从那里往后都不算数。
+        touch(&dir.join("backup.7z.001"));
+        std::fs::create_dir_all(dir.join("backup.7z.002")).unwrap();
+        touch(&dir.join("backup.7z.003"));
+        assert_eq!(count(&dir, "backup.7z"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_name_comparison_ignores_ascii_case() {
+        let dir = temp_dir("case");
+        touch(&dir.join("BACKUP.7Z.001"));
+        touch(&dir.join("Backup.7z.002"));
+        // Windows 上这些本来就是同一个目标文件。
+        assert_eq!(count(&dir, "backup.7z"), 2);
+        // 反过来也一样：目标全大写，磁盘上的名字全小写。
+        assert_eq!(count(&dir, "BACKUP.7Z"), 2);
+        touch(&dir.join("backup.7z.003"));
+        assert_eq!(count(&dir, "BACKUP.7Z"), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_relative_destination_never_asks() {
+        // 相对路径下「同一个目录」没有确定含义，后端也直接拒绝它。
+        assert_eq!(existing_volumes("backup.7z"), 0);
+        assert_eq!(existing_volumes(r"volumes\backup.7z"), 0);
+    }
+
+    #[test]
+    fn a_destination_without_a_file_name_never_asks() {
+        assert_eq!(existing_volumes(r"C:\"), 0);
+    }
+
+    #[test]
+    fn a_destination_in_the_root_of_a_drive_is_readable() {
+        // `C:\backup.7z` 的父目录是 `C:\` 本身：这里既不能因为 parent 特殊就
+        // panic，也不能 join 出怪路径。只读一个不存在的名字，不需要写权限。
+        let temp = std::env::temp_dir();
+        let root = temp
+            .ancestors()
+            .find(|p| !p.as_os_str().is_empty() && p.parent().is_none())
+            .expect("temp dir has a drive root");
+        let dest = root.join(format!("zipnest-vol-test-{}.7z", std::process::id()));
+        assert!(dest.is_absolute());
+        assert_eq!(existing_volumes(&dest.to_string_lossy()), 0);
+    }
+}
+
 impl eframe::App for App {
     // 0.34 split the old `update` into `logic` (no ui, may run while hidden)
     // and `ui`. Everything this app does before drawing — polling jobs, taking
@@ -4344,12 +4837,49 @@ impl eframe::App for App {
     // keeps running while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs();
+        // 防抖到期的那一帧在这里补跑一次搜索：输入时的 `run_search` 只会返回，
+        // 真正过滤由这一行完成。`run_search` 自己会把 `search_typed_at` 清掉，
+        // 所以每个字最多只补一次。
+        if self
+            .search_typed_at
+            .is_some_and(|t| t.elapsed() >= Self::SEARCH_DEBOUNCE)
+        {
+            self.run_search();
+        }
+        // 任务跑着时被挡下的那次翻目录 / 搜索，任务一结束就补上。放在这里而不是
+        // `job_finished` 分支里：任务可能结束于任何一条路径（成功、取消、失败、
+        // 清空视图），只在一帧里判断"没有任务在跑"就不会漏。
+        if !self.job_running() {
+            if let Some(pending) = self.pending_view.take() {
+                if self.archive.is_some() {
+                    match pending {
+                        PendingView::Dir(dir) => {
+                            self.navigate(&dir);
+                        }
+                        PendingView::Search => {
+                            self.run_search();
+                        }
+                    }
+                    // 只收掉"正忙"这条提示；任务刚结束时状态栏可能正显示完成信息，
+                    // 那不是我们该清的。
+                    if self.pending_view.is_none() && self.notice.as_deref() == Some("browser.busy") {
+                        self.notice = None;
+                    }
+                }
+            }
+        }
 
         if self.show_on_first_frame {
             self.show_on_first_frame = false;
             // The size is applied by now, so the window can appear at its final
             // geometry instead of flashing a small default first.
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            // The exe's own icon, both sizes, on every window this process owns
+            // — including the create wizard, which is an immediate viewport and
+            // may not exist yet. See `window_icon` for why winit's
+            // `with_icon` was not enough (the taskbar fell back to a blank
+            // class icon whenever the wizard was the window Windows focused).
+            window_icon::apply_to_all_windows();
         }
 
         // Remember the window geometry so the next launch opens where the user
@@ -4610,6 +5140,9 @@ mod password_key_tests {
         assert!(!is_password_key("error.engine"));
         assert!(!is_password_key("error.cancelled"));
         assert!(!is_password_key("error.not_an_archive"));
+        // 数据坏了再输密码也没用：这条必须在「不再问密码」那一侧，
+        // 否则用户会对着一个坏掉的包反复输密码。
+        assert!(!is_password_key("error.corrupt"));
     }
 }
 
@@ -5141,6 +5674,16 @@ fn error_color(ui: &egui::Ui) -> egui::Color32 {
         egui::Color32::from_rgb(255, 122, 102)
     } else {
         egui::Color32::from_rgb(200, 60, 40)
+    }
+}
+
+/// Amber for "it worked, but not all of it" — a run that finished with content
+/// left out. Neither the done-green nor the failure-red is honest for that.
+fn warning_color(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(240, 186, 92)
+    } else {
+        egui::Color32::from_rgb(176, 112, 10)
     }
 }
 

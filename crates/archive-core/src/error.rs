@@ -1,5 +1,6 @@
 //! Unified error type for archive operations.
 
+use crate::types::EntryFailure;
 use archive_security::SecurityViolation;
 use std::fmt;
 
@@ -18,6 +19,12 @@ pub enum ZipnestError {
     PasswordRequired,
     /// Password supplied but rejected.
     PasswordIncorrect,
+    /// 已解出的内容对不上校验（CRC 不符 / 数据解码失败），也就是压缩包本身坏了。
+    ///
+    /// 单独成一类而不是并进 [`Self::PasswordIncorrect`]：两者在用户侧的处理完全
+    /// 相反 —— 密码错要让他再输一次，数据坏要让他别再试密码。携带的条目列表是
+    /// 本次没能写出来的那些（`read_entry` 这类单条目路径为空）。
+    Corrupt(Vec<EntryFailure>),
     /// A password was requested for a format that cannot encrypt (TAR family).
     PasswordUnsupported,
     /// User cancelled a progress-reporting operation.
@@ -28,6 +35,12 @@ pub enum ZipnestError {
     Security(SecurityViolation),
     /// Extracted bytes exceeded the configured quota.
     QuotaExceeded,
+    /// 同一个 `dest` 上已经有另一个分卷创建任务在跑（进程间互斥量没等到）。
+    ///
+    /// 单独成一类而不是并进 [`Self::Io`]：文件系统层面一切正常，用户要做的是
+    /// 「等一下再试」或「换个位置」，而 `error.io`（被占用 / 路径无效 / 磁盘满）
+    /// 会把他引向错误的排查方向。i18n key 是 `error.volume_busy`。
+    VolumeBusy,
     /// Local filesystem error.
     Io(std::io::Error),
 }
@@ -40,11 +53,13 @@ impl ZipnestError {
             ZipnestError::NotAnArchive => "error.not_an_archive",
             ZipnestError::PasswordRequired => "error.password_required",
             ZipnestError::PasswordIncorrect => "error.password_incorrect",
+            ZipnestError::Corrupt(_) => "error.corrupt",
             ZipnestError::PasswordUnsupported => "error.password_unsupported",
             ZipnestError::Cancelled => "error.cancelled",
             ZipnestError::Engine(_) => "error.engine",
             ZipnestError::Security(_) => "error.security_blocked",
             ZipnestError::QuotaExceeded => "error.quota_exceeded",
+            ZipnestError::VolumeBusy => "error.volume_busy",
             ZipnestError::Io(_) => "error.io",
         }
     }
@@ -64,6 +79,9 @@ impl fmt::Display for ZipnestError {
             ZipnestError::Engine(hr) => write!(f, "engine error HRESULT=0x{:08X}", *hr as u32),
             ZipnestError::PasswordUnsupported => {
                 write!(f, "this archive format does not support a password")
+            }
+            ZipnestError::Corrupt(entries) => {
+                write!(f, "archive data is damaged ({} entries unwritten)", entries.len())
             }
             other => write!(f, "{}", other.error_key()),
         }

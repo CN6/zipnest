@@ -45,6 +45,33 @@ fn leftover_tmp(dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// 进程级环境变量锁：`ZIPNEST_SFX_DIR` 是进程全局的，而 cargo test 默认多
+/// 线程跑同一个二进制里的用例。所有会改动它的用例都先拿这把锁。
+fn sfx_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 设置 `ZIPNEST_SFX_DIR`，drop 时恢复原值（含「原本没设」）。
+struct SfxDirEnv(Option<String>);
+
+impl SfxDirEnv {
+    fn set(dir: &std::path::Path) -> Self {
+        let old = std::env::var("ZIPNEST_SFX_DIR").ok();
+        std::env::set_var("ZIPNEST_SFX_DIR", dir);
+        SfxDirEnv(old)
+    }
+}
+
+impl Drop for SfxDirEnv {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(v) => std::env::set_var("ZIPNEST_SFX_DIR", v),
+            None => std::env::remove_var("ZIPNEST_SFX_DIR"),
+        }
+    }
+}
+
 #[test]
 fn creates_zip_with_one_file_roundtrip() {
     let base = tmp("zip"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
@@ -156,6 +183,100 @@ fn skips_symlinked_entries() {
     let sources = collect_sources(&[base.join("src")], &base).unwrap();
     assert!(sources.iter().all(|s| s.node != "src/link.txt"), "file symlink must be skipped");
     assert!(sources.iter().all(|s| s.node != "src/linkdir"), "dir symlink must be skipped");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 缺陷 A：被跳过的链接必须被记账。以前 `collect_one` 直接 `return Ok(())`，
+/// 一个只装着链接的目录会走进一个空包，而引擎照样报「完成」。
+#[test]
+fn skipped_links_are_reported() {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+    let base = tmp("skipped-links"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    write_src(&base, "src/real.txt", b"real");
+    write_src(&base, "src/sub/inner.txt", b"inner");
+    let link_file = base.join("src/link.txt");
+    let link_dir = base.join("src/linkdir");
+    // 建符号链接需要特权（SeCreateSymbolicLinkPrivilege），像 extract.rs 的
+    // has_link_ancestor 测试那样在没权限的机器上跳过正向用例。
+    if symlink_file("real.txt", &link_file).is_err() {
+        eprintln!("note: this platform refused to create a symlink; positive case skipped");
+        let _ = std::fs::remove_dir_all(&base);
+        return;
+    }
+
+    let collected = archive_core::collect_sources_detailed(&[base.join("src")], &base).unwrap();
+    // 链接本身不进包。
+    assert!(collected.sources.iter().all(|s| s.node != "src/link.txt"));
+    let file_link = collected.skipped_links.iter()
+        .find(|l| l.path.ends_with("link.txt"))
+        .expect("file symlink must be reported as skipped");
+    assert!(!file_link.is_dir, "a file symlink is not a directory link");
+
+    if symlink_dir("sub", &link_dir).is_ok() {
+        let collected = archive_core::collect_sources_detailed(&[base.join("src")], &base).unwrap();
+        assert!(collected.sources.iter().all(|s| s.node != "src/linkdir"));
+        let dir_link = collected.skipped_links.iter()
+            .find(|l| l.path.ends_with("linkdir"))
+            .expect("directory symlink must be reported as skipped");
+        assert!(dir_link.is_dir, "a directory symlink must be flagged as a directory link");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Junction 不需要任何特权，所以这一条在任何 Windows 账户下都会真的跑到：
+/// `symlink_metadata` 把 junction 也当 symlink，整棵子树都不该进包 —— 但必须
+/// 出现在 skipped 列表里，否则用户会以为子目录已经打包了。
+#[test]
+fn junctions_are_skipped_and_reported() {
+    let base = tmp("junction"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    write_src(&base, "src/real.txt", b"real");
+    write_src(&base, "elsewhere/inside.txt", b"inside");
+    let made = std::process::Command::new("cmd")
+        .current_dir(base.join("src"))
+        // 相对路径 + 在链接的父目录里执行：绝对路径经 MSYS 转换后 mklink 会报
+        // 「系统找不到指定的路径」，相对形式在两种 shell 里都稳。
+        .args(["/c", "mklink", "/J", "junction", "..\\elsewhere"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !made {
+        eprintln!("note: mklink /J failed; junction case skipped");
+        let _ = std::fs::remove_dir_all(&base);
+        return;
+    }
+
+    let collected = archive_core::collect_sources_detailed(&[base.join("src")], &base).unwrap();
+    assert!(collected.sources.iter().all(|s| !s.node.starts_with("src/junction")),
+        "a junction and its whole subtree must stay out of the archive, got {:?}",
+        collected.sources.iter().map(|s| &s.node).collect::<Vec<_>>());
+    let link = collected.skipped_links.iter()
+        .find(|l| l.path.ends_with("junction"))
+        .expect("the junction must be reported as skipped");
+    assert!(link.is_dir, "a junction resolves to a directory");
+
+    // 建包成功但内容为空时，调用方至少能从 skipped 列表看出「东西没进去」。
+    let dest = base.join("out.zip");
+    create_archive(&collected.sources, &dest, &opts(CreateFormat::Zip), &mut |_| true).unwrap();
+    let arc = Archive::open(&dest, ArchiveOpenOptions::default()).unwrap();
+    let paths: Vec<String> = arc.entries().unwrap().iter().map(|e| e.path.replace('\\', "/")).collect();
+    assert!(paths.iter().all(|p| !p.contains("junction")), "junction content must not be packed, got {paths:?}");
+    assert!(paths.contains(&"src/real.txt".to_string()), "the real file must still be packed");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 既有签名保持可用：`collect_sources` 仍然只返回条目表，跳过项由新的
+/// `collect_sources_detailed` 给出。两者对同一棵树给出同一份 sources。
+#[test]
+fn collect_sources_wrapper_matches_detailed() {
+    let base = tmp("collect-compat"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    write_src(&base, "src/a.txt", b"a");
+    write_src(&base, "src/sub/b.txt", b"b");
+    let plain = collect_sources(&[base.join("src")], &base).unwrap();
+    let detailed = archive_core::collect_sources_detailed(&[base.join("src")], &base).unwrap();
+    let plain_nodes: Vec<&String> = plain.iter().map(|s| &s.node).collect();
+    let detailed_nodes: Vec<&String> = detailed.sources.iter().map(|s| &s.node).collect();
+    assert_eq!(plain_nodes, detailed_nodes);
+    assert!(detailed.skipped_links.is_empty());
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -504,6 +625,236 @@ fn splits_zip_into_volumes() {
     assert_split_roundtrip(CreateFormat::Zip, "volzip", "vol.joined.zip");
 }
 
+/// 卷序列的现状：从 `.001` 起连续存在的那些文件的路径（升序）。
+fn volume_series(dest: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for i in 1u32.. {
+        let p = PathBuf::from(format!("{}.{:03}", dest.display(), i));
+        if !p.exists() { break; }
+        out.push(p);
+    }
+    out
+}
+
+/// 目录里所有形如 `<name>.old-<tag>.<NNN>` 的备份残留。
+fn leftover_backups(dir: &std::path::Path, name: &str) -> Vec<String> {
+    std::fs::read_dir(dir).unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(&format!("{name}.old-")))
+        .collect()
+}
+
+/// 拼出一套可读的分卷归档并验证内容：`vols` 必须齐全，合起来能打开。
+fn assert_volume_set_readable(base: &std::path::Path, dest: &std::path::Path, expect_len: u64) {
+    let vols = volume_series(dest);
+    assert!(!vols.is_empty(), "expected a volume series at {}", dest.display());
+    let joined = base.join("joined-check.7z");
+    std::fs::write(&joined, {
+        let mut bytes = Vec::new();
+        for v in &vols { bytes.extend(std::fs::read(v).unwrap()); }
+        bytes
+    }).unwrap();
+    let arc = Archive::open(&joined, ArchiveOpenOptions::default()).unwrap();
+    let e = arc.entries().unwrap().into_iter().find(|e| e.path.ends_with("big.bin")).expect("big.bin present");
+    assert_eq!(arc.read_entry(e.index, &ArchiveOpenOptions::default(), None).unwrap().len() as u64, expect_len);
+    let _ = std::fs::remove_file(&joined);
+}
+
+/// 刑部实测之一：第二次分卷压缩中途取消，旧的卷序列必须仍然完整可读。
+///
+/// 上一版在写任何字节之前就 `clear_volumes(dest)`，取消后目录里只剩空目录 ——
+/// 用户原来的归档没了，新的也没有。现在暂存卷写在 `<dest>.zipnest-part-*`
+/// 上，取消只会让守卫删掉暂存卷。
+#[test]
+fn cancelling_a_second_split_keeps_the_previous_volumes_readable() {
+    let base = tmp("volcancel-keep"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "big.bin", &vec![0x5Au8; 2_500_000]);
+    let dest = base.join("vol.7z");
+    let srcs = vec![CreateSource { path: src.clone(), node: "big.bin".into() }];
+    let mut o = opts(CreateFormat::SevenZ); o.volume_bytes = Some(1_000_000);
+
+    let first = create_archive(&srcs, &dest, &o, &mut |_| true).expect("first split must succeed");
+    let before = volume_series(&dest);
+    assert!(before.len() >= 3, "sanity: the first run wrote a volume series");
+
+    let err = create_archive(&srcs, &dest, &o, &mut |_| false)
+        .expect_err("a cancelled second split must fail");
+    assert_eq!(err.error_key(), "error.cancelled", "got {err:?}");
+
+    // 旧序列一个不少、内容能打开。
+    assert_eq!(volume_series(&dest), before, "the previous volume series must survive a cancel");
+    assert_volume_set_readable(&base, &dest, 2_500_000);
+    // 暂存卷和备份都不该留。
+    let strays = leftover_tmp(&base);
+    assert!(strays.is_empty(), "staged volumes left behind after cancel: {strays:?}");
+    assert!(leftover_backups(&base, "vol.7z").is_empty(), "no backup may be created on a cancel");
+    // 第一次运行报告的输出字节数，应当等于磁盘上这些卷的实际总大小
+    // （finalize 会把每一卷截到逻辑长度）。这里原本留着一行
+    // `… .len() * 0 + first.bytes_out` 的调试残渣，恒真，clippy 的
+    // `erasing_op` 会直接判红。
+    let on_disk: u64 = before.iter().map(|p| std::fs::metadata(p).unwrap().len()).sum();
+    assert_eq!(first.bytes_out, on_disk, "bytes_out must match the series on disk");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 刑部实测之二：旧序列里某卷被别的进程以独占句柄占住（`share_mode(0)`）。
+///
+/// 改名会因共享冲突失败 ⇒ 整体失败并回滚：**旧卷必须一个不少、内容不变**，
+/// 不能出现「.001 已让位成备份、.002 失败」这类半套状态。暂存卷也不能留下。
+#[test]
+fn a_locked_previous_volume_aborts_the_replace_and_keeps_the_old_set() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let base = tmp("vollocked"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "big.bin", &vec![0x5Au8; 2_500_000]);
+    let dest = base.join("vol.7z");
+    let srcs = vec![CreateSource { path: src, node: "big.bin".into() }];
+    let mut o = opts(CreateFormat::SevenZ); o.volume_bytes = Some(1_000_000);
+
+    create_archive(&srcs, &dest, &o, &mut |_| true).expect("first split must succeed");
+    let before = volume_series(&dest);
+    assert!(before.len() >= 2, "sanity: at least two volumes");
+    let snapshot: Vec<Vec<u8>> = before.iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+    // 占住第二卷：改名它必然失败（share_mode(0) 不给别人 DELETE / 改名的余地），
+    // 而第一卷此前已经成功让位 —— 正好考验回滚。
+    let locked = std::fs::OpenOptions::new().read(true).share_mode(0)
+        .open(&before[1]).expect("locking the second volume must succeed");
+
+    let err = create_archive(&srcs, &dest, &o, &mut |_| true)
+        .expect_err("the replace must fail while a previous volume is locked");
+    assert_eq!(err.error_key(), "error.io", "got {err:?}");
+
+    drop(locked);
+    // 旧序列完整、逐字节未变。
+    assert_eq!(volume_series(&dest), before, "every previous volume must come back");
+    for (path, expected) in before.iter().zip(&snapshot) {
+        assert_eq!(&std::fs::read(path).unwrap(), expected, "{} must be byte-identical", path.display());
+    }
+    assert_volume_set_readable(&base, &dest, 2_500_000);
+    // 备份全部改回去了，暂存卷被守卫删掉。
+    assert!(leftover_backups(&base, "vol.7z").is_empty(),
+        "rollback must move every backup back: {:?}", leftover_backups(&base, "vol.7z"));
+    let strays = leftover_tmp(&base);
+    assert!(strays.is_empty(), "staged volumes left behind after a failed replace: {strays:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 刑部实测之三：连续两次成功覆盖后，目录里只有新一代卷 —— 没有 `.old-*`
+/// 残留，也没有第一次多出来的高编号旧卷。
+#[test]
+fn two_successful_overwrites_leave_only_the_new_series() {
+    let base = tmp("voltwoclean"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    // 第二次的输入更小，卷数会变少：多出来的高编号旧卷必须消失。
+    let big = write_src(&base, "big.bin", &vec![0x5Au8; 2_500_000]);
+    let small = write_src(&base, "small.bin", &vec![0x11u8; 1_200_000]);
+    let dest = base.join("vol.7z");
+    let mut o = opts(CreateFormat::SevenZ); o.volume_bytes = Some(1_000_000);
+
+    let big_srcs = vec![CreateSource { path: big, node: "big.bin".into() }];
+    create_archive(&big_srcs, &dest, &o, &mut |_| true).expect("first split must succeed");
+    let first_vols = volume_series(&dest);
+    assert!(first_vols.len() >= 3, "sanity: the first run splits into >=3 volumes");
+
+    let small_srcs = vec![CreateSource { path: small, node: "small.bin".into() }];
+    create_archive(&small_srcs, &dest, &o, &mut |_| true).expect("second split must succeed");
+    let second_vols = volume_series(&dest);
+    assert!(second_vols.len() < first_vols.len(),
+        "the smaller input must yield fewer volumes: first {}, second {}",
+        first_vols.len(), second_vols.len());
+
+    // 目录里除了新一代卷，不该再有别的属于这个归档的东西。
+    assert!(leftover_backups(&base, "vol.7z").is_empty(),
+        "backups must be deleted after success: {:?}", leftover_backups(&base, "vol.7z"));
+    let strays = leftover_tmp(&base);
+    assert!(strays.is_empty(), "staged volumes left behind after success: {strays:?}");
+    let names: Vec<String> = std::fs::read_dir(&base).unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("vol.7z"))
+        .collect();
+    assert_eq!(names.len(), second_vols.len(),
+        "only the new series may remain beside the destination, got {names:?}");
+
+    // 新内容确实是第二次打包的那个文件。
+    let joined = base.join("joined-new.7z");
+    let mut bytes = Vec::new();
+    for v in &second_vols { bytes.extend(std::fs::read(v).unwrap()); }
+    std::fs::write(&joined, &bytes).unwrap();
+    let arc = Archive::open(&joined, ArchiveOpenOptions::default()).unwrap();
+    let names: Vec<String> = arc.entries().unwrap().iter().map(|e| e.path.replace('\\', "/")).collect();
+    assert!(names.iter().any(|p| p.ends_with("small.bin")), "got {names:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 缺陷 B：同一路径分卷两次都必须成功。`ensure` 用 `create_new`，以前第二次
+/// 必定撞上第一次留下的 `.001` 而失败（UI 上只看到「操作失败」）。
+#[test]
+fn splitting_twice_to_the_same_path_succeeds() {
+    let base = tmp("voltwice"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "big.bin", &vec![0x5Au8; 2_500_000]);
+    let dest = base.join("vol.7z");
+    let srcs = vec![CreateSource { path: src, node: "big.bin".into() }];
+    let mut o = opts(CreateFormat::SevenZ); o.volume_bytes = Some(1_000_000);
+    let first = create_archive(&srcs, &dest, &o, &mut |_| true).expect("first split must succeed");
+    let vols_after_first: Vec<PathBuf> = join_volumes(&dest, &base.join("ignored.7z"));
+    assert!(vols_after_first.len() >= 3, "sanity: the first run wrote a volume series");
+
+    let second = create_archive(&srcs, &dest, &o, &mut |_| true)
+        .expect("splitting to the same path a second time must overwrite, not fail");
+    assert_eq!(first.bytes_out, second.bytes_out, "same input must give the same total size");
+
+    // 旧的卷序列必须被完整替换：不留下第一次多出来的高编号卷。
+    let vols_after_second = join_volumes(&dest, &base.join("ignored2.7z"));
+    assert_eq!(vols_after_first.len(), vols_after_second.len(),
+        "stale trailing volumes from the first run must not survive");
+    // 结果仍然是一个能读的分卷归档。
+    let joined = base.join("joined.7z");
+    join_volumes(&dest, &joined);
+    let arc = Archive::open(&joined, ArchiveOpenOptions::default()).unwrap();
+    let e = arc.entries().unwrap().into_iter().find(|e| e.path.ends_with("big.bin")).expect("big.bin present");
+    assert_eq!(arc.read_entry(e.index, &ArchiveOpenOptions::default(), None).unwrap().len(), 2_500_000);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 覆盖旧卷只允许删「<dest>.<3 位以上纯数字>」这一组的连续序列。邻近的、
+/// 编号不连续的文件，以及同名目录，都不属于我们，必须原样留下。
+#[test]
+fn clearing_stale_volumes_leaves_unrelated_files_alone() {
+    let base = tmp("volclear"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
+    let dest = base.join("vol.7z");
+    let vol = |i: &str| base.join(format!("vol.7z.{i}"));
+    // 我们自己的序列：.001、.002 连续，.004 起断开（第 3 卷本来就没有）。
+    for i in ["002", "001", "004"] { std::fs::write(vol(i), b"stale").unwrap(); }
+    // 不是我们的东西：别的名字、非数字后缀、两位数字、同名目录。
+    std::fs::write(base.join("other.7z.001"), b"keep").unwrap();
+    std::fs::write(base.join("vol.7z.bak"), b"keep").unwrap();
+    std::fs::write(base.join("vol.7z.01"), b"keep").unwrap();
+    std::fs::create_dir_all(vol("005")).unwrap();
+    // 大小写不同的同一序列（Windows 上文件名不区分大小写，这里建的是同一份
+    // 文件的另一种拼写，必须在扫描里被认出来）。
+    std::fs::write(base.join("VOL.7Z.003"), b"stale").unwrap();
+
+    archive_core::com::outstream::clear_volumes(&dest).unwrap();
+
+    assert!(!vol("001").exists(), ".001 must be cleared");
+    assert!(!vol("002").exists(), ".002 must be cleared");
+    assert!(!vol("003").exists(), "a differently-cased .003 must be cleared");
+    // 扫描按连续编号走，但 .003 存在时 .004 也在连续段内，所以它也该被清掉。
+    assert!(!vol("004").exists(), ".004 belongs to the contiguous run and must be cleared");
+    assert!(vol("005").is_dir(), "a directory is never deleted");
+    assert!(base.join("other.7z.001").exists(), "a different name must survive");
+    assert!(base.join("vol.7z.bak").exists(), "a non-numeric suffix must survive");
+    assert!(base.join("vol.7z.01").exists(), "fewer than 3 digits is not our volume");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 相对路径的 dest 不参与「清旧卷」：含义不明，宁可返回错误也不猜。
+#[test]
+fn clearing_volumes_refuses_relative_destinations() {
+    let err = archive_core::com::outstream::clear_volumes(std::path::Path::new("vol.7z"))
+        .expect_err("a relative destination must be refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
 #[test]
 fn opens_split_7z_from_first_volume() {
     let base = tmp("rvol7z"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
@@ -566,8 +917,15 @@ fn opens_single_volume_zip_from_first_volume() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// 取消一个**首次**分卷：一个用户可见的卷都不该出现（暂存卷也不行）。
+///
+/// 这里的断言以前是「取消后 `.001`–`.004` 一个都不剩」，在旧实现下等同于
+/// 「删掉用户的旧归档」—— 那条断言正是刑部封还的缺陷本身。现在这套断言只
+/// 针对「该 dest 本来就没有旧归档」的情形：取消之后目录必须和取消之前一样
+/// 干净。「有旧归档时取消必须保留旧归档」由
+/// `cancelling_a_second_split_keeps_the_previous_volumes_readable` 负责。
 #[test]
-fn deletes_partial_volumes_on_cancel() {
+fn cancelling_a_first_split_leaves_no_partial_volumes() {
     let base = tmp("volcancel"); let _ = std::fs::remove_dir_all(&base); std::fs::create_dir_all(&base).unwrap();
     let src = write_src(&base, "big.bin", &vec![0x5Au8; 2_500_000]);
     let dest = base.join("vol.7z");
@@ -576,10 +934,11 @@ fn deletes_partial_volumes_on_cancel() {
     let err = create_archive(&srcs, &dest, &o, &mut |_| false)
         .expect_err("cancelled create must fail");
     assert_eq!(err.kind(), "error.cancelled", "got {err:?}");
-    for i in 1..=4 {
-        let p = base.join(format!("vol.7z.{i:03}"));
-        assert!(!p.exists(), "partial volume {} must be deleted on cancel", p.display());
-    }
+    assert!(volume_series(&dest).is_empty(),
+        "no user-visible volume may appear when a first split is cancelled: {:?}",
+        volume_series(&dest));
+    let strays = leftover_tmp(&base);
+    assert!(strays.is_empty(), "staged volumes left behind after cancel: {strays:?}");
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -632,6 +991,55 @@ fn creates_7z_sfx_runnable() {
 #[test]
 fn creates_7z_gui_sfx_runnable() {
     assert_sfx_roundtrip(SfxKind::Gui, "sfx-gui");
+}
+
+/// 缺陷 C：SFX 中途失败时，用户原有的 `dest` 必须原样留在原地。
+///
+/// 以前 `concat_files` 先 `File::create(dest)` 截断目标，失败时再
+/// `remove_file(dest)`：用户在覆盖确认里答应的「替换」，实际结果是原文件和新
+/// 文件都没有。现在载荷先写临时文件、成功才 rename。
+///
+/// 失败点选在拼接的第一步：把 `ZIPNEST_SFX_DIR` 指向一个 stub 被独占锁住的
+/// 目录，`concat_files` 读 stub 时得到共享冲突。旧实现这时 `dest` 已经被截断、
+/// 随后被删掉；新实现下 `dest` 完全没被碰过。
+#[test]
+fn failed_sfx_preserves_existing_destination() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let _serial = sfx_dir_lock();
+    let base = tmp("sfxfail");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let src = write_src(&base, "a.txt", b"sfx body");
+    let dest = base.join("packed.exe");
+    std::fs::write(&dest, b"ORIGINAL EXE").unwrap();
+
+    // 一个完整但被锁住的 stub：查找会成功（`is_file` 不受共享模式影响），
+    // 真正读取时才失败。
+    let stub_dir = base.join("sfx-stub");
+    std::fs::create_dir_all(&stub_dir).unwrap();
+    std::fs::write(stub_dir.join("7zCon.sfx"), vendored_stub(SfxKind::Console)).unwrap();
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(stub_dir.join("7zCon.sfx"))
+        .expect("locking the stub copy must succeed");
+    let _env = SfxDirEnv::set(&stub_dir);
+
+    let srcs = vec![CreateSource { path: src, node: "a.txt".into() }];
+    let mut o = opts(CreateFormat::SevenZ); o.sfx = Some(SfxKind::Console);
+    let err = create_archive(&srcs, &dest, &o, &mut |_| true)
+        .expect_err("an unreadable stub must abort the SFX");
+    assert_eq!(err.kind(), "error.io", "got {err:?}");
+
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        b"ORIGINAL EXE",
+        "a failed SFX must leave the pre-existing destination untouched"
+    );
+    let leftovers = leftover_tmp(&base);
+    assert!(leftovers.is_empty(), "temp file left behind after failed SFX: {leftovers:?}");
+    drop(locked);
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]

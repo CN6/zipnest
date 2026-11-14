@@ -17,10 +17,10 @@ pub mod types;
 pub mod com;
 
 pub use archive::Archive;
-pub use create::{collect_sources, create_archive};
+pub use create::{collect_sources, collect_sources_detailed, create_archive, CollectedSources};
 pub use error::{map_hresult, ZipnestError};
 pub use types::{
     ArchiveEntry, ArchiveOpenOptions, CompressionLevel, CompressionMethod, CreateFormat,
     CreateOptions, CreateProgress, CreateSource, CreateStats, ExtractOptions, ExtractProgress,
-    ExtractStats, OnConflict, SfxKind,
+    ExtractStats, OnConflict, SfxKind, SkippedLink,
 };

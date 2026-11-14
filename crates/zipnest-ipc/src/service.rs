@@ -157,14 +157,18 @@ impl CreateRequest {
     }
 }
 
-fn to_dto(e: &ArchiveEntry) -> EntryDto {
-    let name = e
-        .path
+/// 条目的显示名：路径最后一段，忽略结尾的分隔符。借出而不复制，列目录和搜索
+/// 都会对每个条目调用它。
+fn entry_name(e: &ArchiveEntry) -> &str {
+    e.path
         .trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(&e.path)
-        .to_string();
+}
+
+fn to_dto(e: &ArchiveEntry) -> EntryDto {
+    let name = entry_name(e).to_string();
     EntryDto {
         path: e.path.clone(),
         name,
@@ -265,6 +269,10 @@ fn children_of(entries: &[ArchiveEntry], dir: &str) -> Vec<EntryDto> {
 /// Matches the name only: a hit has to be something the user can recognise in
 /// the list, and matching whole paths turned a search for `a` into every file
 /// under a folder whose name happened to contain one.
+///
+/// 先用不分配的方式判断命中，命中了才构造 DTO：搜索框每敲一个字都会走一遍全部
+/// 条目，从前每条都要 `path.clone()` + `to_lowercase()`，即使绝大多数条目不匹配。
+/// `to_lowercase` 仍然只在条目本身带大写时才分配（见 [`contains_ignore_case`]）。
 fn search_entries_in(entries: &[ArchiveEntry], query: &str, limit: usize) -> Vec<EntryDto> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() || limit == 0 {
@@ -272,17 +280,37 @@ fn search_entries_in(entries: &[ArchiveEntry], query: &str, limit: usize) -> Vec
     }
     let mut out = Vec::new();
     for e in entries {
-        let dto = to_dto(e);
-        // `to_lowercase` allocates; a big archive being searched on every
-        // keystroke would otherwise lowercase every name on every frame.
-        if dto.name.to_lowercase().contains(&needle) {
-            out.push(dto);
+        if contains_ignore_case(entry_name(e), &needle) {
+            out.push(to_dto(e));
             if out.len() == limit {
                 break;
             }
         }
     }
     out
+}
+
+/// `haystack` 是否（忽略大小写）包含已经小写化的 `needle`。
+///
+/// 全小写的名字——绝大部分下载和打包工具写出来的都是——先在原串上逐字节滑窗比
+/// 一遍就能命中，完全不分配；只有带大写的名字才付一次 `to_lowercase`。等价于
+/// `haystack.to_lowercase().contains(needle)`，并且 `needle` 必须是已经
+/// `trim` + `to_lowercase` 过的。
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        // 与 `contains("")` 一致。`windows(0)` 会 panic，所以必须先挡掉。
+        return true;
+    }
+    if haystack.as_bytes().windows(needle.len()).any(|w| w == needle.as_bytes()) {
+        return true;
+    }
+    if haystack.is_ascii() && !haystack.bytes().any(|b| b.is_ascii_uppercase()) {
+        // 纯 ASCII 且全小写：快路径没中，逐字节比较就是最终答案。
+        return false;
+    }
+    // 带大写或带非 ASCII 字符：只有这条路才能保证与 `to_lowercase` 等价
+    // （例如 `É` 会小写成 `é`，快路径的逐字节比较看不到）。
+    haystack.to_lowercase().contains(needle)
 }
 
 /// Expand the UI's selection into the engine's index list.
@@ -356,6 +384,61 @@ fn select_entries(entries: &[ArchiveEntry], paths: &[String]) -> Vec<u32> {
 /// `emit(event_name, json_payload)` — thread-safe callback the glue layer
 /// wires to Tauri events (tests wire a recorder).
 pub type Emit = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
+
+/// 创建前把输入展开成进包的条目表，并把「因为是指向别处的链接而没跟进」的
+/// 那些项以 `create_skipped` 事件报给界面。
+///
+/// 两者必须一起处理：只拿条目表的话，用户拖进来的若是个 junction，结果就是一个
+/// 空包加一句「完成」。多输入各自相对自己的父目录展开（归档内的名字取条目自己
+/// 的 basename），用 `CollectedSources` 的 `Extend` 合并。
+///
+/// 返回的空表有两种来源，分别给不同的 key：什么都没收到 → `error.io`；收到的
+/// 全是指向别处的链接 → `error.create_only_links`（一个用户看得懂、也改得动的
+/// 原因，不能笼统地叫 I/O 失败）。事件在返回错误之前发出，界面才说得出是哪些
+/// 路径、为什么没打进去。
+fn collect_create_sources(
+    inputs: &[std::path::PathBuf],
+    emit: &Emit,
+) -> Result<Vec<archive_core::CreateSource>, String> {
+    let mut collected = archive_core::CollectedSources::default();
+    for input in inputs {
+        let base = input
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let part = archive_core::collect_sources_detailed(std::slice::from_ref(input), &base)
+            .map_err(|e| e.error_key().to_string())?;
+        collected.extend([part]);
+    }
+    // emit 是线程安全的，worker 线程上直接发即可（与 extract_renamed 同）。
+    if !collected.skipped_links.is_empty() {
+        emit(
+            "create_skipped",
+            serde_json::json!({
+                "count": collected.skipped_links.len(),
+                "entries": collected.skipped_links
+                    .iter()
+                    .map(|l| {
+                        serde_json::json!({
+                            "path": l.path.to_string_lossy(),
+                            "is_dir": l.is_dir,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+    if collected.sources.is_empty() {
+        return Err(if collected.skipped_links.is_empty() {
+            "error.io"
+        } else {
+            "error.create_only_links"
+        }
+        .to_string());
+    }
+    Ok(collected.sources)
+}
 
 pub struct IpcService {
     /// Exposed read-only for the Tauri glue (resolve an entry for preview).
@@ -548,7 +631,12 @@ impl IpcService {
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
         let root = children_of(&entries, "");
-        let (id, _) = self.registry.insert(archive, std::path::PathBuf::from(&path), password);
+        let (id, _) = self.registry.insert(
+            archive,
+            std::path::PathBuf::from(&path),
+            password,
+            Arc::clone(&entries),
+        );
         Ok(OpenArchiveResult { id, encrypted, format, entries: root })
     }
 
@@ -577,10 +665,14 @@ impl IpcService {
         self.registry.len()
     }
 
+    /// 归档里 `dir` 的直接子项（`""` 为根）。
+    ///
+    /// 只读注册表里那份打开时缓存的条目列表，**不取归档锁**：提取的 worker
+    /// 线程会把 `Mutex<SendArchive>` 一直握到解压结束，从前这里跟着阻塞，UI 线程
+    /// 上翻一个目录就能把窗口整块冻住，连取消都点不了。条目列表在归档打开后不再
+    /// 变化，缓存不会过期。
     pub fn list_children(&self, id: u64, dir: String) -> Result<Vec<EntryDto>, IpcError> {
-        let shared = self.lock_archive(id)?;
-        let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let entries = guard.0.entries_arc()?;
+        let entries = self.cached_entries(id)?;
         Ok(children_of(&entries, &dir))
     }
 
@@ -591,16 +683,24 @@ impl IpcService {
     /// folders down is unfindable by eye in a big archive. This searches the
     /// whole entry list and returns real entry paths, which means a hit can be
     /// selected and extracted without navigating to it first.
+    ///
+    /// 和 [`IpcService::list_children`] 一样只走条目缓存，因此提取进行中也能搜索。
     pub fn search_entries(
         &self,
         id: u64,
         query: String,
         limit: usize,
     ) -> Result<Vec<EntryDto>, IpcError> {
-        let shared = self.lock_archive(id)?;
-        let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let entries = guard.0.entries_arc()?;
+        let entries = self.cached_entries(id)?;
         Ok(search_entries_in(&entries, &query, limit))
+    }
+
+    /// 打开时缓存下来的条目列表。归档不存在（或已关闭）时报
+    /// `error.not_an_archive`，和 `lock_archive` 的失败语义一致。
+    fn cached_entries(&self, id: u64) -> Result<Arc<Vec<ArchiveEntry>>, IpcError> {
+        self.registry
+            .entries(id)
+            .ok_or_else(|| IpcError::new("error.not_an_archive"))
     }
 
     pub fn read_entry_bytes(&self, id: u64, path: String, max_bytes: u64) -> Result<Vec<u8>, IpcError> {
@@ -640,9 +740,11 @@ impl IpcService {
 
     /// Queue an extract job (behind any active one) and return its id.
     ///
-    /// The runner holds the archive's mutex for the whole extraction —
-    /// other commands on the same archive wait (single-archive-at-a-time
-    /// is the M2 model; the UI only ever has one heavy job running).
+    /// The runner holds the archive's mutex for the whole extraction, so the
+    /// one command that still waits on it is [`IpcService::read_entry_bytes`]
+    /// (previewing an entry while it is being unpacked). Listings and searches
+    /// read the cached entry list instead and never block; the UI only ever has
+    /// one heavy job running.
     ///
     /// `on_conflict` carries the user's conflict policy (`"overwrite" | "skip" |
     /// "rename"`); `"ask"` is resolved by the UI before calling and unknown
@@ -780,6 +882,30 @@ impl IpcService {
                         }),
                     );
                 }
+                // 数据损坏是致命错误，但它同样有「哪些条目没写出来」的名单，
+                // 而且这份名单只在这里能拿到 —— 错误本身不经过 `ExtractStats`。
+                // 丢掉它，用户就只剩一句「已损坏」，不知道自己少了哪些文件。
+                if let archive_core::ZipnestError::Corrupt(entries) = &e {
+                    if !entries.is_empty() {
+                        emit(
+                            "extract_failed",
+                            serde_json::json!({
+                                "count": entries.len(),
+                                "detail": serde_json::Value::Null,
+                                "entries": entries
+                                    .iter()
+                                    .map(|f| {
+                                        serde_json::json!({
+                                            "path": f.path,
+                                            "reason": f.reason,
+                                            "detail": f.detail,
+                                        })
+                                    })
+                                    .collect::<Vec<_>>(),
+                            }),
+                        );
+                    }
+                }
                 key
             })?;
             if !stats.renamed.is_empty() {
@@ -869,6 +995,10 @@ impl IpcService {
     /// `IpcError` instead of producing a queued-but-doomed job. Progress is
     /// reported from the engine callback (return `false` on cancel), and the
     /// destination's parent must be writable — enforced by the engine.
+    ///
+    /// 符号链接与目录联接不跟进（见 `archive_core::SkippedLink`），被跳过的那
+    /// 些以 `create_skipped` 事件报给界面；若一个能打包的条目都不剩，这条 job
+    /// 以 `error.create_only_links` 失败，而不是交出一个空包。
     pub fn create_archive(
         &self,
         sources: Vec<String>,
@@ -882,44 +1012,32 @@ impl IpcService {
         let inputs: Vec<std::path::PathBuf> =
             sources.into_iter().map(std::path::PathBuf::from).collect();
 
-        let job_id = self.jobs.submit("create", Box::new(move |ctx| {
-            // Each input is expanded relative to its own parent so the archive
-            // node is the item's basename (a directory keeps its tree).
-            let mut engine_sources = Vec::new();
-            for input in &inputs {
-                let base = input
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                let mut part =
-                    archive_core::collect_sources(std::slice::from_ref(input), &base)
-                        .map_err(|e| e.error_key().to_string())?;
-                engine_sources.append(&mut part);
-            }
-            if engine_sources.is_empty() {
-                return Err("error.io".into());
-            }
+        let emit = Arc::clone(&self.emit);
+        let job_id = self.jobs.submit(
+            "create",
+            Box::new(move |ctx| {
+                let engine_sources = collect_create_sources(&inputs, &emit)?;
 
-            let total_items = engine_sources.len() as u64;
-            let dest_path = std::path::PathBuf::from(&dest);
-            // `CreateProgress` has no item counter; count distinct paths
-            // observed as an approximation of entries written.
-            let mut seen = std::collections::HashSet::new();
-            let mut throttle = ProgressThrottle::new(PROGRESS_MIN_INTERVAL);
-            archive_core::create_archive(&engine_sources, &dest_path, &opts, &mut |p| {
-                if ctx.cancelled() {
-                    return false;
-                }
-                seen.insert(p.current_path.clone());
-                if throttle.due() {
-                    ctx.report(seen.len() as u64, total_items, p.done_bytes, p.total_bytes);
-                }
-                true
-            })
-            .map_err(|e| e.error_key().to_string())?;
-            Ok(())
-        }));
+                let total_items = engine_sources.len() as u64;
+                let dest_path = std::path::PathBuf::from(&dest);
+                // `CreateProgress` has no item counter; count distinct paths
+                // observed as an approximation of entries written.
+                let mut seen = std::collections::HashSet::new();
+                let mut throttle = ProgressThrottle::new(PROGRESS_MIN_INTERVAL);
+                archive_core::create_archive(&engine_sources, &dest_path, &opts, &mut |p| {
+                    if ctx.cancelled() {
+                        return false;
+                    }
+                    seen.insert(p.current_path.clone());
+                    if throttle.due() {
+                        ctx.report(seen.len() as u64, total_items, p.done_bytes, p.total_bytes);
+                    }
+                    true
+                })
+                .map_err(|e| e.error_key().to_string())?;
+                Ok(())
+            }),
+        );
         Ok(job_id)
     }
 }
@@ -996,6 +1114,143 @@ mod tests {
             Duration::ZERO,
             root.join("settings.json"),
         )
+    }
+
+    /// 测试里收集 worker 线程发出的事件：`(事件名, 载荷)`。
+    type Events = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// 和 [`service_with_settings`] 一样起一个服务，但把 emit 回调留下来，
+    /// 好在测试里检查 worker 线程发出去的事件。
+    fn service_with_events(name: &str) -> (IpcService, Events) {
+        crate::sweep_stale_test_temp("zipnest-svc-");
+        let root = std::env::temp_dir().join(format!("zipnest-svc-{}-{name}", std::process::id()));
+        let events: Events = Arc::default();
+        let sink = Arc::clone(&events);
+        let svc = IpcService::with_settings_path(
+            Arc::new(move |name: &str, payload: serde_json::Value| {
+                sink.lock().unwrap().push((name.to_string(), payload));
+            }),
+            Duration::ZERO,
+            root.join("settings.json"),
+        );
+        (svc, events)
+    }
+
+    /// 等一个叫 `what` 的事件出现（worker 线程是异步的）。返回那一刻的整份
+    /// 事件表，让调用方自己再断言细节。
+    fn wait_for_event(events: &Events, what: &str) -> Vec<(String, serde_json::Value)> {
+        let t0 = std::time::Instant::now();
+        loop {
+            let snapshot = events.lock().unwrap().clone();
+            if snapshot.iter().any(|(n, _)| n == what) {
+                return snapshot;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(10), "事件 {what} 没等到");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 「源目录里只有链接」：既要报出 `create_skipped`，又不能交出空包。
+    ///
+    /// 用 junction 构造正向用例 —— `mklink /J` 不需要 `SeCreateSymbolicLinkPrivilege`，
+    /// 所以在普通账户下也能跑。真建不出来（受限环境）就打印一行提示跳过，
+    /// 而不是误报失败。
+    #[test]
+    fn create_with_only_links_fails_loudly_and_reports_them() {
+        let (svc, events) = service_with_events("create-links");
+
+        crate::sweep_stale_test_temp("zipnest-links-");
+        let base = std::env::temp_dir().join(format!("zipnest-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("inside.txt"), b"inside").unwrap();
+        // 相对路径 + 在链接的父目录里执行（与 archive-core 的 junction 测试同一
+        // 写法）：绝对路径经 MSYS 转换后 mklink 会报「找不到路径」。
+        let made = std::process::Command::new("cmd")
+            .current_dir(&src)
+            .args(["/c", "mklink", "/J", "only", "..\\elsewhere"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("note: 这个环境建不出 junction，只有链接的用例跳过");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let dest = base.join("out.zip");
+        let job = svc
+            .create_archive(
+                vec![src.join("only").to_string_lossy().into()],
+                dest.to_string_lossy().into(),
+                serde_json::from_value(
+                    serde_json::json!({"format":"zip","level":"normal","method":"auto"}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let snapshot = wait_for_event(&events, "job_finished");
+
+        // 事件在失败之前发出，且带得回路径与 is_dir。
+        let (_, skipped) = snapshot
+            .iter()
+            .find(|(n, _)| n == "create_skipped")
+            .expect("只装着链接时必须发 create_skipped");
+        assert_eq!(skipped["count"], 1);
+        let entry = &skipped["entries"][0];
+        assert!(
+            entry["path"].as_str().unwrap_or_default().ends_with("only"),
+            "事件里要带上被跳过的路径，实际 {:?}",
+            entry
+        );
+        assert_eq!(entry["is_dir"], true, "junction 指向目录");
+
+        // 不是 I/O 失败，也不是「完成」：给的是一个说得清原因的 key。
+        let (_, fin) = snapshot
+            .iter()
+            .find(|(n, e)| n == "job_finished" && e["job_id"] == job)
+            .expect("job_finished 必须发出");
+        assert_eq!(fin["ok"], false);
+        assert_eq!(
+            fin["error_key"].as_str(),
+            Some("error.create_only_links"),
+            "只有链接时要报出专门的原因，实际 {:?}",
+            fin
+        );
+        assert!(!dest.exists(), "没有可打包的条目就不该留下一个空包");
+
+        // 第二种输入形态：选中的是「只装着那个 junction 的文件夹」本身。文件夹
+        // 自己的条目能进包，所以这条 job 是成功的 —— 但它必须照样报出跳过项，
+        // 否则用户会以为 junction 后面的东西已经打进去了。
+        events.lock().unwrap().clear();
+        let dest2 = base.join("out2.zip");
+        let job2 = svc
+            .create_archive(
+                vec![src.to_string_lossy().into()],
+                dest2.to_string_lossy().into(),
+                serde_json::from_value(
+                    serde_json::json!({"format":"zip","level":"normal","method":"auto"}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let snapshot = wait_for_event(&events, "job_finished");
+        let (_, skipped) = snapshot
+            .iter()
+            .find(|(n, _)| n == "create_skipped")
+            .expect("文件夹里只有链接时同样要发 create_skipped");
+        assert_eq!(skipped["count"], 1);
+        let (_, fin) = snapshot
+            .iter()
+            .find(|(n, e)| n == "job_finished" && e["job_id"] == job2)
+            .expect("job_finished 必须发出");
+        assert_eq!(fin["ok"], true, "文件夹本身是可打包的，这条应当成功");
+        assert!(dest2.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1113,6 +1368,40 @@ mod tests {
         assert!(hits("no such file").is_empty());
         // The cap is a hard stop, not a hint.
         assert_eq!(search_entries_in(&entries, "t", 2).len(), 2);
+    }
+
+    #[test]
+    fn case_insensitive_match_matches_lowercase_contains() {
+        // 快路径（纯 ASCII、已经小写）与慢路径（带大写或非 ASCII）必须与
+        // `to_lowercase().contains` 完全一致，否则搜索会随文件名的写法悄悄
+        // 改变结果。
+        let cases = [
+            ("readme.txt", "readme", true),
+            ("README.TXT", "readme", true),
+            ("readme.txt", "me.t", true),
+            ("readme.txt", "readme.txt", true),
+            ("readme.txt", "readme.txtx", false),
+            ("readme.txt", "", true),
+            ("Été.txt", "été", true),
+            ("ÉTÉ.TXT", "été", true),
+            ("naïve.txt", "naïve", true),
+            ("photo.JPG", "photo.jpg", true),
+            ("photo.jpg", "photo.JPG", false), // needle 永远是小写化的
+            ("中文名字.txt", "中文", true),
+        ];
+        for (hay, needle, want) in cases {
+            assert_eq!(
+                contains_ignore_case(hay, needle),
+                want,
+                "{hay:?} 里找 {needle:?}"
+            );
+            // 与直接小写再 contains 的参考实现对照。
+            assert_eq!(
+                contains_ignore_case(hay, needle),
+                hay.to_lowercase().contains(needle),
+                "与参考实现不一致：{hay:?} / {needle:?}"
+            );
+        }
     }
 
     // --- listing / selection planning -------------------------------------

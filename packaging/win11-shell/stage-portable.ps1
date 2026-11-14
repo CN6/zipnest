@@ -9,6 +9,7 @@
     (default: dist-portable\ZipNest):
 
         zipnest_shell.dll
+        Assets\*.png
         Win11Shell\ZipNestShell.msix
         Win11Shell\install.ps1
         Win11Shell\uninstall.ps1
@@ -49,5 +50,20 @@ if ($LASTEXITCODE -ne 0) { throw "build-package failed ($LASTEXITCODE)" }
 Copy-Item (Join-Path $repo 'target\release\zipnest_shell.dll') $PortableDir -Force
 Copy-Item (Join-Path $here 'install.ps1') $payload
 Copy-Item (Join-Path $here 'uninstall.ps1') $payload
+
+# The package is registered with `-ExternalLocation <install dir>`, and the
+# shell then resolves the manifest's relative `Assets\…` logo paths against that
+# directory — NOT against the copy inside the .msix. Measured on Windows 11
+# 26H1 (28020): with the assets only inside the package the taskbar button came
+# out as Windows' generic grey square for every launch that carried package
+# identity (i.e. every context-menu launch), while an unpackaged launch drew the
+# exe's blue Z; dropping this same folder next to zipnest.exe turned the button
+# blue immediately, no reinstall or Explorer restart needed.
+# Removed first: `Copy-Item –Recurse` into an existing folder nests it one level
+# deeper (Assets\Assets), which the payload listing showed on the second run.
+$assets = Join-Path $PortableDir 'Assets'
+Remove-Item $assets -Recurse -Force -ErrorAction SilentlyContinue
+Copy-Item (Join-Path $here 'Assets') $assets -Recurse -Force
+
 
 Write-Host "Staged signed Windows 11 shell integration into $PortableDir"
