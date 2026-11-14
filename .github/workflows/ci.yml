@@ -126,6 +126,11 @@ jobs:
           foreach ($f in "ZipNestShell.msix","ZipNestCodesign.cer","install.ps1","uninstall.ps1") {
             Set-Content -Path "dist-portable/ZipNest/Win11Shell/$f" -Value "placeholder"
           }
+          # The package logo assets are staged by stage-portable.ps1, which this
+          # job skips (it needs the signing key), so they get a placeholder too —
+          # NSIS fails hard on a `File` pattern that matches nothing.
+          New-Item -ItemType Directory -Force -Path dist-portable/ZipNest/Assets | Out-Null
+          Set-Content -Path "dist-portable/ZipNest/Assets/placeholder.png" -Value "placeholder"
           # zipnest_shell.dll is really built by the release-build job, so the
           # installer is compiled against the binary it would actually ship.
           Copy-Item -Path target/release/zipnest_shell.dll -Destination dist-portable/ZipNest/zipnest_shell.dll -Force
