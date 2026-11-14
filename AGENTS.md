@@ -172,15 +172,28 @@ UI that lived in `apps/zipnest` was removed in v0.4.22; it was never shipped.
   `ViewportCommand::Focus` and its own background fill (eframe clears immediate
   viewports with `[0,0,0,0]`, not the app's clear colour). A page needs none of
   that, which is why it won.
-- **The create wizard is an owned window, not a sibling** (v0.4.35). It is still
-  an immediate viewport, so it is a separate top-level window, but
-  `dialog_window::attach` sets `GWL_HWNDPARENT` (= *owner* for a top-level HWND)
-  to the main window and `create_window_position` centres it on the main window's
-  outer rect. Before that, Windows cascaded it anywhere (measured: main at
-  507,587, wizard at 338,338), clicking the main window dropped it behind, and it
-  took a taskbar button of its own. eframe/egui expose no owner API, hence the raw
-  Win32 call. Re-set per opening: the HWND is new every time, so `create_owned` is
-  cleared when the wizard finishes.
+- **The create wizard is a page of the main window, not a window of its own**
+  (v0.4.36). `create_page()` draws *instead of* the archive view, exactly like
+  `settings_page()`: it reuses the `"toolbar"` and `"status"` panel ids for its
+  Back row and its start/cancel footer, and `update()` branches on
+  `self.show_create`. The form scrolls between them, capped at 720 logical
+  points and centred past that.
+  Three dead ends are behind this, all worth remembering:
+  - an **embedded `egui::Window`** is clipped by whatever sits beside it, so in a
+    small window the bottom rows and the start button fell outside the frame;
+  - a **separate OS window** (`show_viewport_immediate`, v0.4.34–v0.4.36) needed
+    `dialog_window`-style raw Win32 ownership (`GWL_HWNDPARENT` = the *owner* of
+    a top-level HWND), a `ViewportCommand::Focus` and its own background fill,
+    because eframe clears immediate viewports with `[0,0,0,0]`;
+  - and re-centring it on the main window **every frame** made
+    `ViewportBuilder::patch` emit `ViewportCommand::OuterPosition` on every frame
+    the main window moved, so the wizard snapped back to the middle mid-drag
+    (measured: main dragged -140,-140, wizard stayed put once the position was
+    handed over only on the opening frame).
+  A page has none of those problems: it cannot drift away, cannot be occluded,
+  and takes no taskbar button. `create_actions` (the footer) queries
+  `std::path` for the overwrite question while the form only draws, so the
+  start button never scrolls out of reach.
 - **Window icons must be set on both sizes, and the package logo is a separate
   thing** (v0.4.35). `window_icon::apply_to_all_windows` loads this exe's `ICON`
   resource at `SM_CXICON`/`SM_CXSMALL` and applies it (plus the window-class
