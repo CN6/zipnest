@@ -2148,14 +2148,44 @@ impl App {
                         |ui| {
                             // The archive *name* is what the user needs to
                             // see; the format alone ("zip") told them nothing.
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(name).size(13.0).strong())
-                                    .truncate(),
-                            )
-                            .on_hover_text(path);
+                            //
+                            // Regular weight, not bold. Explorer draws file
+                            // names regular too, and bold is ~8% wider: at the
+                            // 720-point minimum width that difference pushed a
+                            // name that used to fit over the edge and got it
+                            // ellipsised — a functional regression traded for a
+                            // cosmetic hint.
+                            //
+                            // The format label gets its width reserved first, so
+                            // a name that fills the box cannot push "zip" out
+                            // past the box's right edge.
+                            let tag_w = ui
+                                .painter()
+                                .layout_no_wrap(
+                                    format.clone(),
+                                    egui::FontId::proportional(theme::TEXT_TINY),
+                                    egui::Color32::PLACEHOLDER,
+                                )
+                                .size()
+                                .x;
+                            let name_budget =
+                                (name_w - tag_w - ui.spacing().item_spacing.x).max(0.0);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(name_budget, 22.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(name).size(theme::TEXT_BODY),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(path);
+                                },
+                            );
                             ui.add(egui::Label::new(
                                 egui::RichText::new(format)
-                                    .size(11.0)
+                                    .size(theme::TEXT_TINY)
                                     .color(theme::secondary(ui)),
                             ));
                         },
@@ -2343,7 +2373,7 @@ impl App {
                     }
                 }
                 let p = ui.painter();
-                let f = egui::FontId::proportional(12.0);
+                let f = egui::FontId::proportional(theme::TEXT_SMALL);
                 p.text(
                     egui::pos2(head.left() + 30.0, head.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -2503,7 +2533,7 @@ impl App {
                             .filter(|d| !d.is_empty());
                         match dir_of {
                             Some(dir) => {
-                                let font = egui::FontId::proportional(13.5);
+                                let font = egui::FontId::proportional(theme::TEXT_BODY);
                                 let name_w = ui
                                     .painter()
                                     .layout_no_wrap(e.name.clone(), font.clone(), text_color)
@@ -2534,7 +2564,7 @@ impl App {
                                         name_rect.max,
                                     ),
                                     &format!("· {dir}"),
-                                    egui::FontId::proportional(11.5),
+                                    egui::FontId::proportional(theme::TEXT_SMALL),
                                     weak,
                                     egui::Align2::LEFT_CENTER,
                                 );
@@ -2543,7 +2573,7 @@ impl App {
                                 ui,
                                 name_rect,
                                 &e.name,
-                                egui::FontId::proportional(13.5),
+                                egui::FontId::proportional(theme::TEXT_BODY),
                                 text_color,
                                 egui::Align2::LEFT_CENTER,
                             ),
@@ -2558,7 +2588,7 @@ impl App {
                                     egui::pos2(mtime_x - 8.0, rect.bottom()),
                                 ),
                                 &pretty_size(e.size),
-                                egui::FontId::proportional(12.5),
+                                egui::FontId::proportional(theme::TEXT_BODY),
                                 weak,
                                 egui::Align2::RIGHT_CENTER,
                             );
@@ -2574,7 +2604,7 @@ impl App {
                                 egui::pos2(enc_x - 4.0, rect.bottom()),
                             ),
                             mtime,
-                            egui::FontId::proportional(12.5),
+                            egui::FontId::proportional(theme::TEXT_BODY),
                             weak,
                             egui::Align2::LEFT_CENTER,
                         );
@@ -2728,14 +2758,14 @@ impl App {
                 border.center() - egui::vec2(0.0, 30.0),
                 egui::Align2::CENTER_CENTER,
                 self.t("browser.drop_title"),
-                egui::FontId::proportional(17.0),
+                egui::FontId::proportional(theme::TEXT_TITLE),
                 text,
             );
             painter.text(
                 border.center() - egui::vec2(0.0, 2.0),
                 egui::Align2::CENTER_CENTER,
                 self.t("browser.drop_hint"),
-                egui::FontId::proportional(13.0),
+                egui::FontId::proportional(theme::TEXT_BODY),
                 weak,
             );
         }
@@ -2747,7 +2777,7 @@ impl App {
             .put(
                 button,
                 egui::Button::new(
-                    egui::RichText::new(self.t("app.open")).color(egui::Color32::WHITE),
+                    egui::RichText::new(self.t("app.open")).color(theme::on_accent(ui)),
                 )
                 .fill(accent)
                 .corner_radius(egui::CornerRadius::same(6))
@@ -2841,7 +2871,7 @@ impl App {
                             self.t("extract.scope_selected")
                                 .replace("{n}", &srcs.len().to_string())
                         })
-                        .size(12.5)
+                        .size(theme::TEXT_BODY)
                         .color(theme::secondary(ui)),
                     )
                     .wrap(),
@@ -2892,7 +2922,7 @@ impl App {
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(self.t("extract.dest_absolute"))
-                                .size(11.5)
+                                .size(theme::TEXT_SMALL)
                                 .color(error_color(ui)),
                         )
                         .wrap(),
@@ -3085,11 +3115,11 @@ impl App {
                     .to_string();
                 ui.label(
                     egui::RichText::new(name)
-                        .size(11.5)
+                        .size(theme::TEXT_SMALL)
                         .color(theme::secondary(ui)),
                 );
                 if prompt.retry {
-                    ui.colored_label(ui.visuals().error_fg_color, self.t("password.wrong"));
+                    ui.colored_label(error_color(ui), self.t("password.wrong"));
                 }
                 let field = ui.add_sized(
                     [ui.available_width(), theme::CONTROL_H],
@@ -3235,7 +3265,7 @@ impl App {
                     back = true;
                 }
                 ui.add(egui::Label::new(
-                    egui::RichText::new(self.t("create.title")).size(18.0).strong(),
+                    theme::emphasis(self.t("create.title")).size(theme::TEXT_TITLE),
                 ));
             });
         });
@@ -3430,7 +3460,7 @@ impl App {
                     ui.add_space(4.0);
                     ui.add(egui::Label::new(
                         egui::RichText::new(self.t("create.password_mismatch"))
-                            .size(11.5)
+                            .size(theme::TEXT_SMALL)
                             .color(error_color(ui)),
                     ));
                 }
@@ -3547,7 +3577,7 @@ impl App {
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(warning)
-                            .size(12.0)
+                            .size(theme::TEXT_SMALL)
                             .color(error_color(ui)),
                     )
                     .wrap(),
@@ -3589,7 +3619,7 @@ impl App {
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(self.t(why))
-                                    .size(11.5)
+                                    .size(theme::TEXT_SMALL)
                                     .color(theme::secondary(ui)),
                             )
                             .truncate(),
@@ -3922,8 +3952,7 @@ impl App {
                                     let label = self.t("settings.version");
                                     theme::field(ui, &label, false, |ui| {
                                         ui.label(
-                                            egui::RichText::new(format!("v{CURRENT_VERSION}"))
-                                                .strong(),
+                                            theme::emphasis(format!("v{CURRENT_VERSION}")),
                                         );
                                     });
                                 });
@@ -3962,7 +3991,7 @@ impl App {
                                             "{FEEDBACK_EMAIL_USER} @ {FEEDBACK_EMAIL_DOMAIN}"
                                         );
                                         ui.add(
-                                            egui::Label::new(egui::RichText::new(shown).strong())
+                                            egui::Label::new(theme::emphasis(shown))
                                                 .selectable(true),
                                         );
                                         if ui
@@ -3998,9 +4027,7 @@ impl App {
                     back = true;
                 }
                 ui.add(egui::Label::new(
-                    egui::RichText::new(self.t("settings.title"))
-                        .size(18.0)
-                        .strong(),
+                    theme::emphasis(self.t("settings.title")).size(theme::TEXT_TITLE),
                 ));
             });
         });
@@ -4342,7 +4369,7 @@ impl App {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
                                     egui::RichText::new(&j.dest)
-                                        .size(11.5)
+                                        .size(theme::TEXT_SMALL)
                                         .color(theme::secondary(ui)),
                                 );
                             });
@@ -4396,7 +4423,7 @@ impl App {
                     if let Some(eta) = j.eta_text(&self.lang) {
                         ui.label(
                             egui::RichText::new(eta)
-                                .size(12.0)
+                                .size(theme::TEXT_SMALL)
                                 .color(theme::secondary(ui)),
                         );
                     }
@@ -5135,7 +5162,7 @@ fn breadcrumb_segments(cwd: &str) -> Vec<(String, String)> {
 /// A breadcrumb chip: text only, like the toolbar's ghost buttons, but with a
 /// smaller font because a deep path puts many of them in one row.
 fn crumb_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(egui::Button::new(egui::RichText::new(text).size(12.0)).frame(false))
+    ui.add(egui::Button::new(egui::RichText::new(text).size(theme::TEXT_SMALL)).frame(false))
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -5198,12 +5225,16 @@ fn paint_entry_icon(p: &egui::Painter, icon_rect: egui::Rect, e: &EntryDto, dark
         accent,
     );
     if let Some(txt) = label {
+        // Darkened towards the page it sits on. At full accent the three-letter
+        // label measured 2.35:1 against the badge's white page — the faintest
+        // readable text anywhere in the app. 0.6 brings it to 5.7:1 and keeps
+        // the type-colour coding (the top bar stays full accent).
         p.text(
             page.center() + egui::vec2(1.0, 5.0),
             egui::Align2::CENTER_CENTER,
             txt,
-            egui::FontId::proportional(8.0),
-            accent,
+            egui::FontId::proportional(theme::TEXT_BADGE),
+            accent.gamma_multiply(0.6),
         );
     }
 }
@@ -5596,30 +5627,46 @@ fn dashed_rect(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
 }
 
 /// "Done" green — brightened for dark mode so it stays readable.
+/// Green for "done". Both themes are dark enough to read as text: the light
+/// value is 7.27:1 on a white card and 6.55:1 on the panel. It used to be
+/// rgb(40,140,60), which was 4.28:1 — fainter than the secondary text beside it,
+/// so the one line that says "it worked" was the weakest thing in the window.
 fn ok_color(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
         egui::Color32::from_rgb(94, 200, 126)
     } else {
-        egui::Color32::from_rgb(40, 140, 60)
+        egui::Color32::from_rgb(22, 100, 42)
     }
 }
 
 /// Error red — brightened for dark mode for the same reason.
+///
+/// Darkened in light mode along with the green and the amber: rgb(200,60,40)
+/// was 4.58:1 on the panel and dimmer than the secondary text it sits above,
+/// which for the one colour that means "this went wrong" was backwards.
+/// rgb(160,30,15) is 7.04:1 on the panel and 7.81:1 on a card, and its L* (34.9)
+/// sits *below* the green (36.8) and the amber (39.8), so "error" also reads as
+/// the heaviest of the three in greyscale.
 fn error_color(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
         egui::Color32::from_rgb(255, 122, 102)
     } else {
-        egui::Color32::from_rgb(200, 60, 40)
+        egui::Color32::from_rgb(160, 30, 15)
     }
 }
 
 /// Amber for "it worked, but not all of it" — a run that finished with content
 /// left out. Neither the done-green nor the failure-red is honest for that.
+///
+/// Darkened for the same reason as `ok_color`: rgb(176,112,10) was 4.06:1 on a
+/// white card — dimmer than the helper text below it. rgb(138,80,2) is 6.5:1,
+/// and its L* (39.8) is now well below the green's (36.8) only in hue, so a
+/// red-green colour-blind reader still sees two different final states.
 fn warning_color(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
         egui::Color32::from_rgb(240, 186, 92)
     } else {
-        egui::Color32::from_rgb(176, 112, 10)
+        egui::Color32::from_rgb(138, 80, 2)
     }
 }
 

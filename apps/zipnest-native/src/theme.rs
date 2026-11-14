@@ -21,28 +21,139 @@ pub enum Mode {
     Dark,
 }
 
+/// The Windows UI font stack, in the order a glyph is looked up.
+///
+/// This is the same choice Windows itself makes: `Microsoft YaHei UI` is the
+/// face Windows draws its own dialogs and Explorer with (see
+/// `HKCU\Control Panel\Desktop\WindowMetrics` → `MessageFont`/`CaptionFont`),
+/// and it is face **1** of `msyh.ttc`, not face 0. Face 0 is plain
+/// `Microsoft YaHei`, whose vertical metrics are looser (hhea 2167/-536 against
+/// UI's 2080/-521 at the same em), which is why ordinary YaHei reads as airier
+/// and slightly softer at UI sizes.
+///
+/// Latin stays `Segoe UI` rather than `Segoe UI Variable`. The variable font
+/// is what Windows 11's own shell uses, but it carries only 2530 glyphs against
+/// 5395, and its digit `one` is proportional (776 units against the static
+/// face's 1104) — swapping it in would re-space every number in the list unless
+/// `tnum` were forced on, which epaint does not expose. Measured, the two are
+/// the same at 13 points for the letters this UI draws.
+///
+/// Deliberately NO color/emoji fonts — egui's glyph engine cannot parse them
+/// and would render every glyph as a box.
+const PROPORTIONAL_FONTS: &[(&str, u32)] = &[
+    ("C:\\Windows\\Fonts\\segoeui.ttf", 0),
+    ("C:\\Windows\\Fonts\\msyh.ttc", 1),
+];
+const MONOSPACE_FONTS: &[(&str, u32)] = &[
+    ("C:\\Windows\\Fonts\\CascadiaMono.ttf", 0),
+    ("C:\\Windows\\Fonts\\consola.ttf", 0),
+    ("C:\\Windows\\Fonts\\msyh.ttc", 1),
+];
+
+/// The family name of the semibold/bold stack, for headings and emphasis.
+///
+/// egui has no synthetic bolding — `RichText::strong()` only darkens the colour,
+/// which stopped being a distinction once body text itself went near-black. So
+/// emphasis is a *face*, the way Windows does it: `Segoe UI Bold` for Latin and
+/// `Microsoft YaHei UI Bold` (face 1 of `msyhbd.ttc`, the UI-metric face, same
+/// as the regular stack) for CJK. `msyhbd` covers every non-ASCII character in
+/// this crate's string literals (408 distinct code points, counted, not
+/// estimated).
+pub const BOLD: &str = "bold";
+
+const BOLD_FONTS: &[(&str, u32)] = &[
+    ("C:\\Windows\\Fonts\\segoeuib.ttf", 0),
+    ("C:\\Windows\\Fonts\\msyhbd.ttc", 1),
+];
+
+/// How a system face is grid-fitted.
+///
+/// `symmetric_rendering: false` is the one that matters. With it on — egui's
+/// default, and what every earlier ZipNest release used — ClearType-flavoured
+/// TrueType programs (Microsoft YaHei ships a full `fpgm`/`prep`/`cvt ` set)
+/// are run with GETINFO's "symmetric smoothing" bit set, which widens horizontal
+/// stems so that they look right on a sub-pixel (RGB-striped) rasterizer. epaint
+/// uses an analytic area rasterizer with one coverage channel, so those widened
+/// stems have nothing to exploit and land as grey fringes instead.
+///
+/// Measured on this machine, 13-point Microsoft YaHei UI, `subpixel_binning`
+/// off: turning this flag off moves fully-covered (solid) pixels from 4.0% to
+/// 27.2% of the ink, while total ink is unchanged (1005 → 1001). The same text
+/// in Segoe UI is byte-identical either way, so this only touches CJK — which
+/// is exactly the text the user complained about.
+///
+/// `preserve_linear_metrics` is deliberately left at its default. It sounds
+/// like it controls vertical grid-fitting but in skrifa 0.44 it only gates
+/// `backward_compatibility` and INSTCTRL selector 3; measured across 12- and
+/// 13-point CJK and Latin in both faces it produces byte-identical bitmaps.
+/// Setting it would have been a no-op dressed up as a fix.
+fn crisper_tweak() -> egui::FontTweak {
+    use egui::epaint::text::{HintingTarget, SmoothHinting};
+    egui::FontTweak {
+        hinting_target: HintingTarget::Smooth(SmoothHinting {
+            symmetric_rendering: false,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The face index to actually load: `index` when the file has that many faces,
+/// else 0.
+///
+/// epaint has no missing-face fallback — `Family::new` calls
+/// `panic!("Error parsing … TTF/OTF font file")` when `FontRef::from_index`
+/// fails — so a `.ttc` that arrives with fewer faces than we assume (an
+/// OEM or user-replaced font at a system path) would take the whole process
+/// down at startup under `windows_subsystem = "windows"`, i.e. silently.
+fn clamp_face_index(bytes: &[u8], index: u32) -> u32 {
+    // Offset 8 of a "ttcf" header is numFonts, big-endian u32.
+    let faces = if bytes.len() >= 12 && &bytes[0..4] == b"ttcf" {
+        u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])
+    } else {
+        1
+    };
+    if index < faces {
+        index
+    } else {
+        0
+    }
+}
+
 pub fn install_fonts(ctx: &egui::Context) {
     use egui::FontFamily;
 
     let mut fonts = egui::FontDefinitions::default();
-    // Each font file is read once and registered once, then referenced from
-    // every family that wants it. `msyh.ttc` used to be read twice (once for
-    // Proportional, once for Monospace): the key collided, so memory was not
-    // duplicated, but the ~19 MB file was read from disk and dropped a second
-    // time on every start.
-    let mut add = |path: &str, families: &[FontFamily]| {
-        let Ok(bytes) = std::fs::read(path) else {
-            return;
-        };
+    // Each font file is read from disk at most once and registered once, then
+    // referenced by key from every family that wants it — the bold family below
+    // reuses the regular faces, and reading a 19 MB `.ttc` once per family was
+    // three reads of it on every start.
+    //
+    // `index` picks the face inside a `.ttc` collection; 0 for a plain
+    // `.ttf`/`.otf`.
+    let mut add = |path: &str, index: u32, families: &[FontFamily]| {
         let file = std::path::Path::new(path)
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        let key = format!("sys-{file}");
-        fonts
-            .font_data
-            .insert(key.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        let key = format!("sys-{index}-{file}");
+        // Read the file only if no family has registered it yet. The bold chain
+        // below reuses the regular faces, and without this guard `msyh.ttc`
+        // (18.8 MB) was read three times per launch and `segoeui.ttf` twice.
+        if !fonts.font_data.contains_key(&key) {
+            let Ok(bytes) = std::fs::read(path) else {
+                return;
+            };
+            // A `.ttc` can hold fewer faces than the index we ask for (or the
+            // path may hold a plain single-face file). epaint *panics* on a bad
+            // face index — `family.rs` has no fallback — so clamp it here and
+            // degrade to face 0 rather than take the process down at startup.
+            let index = clamp_face_index(&bytes, index);
+            let data = egui::FontData::from_blob(std::sync::Arc::new(bytes), index)
+                .tweak(crisper_tweak());
+            fonts.font_data.insert(key.clone(), std::sync::Arc::new(data));
+        }
         for family in families {
             let list = fonts.families.entry(family.clone()).or_default();
             if !list.contains(&key) {
@@ -50,20 +161,41 @@ pub fn install_fonts(ctx: &egui::Context) {
             }
         }
     };
-    // Latin: Segoe UI (Win11 default). CJK: Microsoft YaHei fallback.
-    // Deliberately NO color/emoji fonts — egui's glyph engine cannot parse
-    // them and would render every glyph as a box.
-    add(
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        &[FontFamily::Proportional],
-    );
-    add(
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        &[FontFamily::Proportional, FontFamily::Monospace],
-    );
-    add("C:\\Windows\\Fonts\\consola.ttf", &[FontFamily::Monospace]);
+    for (path, index) in PROPORTIONAL_FONTS {
+        add(path, *index, &[FontFamily::Proportional]);
+    }
+    for (path, index) in MONOSPACE_FONTS {
+        add(path, *index, &[FontFamily::Monospace]);
+    }
+    // The bold stack: its own family, so emphasis can be a real weight change
+    // rather than a darker colour. The regular faces follow as the tail of the
+    // chain, so a glyph the bold files happen to lack still renders (at regular
+    // weight) instead of becoming tofu.
+    let bold_family = FontFamily::Name(BOLD.into());
+    for (path, index) in BOLD_FONTS {
+        add(path, *index, std::slice::from_ref(&bold_family));
+    }
+    for (path, index) in PROPORTIONAL_FONTS {
+        add(path, *index, std::slice::from_ref(&bold_family));
+    }
+    // ...and the *built-in* tail as well. A custom family starts with no entry
+    // in `fonts.families`, so it never inherits `egui-icons` — the only face for
+    // `egui::special_emojis`, whose private-use code points no platform font
+    // has. Without this, an icon drawn in the bold family is a tofu box.
+    if let Some(tail) = fonts.families.get(&FontFamily::Proportional).cloned() {
+        let list = fonts.families.entry(bold_family.clone()).or_default();
+        for key in tail.into_iter().filter(|k| !k.starts_with("sys-")) {
+            if !list.contains(&key) {
+                list.push(key);
+            }
+        }
+    }
     // Move our system fonts ahead of the built-ins so they win.
-    for fam in [FontFamily::Proportional, FontFamily::Monospace] {
+    for fam in [
+        FontFamily::Proportional,
+        FontFamily::Monospace,
+        bold_family.clone(),
+    ] {
         if let Some(list) = fonts.families.get_mut(&fam) {
             let sys: Vec<String> = list
                 .iter()
@@ -85,6 +217,20 @@ impl Mode {
     pub fn is_dark(self) -> bool {
         self == Mode::Dark
     }
+}
+
+/// The family that draws at semibold/bold weight.
+///
+/// Use [`emphasis`] rather than `RichText::strong()`: strong only darkens the
+/// colour, and against near-black body text that is a 1.2:1 change nobody can
+/// see. This is the actual bold face.
+pub fn bold_family() -> egui::FontFamily {
+    egui::FontFamily::Name(BOLD.into())
+}
+
+/// A [`egui::RichText`] in the bold face. Chain `.size(…)`/`.color(…)` after it.
+pub fn emphasis(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text).family(bold_family())
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> Color32 {
@@ -228,12 +374,100 @@ fn tune(style: &mut egui::Style, mode: Mode) {
     } else {
         rgb(238, 242, 248)
     };
+    // Body text. egui's defaults are gray(80) light / gray(140) dark, which on
+    // this app's surfaces measured 7.3:1 — readable, but visibly fainter than
+    // the title bar's own text a few points above it, and faint text is most of
+    // what reads as "blurry". These are Windows 11's primary text values
+    // (`TextFillColorPrimary`, i.e. black at 90% on a light surface, white at
+    // 90% on a dark one), not pure black: on a 96-DPI LCD a pure-black stem
+    // looks harsh.
+    //
+    // Emphasis is *not* expressed by a darker colour any more: at 27 the body
+    // text is already within 1.2:1 of black, so `.strong()` had nothing left to
+    // say. See [`emphasis`] — emphasis is a bold face now.
+    let body_text = if dark { rgb(229, 229, 229) } else { rgb(27, 27, 27) };
+    style.visuals.widgets.noninteractive.fg_stroke.color = body_text;
+    style.visuals.widgets.inactive.fg_stroke.color = body_text;
+    // Hover feedback. `ghost_button` and `crumb_button` draw no frame at all, so
+    // the text colour is the *only* thing that changes under the pointer — and
+    // body text is now 1.2:1 from black, which left hover almost invisible on
+    // exactly the controls that have nothing else to show. The accent is
+    // unmistakable against the body colour and still reads as text (5.7:1).
+    style.visuals.widgets.hovered.fg_stroke.color = if dark { ACCENT_DARK } else { ACCENT_LIGHT };
+    // Hint text inside a text field is egui's `weak_text_color()`, which is
+    // `text_color().gamma_multiply(0.6)` and *then* painted at that alpha — two
+    // separate attenuations, so it measured 2.96:1 on a white field and the
+    // search box's placeholder was nearly invisible. Pinning an opaque value
+    // ends the double decay: 4.95:1 light, 6.66:1 dark, both on the field's own
+    // background. It stays lighter than body text, which is what a placeholder
+    // should be.
+    style.visuals.weak_text_color = Some(if dark {
+        rgb(160, 160, 160)
+    } else {
+        rgb(112, 112, 112)
+    });
+    // Turn off sub-pixel binning. It caches each glyph at up to four horizontal
+    // fractional offsets so kerning looks even, and epaint's own docs say what
+    // it costs: "It also lead to text looking more blurry." CJK ideographs were
+    // already excluded from it (`glyph_atlas.rs`, `is_cjk`), so the gain is
+    // Latin's — and so is the full-width punctuation this UI uses a lot of
+    // (`，。！？` are not `is_cjk`; they each held four atlas slots). Hinting
+    // itself stays on: that is the one that sharpens.
+    style.visuals.text_options.subpixel_binning = false;
     // Default control height. egui sizes a button from its text plus
-    // `button_padding`, which at 12.5-point text comes to 26 — every control in
+    // `button_padding`, which at 13-point text comes to 26 — every control in
     // the app was a different height from the 28-point text fields beside it.
     style.spacing.interact_size.y = CONTROL_H;
     style.spacing.button_padding.y = (CONTROL_H - 20.0) / 2.0;
+    // egui draws a few things from its own `text_styles` table rather than
+    // through anything this file can see: a `Window` title and the error dialog
+    // are `TextStyle::Heading`, a `ProgressBar` percentage and a `DragValue` are
+    // `TextStyle::Button`, and a bare `ui.label` / `TextEdit` is `TextStyle::Body`.
+    // Mapping the table to the same constants is what makes AGENTS.md's "dialogs
+    // share the main window's text scale" a fact instead of two numbers that
+    // happened to agree. `Small` was the one that disagreed (egui default 9).
+    style.text_styles = [
+        (egui::TextStyle::Small, egui::FontId::proportional(TEXT_SMALL)),
+        (egui::TextStyle::Body, egui::FontId::proportional(TEXT_BODY)),
+        (egui::TextStyle::Button, egui::FontId::proportional(TEXT_BODY)),
+        (egui::TextStyle::Heading, egui::FontId::proportional(TEXT_TITLE)),
+        (egui::TextStyle::Monospace, egui::FontId::monospace(TEXT_BODY)),
+    ]
+    .into();
 }
+
+// ---------------------------------------------------------------------------
+// Type scale
+// ---------------------------------------------------------------------------
+//
+// Every size the UI draws now lives here and is a whole number, so the scale
+// sits on one grid and adding a size is a deliberate act rather than a new
+// literal.
+//
+// One honest note about why: these faces (Microsoft YaHei UI, Segoe UI) both
+// set `FORCE_INTEGER_PPEM` in `head.flags`, so skrifa rounds the ppem before
+// hinting and a 12.5-point request rasterizes *identically* to 13. The half
+// point only ever moved layout, not strokes. The measured sharpness step is a
+// whole size step: at 13 px the edge-pixel share of this text is 0.60 and at
+// 14 px it is 0.556. Body text ships at 13 — the 0.60 tier — because 14 would
+// have grown every row and control by a point, and the far larger wins turned
+// out to be elsewhere (`crisper_tweak`, the text colours). See
+// `docs/font-crispness-design.md`.
+
+/// The smallest thing the UI says: format labels, the "?" help mark.
+pub const TEXT_TINY: f32 = 11.0;
+/// The three letters on the 14×16 file-type badge in the list. Drawn *inside* a
+/// fixed 14-point page, so it is deliberately below [`TEXT_TINY`] and must not
+/// be raised with the rest of the scale.
+pub const TEXT_BADGE: f32 = 8.0;
+/// Hints, footnotes, status-bar text, error lines under a field.
+pub const TEXT_SMALL: f32 = 12.0;
+/// Body text: captions, chips, row names, list content.
+pub const TEXT_BODY: f32 = 13.0;
+/// A settings or form section heading.
+pub const TEXT_SECTION: f32 = 13.0;
+/// The title row of a page (Settings, Create).
+pub const TEXT_TITLE: f32 = 18.0;
 
 /// Primary/accent button (filled accent, white text) for the toolbar.
 pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
@@ -248,15 +482,21 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 /// did nothing when I clicked it". The fill is chosen from `enabled` instead,
 /// and the sense is dropped to hover-only so a dead button neither highlights
 /// nor reports a click.
+///
+/// The dark-mode label is near-black, not white: the dark accent is a *light*
+/// blue (rgb 88,166,255) and white on it measures 2.53:1 — the toolbar's main
+/// button was the least legible text in the whole dark theme. Near-black on the
+/// same fill is 7.29:1.
 pub fn primary_button_enabled(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
     let dark = ui.visuals().dark_mode;
     let (fill, ink) = if enabled {
-        (ui.visuals().hyperlink_color, Color32::WHITE)
+        (ui.visuals().hyperlink_color, on_accent(ui))
     } else if dark {
         (rgb(52, 52, 52), rgb(120, 120, 120))
     } else {
         (rgb(238, 238, 238), rgb(150, 150, 150))
     };
+    // A disabled button greys out; an enabled one keeps the readable pair above.
     let sense = if enabled {
         egui::Sense::click()
     } else {
@@ -269,6 +509,22 @@ pub fn primary_button_enabled(ui: &mut egui::Ui, text: &str, enabled: bool) -> e
             .stroke(Stroke::NONE)
             .sense(sense),
     )
+}
+
+/// The colour a label takes when it sits on the accent fill.
+///
+/// Light mode's accent is a deep blue, so white reads at 5.67:1. Dark mode's is
+/// a pale blue (rgb 88,166,255) and white on it is only 2.53:1 — below the 3:1
+/// floor for large text, let alone body. rgb(20,20,20) is 7.29:1 on the same
+/// fill. Every accent-filled control in the app — the primary buttons, the
+/// empty-state button and the selected chip — reads it from here, so the rule
+/// lives in one place.
+pub fn on_accent(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        rgb(20, 20, 20)
+    } else {
+        Color32::WHITE
+    }
 }
 
 /// Subtle ghost button (no fill until hovered) for secondary actions.
@@ -294,23 +550,16 @@ pub fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 /// A chip is quiet until chosen and unmistakable when chosen.
 pub fn chip(ui: &mut egui::Ui, selected: bool, text: &str) -> egui::Response {
     let accent = ui.visuals().hyperlink_color;
-    // The dark accent is a pale blue: white on it is unreadable, near-black is
-    // not.
-    let on_accent = if ui.visuals().dark_mode {
-        rgb(20, 20, 20)
-    } else {
-        Color32::WHITE
-    };
     let idle_fill = ui.visuals().widgets.inactive.weak_bg_fill;
     let idle_stroke = ui.visuals().widgets.inactive.bg_stroke.color;
     let idle_text = ui.visuals().text_color();
     let (fill, text_color, stroke) = if selected {
-        (accent, on_accent, Stroke::NONE)
+        (accent, on_accent(ui), Stroke::NONE)
     } else {
         (idle_fill, idle_text, Stroke::new(1.0_f32, idle_stroke))
     };
     ui.add(
-        egui::Button::new(egui::RichText::new(text).size(12.5).color(text_color))
+        egui::Button::new(egui::RichText::new(text).size(TEXT_BODY).color(text_color))
             .fill(fill)
             .stroke(stroke)
             .corner_radius(CornerRadius::same(6))
@@ -384,8 +633,11 @@ const LABEL_GAP: f32 = 4.0;
 pub const FIELD_GAP: f32 = 16.0;
 /// Height of every form control — a text field, a button, a chip.
 ///
-/// Windows uses 32 at its 14-point body text; this app's body is 12.5, so 28
-/// keeps the same optical proportion on the same 4-point grid.
+/// Windows uses 32 at its 14-point body text; this app's body is 13, so 28
+/// keeps the same optical proportion on the same 4-point grid. It also bounds
+/// the type scale from above: a Segoe UI line is 1.330× its point size, and
+/// `button_padding.y` below derives from a 20-point text line, so any size past
+/// ~15 would make a button taller than the 28-point field beside it.
 pub const CONTROL_H: f32 = 28.0;
 
 /// One labelled control: caption, optional help mark, then the control itself
@@ -406,14 +658,14 @@ pub fn field<R>(
         // Primary text, not the dim colour: this caption is the row's title.
         // Dim caption + primary checkbox label made two rows of the same form
         // look like different kinds of thing.
-        ui.label(egui::RichText::new(label).size(12.5));
+        ui.label(egui::RichText::new(label).size(TEXT_BODY));
         if has_help {
             let accent = ui.visuals().hyperlink_color;
             let fill = ui.visuals().widgets.inactive.weak_bg_fill;
             let stroke = ui.visuals().widgets.inactive.bg_stroke.color;
             mark = Some(
                 ui.add(
-                    egui::Button::new(egui::RichText::new("?").size(10.5).color(accent))
+                    egui::Button::new(egui::RichText::new("?").size(TEXT_TINY).color(accent))
                         .corner_radius(CornerRadius::same(7))
                         .min_size(egui::vec2(15.0, 15.0))
                         .fill(fill)
@@ -450,7 +702,7 @@ pub fn check_field(
             let stroke = ui.visuals().widgets.inactive.bg_stroke.color;
             mark = Some(
                 ui.add(
-                    egui::Button::new(egui::RichText::new("?").size(10.5).color(accent))
+                    egui::Button::new(egui::RichText::new("?").size(TEXT_TINY).color(accent))
                         .corner_radius(CornerRadius::same(7))
                         .min_size(egui::vec2(15.0, 15.0))
                         .fill(fill)
@@ -467,7 +719,7 @@ pub fn check_field(
 /// A caption that sits immediately above a control drawn by the caller, for
 /// rows whose control owns its own line.
 pub fn caption(ui: &mut egui::Ui, label: &str) {
-    ui.label(egui::RichText::new(label).size(12.5));
+    ui.label(egui::RichText::new(label).size(TEXT_BODY));
     ui.add_space(LABEL_GAP);
 }
 
@@ -494,21 +746,28 @@ pub fn section(ui: &mut egui::Ui, title: &str) {
     // 24 above, 8 below: the heading has to belong to the group under it more
     // than to the group over it, and that distance is what says so.
     ui.add_space(20.0);
-    ui.label(egui::RichText::new(title).size(13.0).strong());
+    ui.label(emphasis(title).size(TEXT_SECTION));
     ui.add_space(8.0);
 }
 
 /// Secondary text: captions, descriptions, helper lines.
 ///
-/// Windows expresses emphasis as alpha over the surface — 62% black on light,
-/// 77% white on dark — rather than a hand-picked grey, so it holds up on any
-/// background and in either theme. egui's `weak_text_color` blends towards the
-/// panel fill instead, which on a dark card came out almost invisible.
+/// A solid grey rather than black at 62% alpha — the same value either way, but
+/// stated as one colour so every caller's contrast is checkable without knowing
+/// which surface it lands on.
+///
+/// Both values are chosen against the *hardest* surface in their theme, which
+/// is the selection fill (a row's size and mtime columns are drawn in this
+/// colour and can be selected): rgb(84) on rgb(205,229,255) is 5.86:1 and
+/// rgb(190) on rgb(38,79,120) is 4.57:1 — both clear of 4.5:1 at 12-point. They
+/// also keep a real step below body text (ΔL* 25.9 light, 13.9 dark), because a
+/// secondary colour that sits within a couple of L* of the body value stops
+/// reading as secondary at all.
 pub fn secondary(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 196)
+        rgb(190, 190, 190)
     } else {
-        Color32::from_rgba_unmultiplied(0, 0, 0, 158)
+        rgb(84, 84, 84)
     }
 }
 
@@ -525,7 +784,12 @@ pub fn hint(ui: &mut egui::Ui, text: &str) {
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
             ui.add(
-                egui::Label::new(egui::RichText::new(text).size(11.5).color(secondary(ui))).wrap(),
+                egui::Label::new(
+                    egui::RichText::new(text)
+                        .size(TEXT_SMALL)
+                        .color(secondary(ui)),
+                )
+                .wrap(),
             );
         },
     );
