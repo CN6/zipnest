@@ -112,7 +112,13 @@ $dirty = & git status --porcelain
 if ($dirty) {
     Warn 'working tree is not clean:'
     $dirty | ForEach-Object { Write-Host "    $_" }
-    if ($Publish) { Fail 'refusing to publish from a dirty tree' }
+    if ($Publish) {
+        # Refused on purpose: the release commit should hold exactly the
+        # version bump, CHANGELOG and code, reviewed as one change. The script
+        # used to commit for you with --allow-empty, which produced a second,
+        # empty commit on top of the real one (v0.4.39 shipped that way).
+        Fail 'refusing to publish from a dirty tree - stage and commit the release first'
+    }
 }
 
 # ------------------------------------------------------- 1. version agreement
@@ -291,10 +297,16 @@ $notesPath = Join-Path $env:TEMP ("zipnest-notes-$Version.md")
 Write-Host "  notes: $notesPath ($($body.Count) lines)"
 
 Step "commit, tag and push v$Version"
-$subject = "release: v$Version"
-& git add -A
-& git commit -m $subject --allow-empty | ForEach-Object { Write-Host "  $_" }
-if ($LASTEXITCODE -ne 0) { Fail 'git commit failed' }
+# The tree is committed by the caller when -Publish is used (see the dirty-tree
+# check in preflight), so this step only tags and pushes. It used to
+# `git add -A; git commit --allow-empty`, which on an already-committed tree
+# made a *second* empty commit with the same subject as the real release commit
+# - that happened during v0.4.39 and put two identical "release: v0.4.39"
+# entries in the history. Commit first, then publish.
+$head = & git log -1 --format=%s
+if ($head -ne "release: v$Version") {
+    Fail "HEAD is '$head', expected 'release: $Version'. Stage and commit the release first: git add -A; git commit -m `"release: v$Version`""
+}
 & git tag -f -a "v$Version" -m "ZipNest v$Version"
 if ($LASTEXITCODE -ne 0) { Fail 'git tag failed' }
 & git push origin HEAD | ForEach-Object { Write-Host "  $_" }
@@ -304,8 +316,23 @@ if ($LASTEXITCODE -ne 0) { Fail 'tag push failed' }
 Step "gh release create v$Version"
 # An existing release for this tag means a re-cut: delete it first, which also
 # removes the tag (--cleanup-tag), so the force-pushed tag is the one uploaded.
-$existing = & gh release view "v$Version" --json tagName -q .tagName 2>$null
-if ($LASTEXITCODE -eq 0 -and $existing) {
+#
+# `gh release view` on a tag that has no release yet writes "release not
+# found" to **stderr**, and PowerShell 5.1 under $ErrorActionPreference='Stop'
+# turns a native command's stderr into a terminating error. That aborted the
+# v0.4.39 publish *after* the tag was pushed and before the release existed,
+# so the check is run with a local 'Continue' preference instead of `2>$null`
+# (which only silences the stream, not the error it raises).
+$hadRelease = $false
+$prev = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $existing = & gh release view "v$Version" --json tagName -q .tagName 2>&1
+    $hadRelease = ($LASTEXITCODE -eq 0 -and $existing)
+} finally {
+    $ErrorActionPreference = $prev
+}
+if ($hadRelease) {
     Write-Host "  re-cutting: deleting the existing release v$Version"
     & gh release delete "v$Version" --yes --cleanup-tag | ForEach-Object { Write-Host "  $_" }
     & git tag -f -a "v$Version" -m "ZipNest v$Version" | Out-Null

@@ -79,9 +79,13 @@ PowerShell 5.1-compatible:
   clippy, both release builds, the GUI-subsystem check, `emit-portable.ps1`,
   `makensis`, the portable zip and the installed copy under `D:\ZipNest`. Without
   `-Publish` it stops there and prints the two artifact paths; `-Publish` adds
-  the commit, tag, push, `gh release create` and the local cleanup. Step 1
-  (version bump + CHANGELOG) stays manual and is enforced by
-  `check-versions.ps1`, which the script runs first.
+  the tag, push, `gh release create` and the local cleanup. Step 1 (version bump
+  + CHANGELOG) stays manual and is enforced by `check-versions.ps1`, which the
+  script runs first. **Commit the release yourself before `-Publish`**: the
+  script refuses a dirty tree and then requires `HEAD`'s subject to be exactly
+  `release: v<ver>`, instead of committing for you — its old
+  `git commit --allow-empty` produced a second, empty release commit on top of
+  the real one (v0.4.39 shipped that way).
 - `scripts\check-syntax.ps1` — parse-checks every script in `scripts\` without
   running it. Use it after editing one.
 
