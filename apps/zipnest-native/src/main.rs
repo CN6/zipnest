@@ -2899,6 +2899,9 @@ impl App {
     fn extract_dialog(&mut self, ctx: &egui::Context) {
         let mut open = self.show_extract;
         let mut close = false;
+        // Filled inside the window closure; acted on below, where the conflict
+        // question can consult the destination folder.
+        let mut pending_extract: Option<ExtractRequest> = None;
         let arch_id = self.archive.as_ref().map(|a| a.id).unwrap_or(0);
         if self.archive.is_none() {
             self.show_extract = false;
@@ -3029,27 +3032,20 @@ impl App {
                 let prompt_open = self.password_prompt.is_some();
                 let enter = !prompt_open && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if clicked || (can && enter) {
-                    let req = ExtractRequest {
+                    // Built here, acted on after the window closes: the answer
+                    // depends on what is on disk, and a disk query does not
+                    // belong inside the frame that draws the dialog.
+                    pending_extract = Some(ExtractRequest {
                         archive_id: arch_id,
                         sources: srcs.iter().cloned().collect(),
                         dest: self.extract_dest.clone(),
-                        // Answered by the conflict question that opens next.
+                        // Filled in by `request_extract`, which knows whether
+                        // there is anything to ask about.
                         on_conflict: String::new(),
                         delete_archive: self.delete_source,
                         silent: false,
-                    };
-                    // The password the archive was opened with, if any. The service
-                    // also remembers it per archive, but passing it here keeps a
-                    // re-opened archive (new id) working the same way.
-                    self.conflict_prompt = Some(ConflictPrompt {
-                        req,
-                        password: self.archive_password.clone(),
                     });
-                    // The extract dialog is finished: the conflict question is
-                    // the only thing left to answer, and leaving both on screen
-                    // would put a working 开始 behind it.
                     close = true;
-                    self.show_extract = false;
                 }
                 if !prompt_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     close = true;
@@ -3058,6 +3054,44 @@ impl App {
         // Cancel used to set `show_extract` inside the closure, which the line
         // below then overwrote — the button did nothing at all.
         self.show_extract = open && !close && self.job.is_none();
+        if let Some(req) = pending_extract {
+            self.request_extract(req);
+        }
+    }
+
+    /// Act on 开始解压: ask about existing files *only if* there are some.
+    ///
+    /// Until v0.4.39 the conflict question was opened by the button press
+    /// itself, so a brand-new destination — nothing in it at all — still got a
+    /// "文件已存在" window. The question now comes from what is actually on
+    /// disk: the service checks every name the run would write and reports how
+    /// many are already taken.
+    ///
+    /// With nothing in the way the run starts immediately and carries
+    /// `rename`. That is not an answer the user gave — nobody was asked — so it
+    /// has to be the one that cannot destroy anything: the folder could be
+    /// written to between the check and the first byte (two copies of ZipNest,
+    /// or another program), and `rename` still never replaces a file. An
+    /// `overwrite` default here would silently replace something nobody agreed
+    /// to replace, which is the exact failure mode the v0.4.38 dialog existed to
+    /// prevent.
+    fn request_extract(&mut self, mut req: ExtractRequest) {
+        let password = self.archive_password.clone();
+        match self
+            .svc
+            .count_conflicts(req.archive_id, req.sources.clone(), req.dest.clone())
+        {
+            // Nothing to ask about: straight to the progress window.
+            Ok(0) => {
+                req.on_conflict = "rename".into();
+                self.start_extract(req, password);
+            }
+            Ok(_) => self.conflict_prompt = Some(ConflictPrompt { req, password }),
+            // The question could not be asked (the archive went away, the
+            // destination is not a full path). Reporting the reason is better
+            // than starting a run whose conflict answer was never collected.
+            Err(e) => self.error = Some(self.t(&e.key)),
+        }
     }
 
     /// Start an extract job and point the progress window at it.
@@ -3211,10 +3245,11 @@ impl App {
 
     /// Put the "these files already exist" question, when there is one.
     ///
-    /// This is what `"ask"` in Settings means, and the only point in the app
-    /// where a conflict is decided: the extract dialog states the saved policy
-    /// and never re-asks for it, and a run with nothing in the way starts
-    /// without this window appearing at all (see `conflict_decision`).
+    /// This is the only point in the app where a conflict is decided. It opens
+    /// only when the destination really holds one of the names this run would
+    /// write — decided by [`Self::request_extract`] from a listing of every
+    /// destination folder — so a run with nothing in the way starts without
+    /// this window appearing at all.
     ///
     /// Three answers, all of them real engine policies, plus Cancel. Cancel is
     /// a real answer too: the extraction does not start.

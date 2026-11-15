@@ -1091,6 +1091,167 @@ unsafe extern "system" fn disk_op_result(this: *mut c_void, op_res: i32) -> Hres
     S_OK
 }
 
+/// The entries an extraction request covers, sorted by archive index.
+///
+/// An empty selection means "the whole archive". This lives on its own — and
+/// is shared with [`conflicts_on_disk`] — because the pre-flight question
+/// ("does anything in the destination already have one of these names?") has to
+/// be asked about *exactly* the same set the run will write. Two answers to
+/// "what is selected" would eventually differ, and the user would be told
+/// there is nothing in the way about files that were never checked.
+fn select_entries_of(all: &[ArchiveEntry], indices: &[u32]) -> Vec<ArchiveEntry> {
+    let mut selected: Vec<ArchiveEntry> = if indices.is_empty() {
+        all.to_vec()
+    } else {
+        let want: std::collections::HashSet<u32> = indices.iter().copied().collect();
+        all.iter().filter(|e| want.contains(&e.index)).cloned().collect()
+    };
+    selected.sort_by_key(|e| e.index);
+    selected.dedup_by_key(|e| e.index);
+    selected
+}
+
+/// Resolve every destination name before a single byte is written.
+///
+/// This is what makes the promise "success means every entry is on disk" hold:
+/// a hostile or merely Windows-unfriendly name is rewritten here (and
+/// reported), so the write path never has to give up on an entry.
+///
+/// [`conflicts_on_disk`] runs the same function, which is the point: the name
+/// the pre-flight answer is about and the name the file actually lands under
+/// are produced by one piece of code, so a change to the renaming rules cannot
+/// make the question and the write disagree.
+fn plan_entries(selected: &[ArchiveEntry]) -> Vec<EntryMeta> {
+    let names: Vec<(String, bool)> = selected
+        .iter()
+        .map(|e| (e.path.clone(), e.is_dir))
+        .collect();
+    selected
+        .iter()
+        .zip(plan_entry_paths(&names))
+        .map(|(e, p)| EntryMeta {
+            index: e.index,
+            raw_path: e.path.clone(),
+            plan: p.path,
+            fixes: p.fixes,
+            is_dir: e.is_dir,
+            size: e.size,
+            mtime: e.mtime,
+        })
+        .collect()
+}
+
+/// How many of the planned files already exist under `opts.dest`.
+///
+/// See [`conflicts_in`] — this is the `Archive`-taking wrapper used by callers
+/// that hold the archive open (tests, tooling).
+pub fn conflicts_on_disk(arc: &Archive, opts: &ExtractOptions) -> Result<u64, ZipnestError> {
+    let all = arc.entries()?;
+    Ok(conflicts_in(&all, &opts.entries, &opts.dest))
+}
+
+/// How many of `indices` would land on a file that is already in `dest`.
+///
+/// This is the question the UI has to answer *before* it asks the user
+/// "覆盖 / 跳过 / 自动重命名": asking when nothing is in the way is noise, and
+/// v0.4.38 asked unconditionally (the dialog was opened by the button press,
+/// never by what was on disk).
+///
+/// An empty `indices` means "the whole archive", exactly like
+/// [`ExtractOptions::entries`]. Only file entries count — a directory is
+/// idempotent (`create_dir_all`), and "replace this folder with another one"
+/// is not an answer a user can meaningfully give.
+///
+/// **Every folder is listed once, not probed per entry.** `stat`-ing each name
+/// costs ~17 µs per miss on this machine (measured), which is 1.7 s for a
+/// 100 000-entry archive; one `read_dir` returns the whole folder for less than
+/// that, and an archive's names cluster heavily into a handful of folders.
+/// Whatever is not in the listing cannot exist, so this is exact, not an
+/// approximation — and it is case-insensitive, which is what a Windows
+/// filesystem is: `A.TXT` in the folder does block `a.txt`. (On a directory
+/// with NTFS per-directory case sensitivity turned on this over-reports, which
+/// asks the user a question rather than replacing a file unasked — the safe
+/// direction.)
+pub fn conflicts_in(entries: &[ArchiveEntry], indices: &[u32], dest: &std::path::Path) -> u64 {
+    conflicts_in_counted(entries, indices, dest).0
+}
+
+/// [`conflicts_in`], also returning how many folders had to be read.
+///
+/// The second number is the property worth pinning in a test: it must be the
+/// number of distinct folders in the selection, never the number of files.
+/// A wall-clock assertion would measure the planner in a debug build instead of
+/// the disk, so the test counts folders.
+fn conflicts_in_counted(
+    entries: &[ArchiveEntry],
+    indices: &[u32],
+    dest: &std::path::Path,
+) -> (u64, usize) {
+    if !os_exists(dest) {
+        // Nothing there at all: every entry is a fresh write.
+        return (0, 0);
+    }
+    let selected = select_entries_of(entries, indices);
+    let mut listings: std::collections::HashMap<PathBuf, Listing> =
+        std::collections::HashMap::new();
+    let mut count = 0u64;
+    for meta in plan_entries(&selected) {
+        if meta.is_dir {
+            continue;
+        }
+        let full = dest.join(&meta.plan);
+        let Some(parent) = full.parent() else {
+            continue;
+        };
+        let listing = listings
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| Listing::read(parent));
+        // A folder `create_dir_all` will make is empty, so nothing in it can be
+        // in the way; `dest` itself is known to exist.
+        if listing.contains(full.file_name(), dest == parent || listing.exists) {
+            count += 1;
+        }
+    }
+    (count, listings.len())
+}
+
+/// One directory's entries, or the fact that it is not there.
+struct Listing {
+    exists: bool,
+    names: std::collections::HashSet<String>,
+}
+
+impl Listing {
+    fn read(dir: &std::path::Path) -> Self {
+        let Ok(rd) = std::fs::read_dir(os_path(dir)) else {
+            return Self {
+                exists: false,
+                names: std::collections::HashSet::new(),
+            };
+        };
+        Self {
+            exists: true,
+            // Lowercased: the destination is a Windows filesystem, where the
+            // names are case-insensitive, and a pre-flight answer that ignored
+            // that would promise a free name the run then has to rename.
+            names: rd
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().map(|n| n.to_lowercase()))
+                .collect(),
+        }
+    }
+
+    /// `parent_known` is pass-through for the destination root, which is
+    /// already known to exist; for any other folder an absent one answers "no".
+    fn contains(&self, name: Option<&std::ffi::OsStr>, parent_known: bool) -> bool {
+        if !parent_known || !self.exists {
+            return false;
+        }
+        name.and_then(|n| n.to_str())
+            .is_some_and(|n| self.names.contains(&n.to_lowercase()))
+    }
+}
+
 // DiskState carries the progress-closure raw cell, so clippy sees a
 // non-Send Arc. The cell lives exactly for this call: 7z invokes our
 // callbacks synchronously on this thread, and it is freed before return.
@@ -1103,38 +1264,10 @@ pub(crate) fn extract_to_disk(
 ) -> Result<ExtractStats, ZipnestError> {
     // Resolve the selection once; handlers get a sorted, deduped index list.
     let all = arc.entries()?;
-    let mut selected: Vec<ArchiveEntry> = if opts.entries.is_empty() {
-        all
-    } else {
-        let want: std::collections::HashSet<u32> = opts.entries.iter().copied().collect();
-        all.into_iter().filter(|e| want.contains(&e.index)).collect()
-    };
-    selected.sort_by_key(|e| e.index);
-    selected.dedup_by_key(|e| e.index);
+    let selected = select_entries_of(&all, &opts.entries);
 
     let total_bytes: u64 = selected.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
-    // Resolve every name before a single byte is written. This is what makes
-    // the promise "success means every entry is on disk" hold: a hostile or
-    // merely Windows-unfriendly name is rewritten here (and reported), so the
-    // write path never has to give up on an entry.
-    let names: Vec<(String, bool)> = selected
-        .iter()
-        .map(|e| (e.path.clone(), e.is_dir))
-        .collect();
-    let planned = plan_entry_paths(&names);
-    let entries: Vec<EntryMeta> = selected
-        .iter()
-        .zip(planned)
-        .map(|(e, p)| EntryMeta {
-            index: e.index,
-            raw_path: e.path.clone(),
-            plan: p.path,
-            fixes: p.fixes,
-            is_dir: e.is_dir,
-            size: e.size,
-            mtime: e.mtime,
-        })
-        .collect();
+    let entries = plan_entries(&selected);
     let renamed: Vec<RenamedEntry> = entries
         .iter()
         .filter(|e| !e.fixes.is_empty())
@@ -1272,7 +1405,279 @@ fn _future_use(_: &PropVariant, _: fn() -> ZipnestError) {
 
 #[cfg(test)]
 mod tests {
-    use super::has_link_ancestor;
+    use super::{conflicts_in, conflicts_on_disk, has_link_ancestor};
+    use crate::archive::Archive;
+    use crate::types::{ArchiveEntry, ArchiveOpenOptions, ExtractOptions, OnConflict};
+    use std::path::{Path, PathBuf};
+
+    /// A private scratch directory per test, removed at the end.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("zipnest-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A real archive built on the fly, so the tests below exercise the engine
+    /// rather than hand-made entry structs. `zip` is already a dev-dependency.
+    fn make_zip(dir: &Path, name: &str, entries: &[(&str, &[u8])]) -> PathBuf {
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        for (entry, data) in entries {
+            zip.start_file(*entry, opts).unwrap();
+            use std::io::Write;
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap();
+        path
+    }
+
+    fn open(path: &Path) -> Archive {
+        Archive::open(path, ArchiveOpenOptions::default()).expect("the fixture opens")
+    }
+
+    fn opts(dest: &Path) -> ExtractOptions {
+        ExtractOptions {
+            dest: dest.to_path_buf(),
+            entries: Vec::new(),
+            max_total_bytes: u64::MAX,
+            on_conflict: OnConflict::Rename,
+        }
+    }
+
+    fn entry(index: u32, path: &str, is_dir: bool) -> ArchiveEntry {
+        ArchiveEntry {
+            index,
+            path: path.to_string(),
+            is_dir,
+            size: 0,
+            crc: None,
+            mtime: None,
+            encrypted: false,
+        }
+    }
+
+    /// 目标目录里什么都没有的时候，绝不能报冲突 —— 这正是 v0.4.38 的缺陷：
+    /// 弹窗由按钮触发，和磁盘无关。
+    #[test]
+    fn an_empty_destination_has_no_conflicts() {
+        let dir = scratch("conflicts-empty");
+        let zip = make_zip(&dir, "a.zip", &[("a.txt", b"one"), ("sub/b.txt", b"two")]);
+        let arc = open(&zip);
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        assert_eq!(conflicts_on_disk(&arc, &opts(&dest)).unwrap(), 0);
+
+        // 目标目录本身还不存在时也一样：解压会把它建出来，没有东西可撞。
+        let missing = dir.join("not-there");
+        assert_eq!(conflicts_on_disk(&arc, &opts(&missing)).unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同名文件真的在的时候要数出来，而且只数文件。
+    #[test]
+    fn existing_names_are_counted_file_by_file() {
+        let dir = scratch("conflicts-count");
+        let zip = make_zip(
+            &dir,
+            "a.zip",
+            &[("a.txt", b"one"), ("b.txt", b"two"), ("sub/b.txt", b"three")],
+        );
+        let arc = open(&zip);
+        let dest = dir.join("out");
+        std::fs::create_dir_all(dest.join("sub")).unwrap();
+
+        // 一个都没有。
+        assert_eq!(conflicts_on_disk(&arc, &opts(&dest)).unwrap(), 0);
+
+        std::fs::write(dest.join("a.txt"), b"old").unwrap();
+        assert_eq!(conflicts_on_disk(&arc, &opts(&dest)).unwrap(), 1);
+
+        // 子目录里的同名文件同样算：目标路径要保持归档里的结构。
+        std::fs::write(dest.join("sub/b.txt"), b"old").unwrap();
+        assert_eq!(conflicts_on_disk(&arc, &opts(&dest)).unwrap(), 2);
+
+        // 目录条目本身从不计入：`sub/` 存在是正常的，不是冲突。
+        let with_dirs = vec![entry(0, "sub", true), entry(1, "sub/b.txt", false)];
+        assert_eq!(
+            conflicts_in(&with_dirs, &[], &dest),
+            1,
+            "already-existing directories are not a conflict; only the file counts"
+        );
+
+        // 名字不同的文件不算：`b.txt` 在根上，`sub/b.txt` 在子目录里。
+        std::fs::remove_file(dest.join("sub/b.txt")).unwrap();
+        std::fs::write(dest.join("b.txt"), b"old").unwrap();
+        assert_eq!(conflicts_on_disk(&arc, &opts(&dest)).unwrap(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 子目录整体不存在时，里面的文件不可能撞名 —— 判断不能只看文件名。
+    #[test]
+    fn a_file_under_a_missing_folder_cannot_conflict() {
+        let dest = scratch("conflicts-missing-parent");
+        // 同名文件放在根上，同时归档里有一个同名但位于不存在子目录里的条目。
+        std::fs::write(dest.join("x.txt"), b"here").unwrap();
+        // 建一个同名的 *目录*：`deep/x.txt` 的父目录叫 `deep`，这里它偏偏是文件。
+        let entries = vec![entry(0, "deep/x.txt", false), entry(1, "x.txt", false)];
+        assert_eq!(
+            conflicts_in(&entries, &[], &dest),
+            1,
+            "deep/ does not exist, so deep/x.txt cannot be in the way; x.txt is"
+        );
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// 预检与解压必须对同一份文件名达成一致 —— 这是这个修复的全部意义。
+    ///
+    /// 用一个真实归档跑两遍：先问「有几个撞名」，再用 `rename` 解压到同一个
+    /// 目录。答案 0 的那一次解压不能留下任何 `name (2).ext`（改名恰恰说明它撞上
+    /// 了什么）；答案 N 的那一次必须正好留下 N 个。数的是磁盘上的文件，不是
+    /// `stats.renamed` —— 那个字段记的是**归档名被清洗**，和冲突无关。
+    #[test]
+    fn the_precheck_agrees_with_the_run_that_follows_it() {
+        fn renamed_copies(dest: &Path) -> u64 {
+            fn walk(dir: &Path, out: &mut u64) {
+                let Ok(rd) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else if p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains(" (2)"))
+                    {
+                        *out += 1;
+                    }
+                }
+            }
+            let mut n = 0;
+            walk(dest, &mut n);
+            n
+        }
+
+        let dir = scratch("conflicts-agrees");
+        let zip = make_zip(
+            &dir,
+            "a.zip",
+            &[("a.txt", b"one"), ("c.txt", b"two"), ("sub/b.txt", b"three")],
+        );
+        let arc = open(&zip);
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // First run into an empty folder: nothing to be asked about.
+        let none = conflicts_on_disk(&arc, &opts(&dest)).unwrap();
+        assert_eq!(none, 0);
+        arc.extract(&opts(&dest), None, &mut |_| true)
+            .expect("the empty-destination run succeeds");
+        assert_eq!(
+            renamed_copies(&dest),
+            0,
+            "the precheck said 0, so the run may not have found anything to rename"
+        );
+
+        // Second run into the folder the first one just filled: every file is
+        // now in the way, and that is exactly what the precheck says.
+        let n = conflicts_on_disk(&arc, &opts(&dest)).unwrap();
+        assert_eq!(n, 3, "all three files were just written there");
+        arc.extract(&opts(&dest), None, &mut |_| true)
+            .expect("the second run succeeds");
+        assert_eq!(
+            renamed_copies(&dest),
+            n,
+            "every name the precheck reported is one the run had to write elsewhere"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 被改写的归档名按**改写后**的名字比对：`CON` 会写成 `CON_`，目标目录里
+    /// 有 `CON` 不算撞名，有 `CON_` 才算。
+    #[test]
+    fn a_rewritten_name_is_compared_under_its_written_name() {
+        let dest = scratch("conflicts-rewritten");
+        let entries = vec![entry(0, "CON", false)];
+        assert_eq!(conflicts_in(&entries, &[], &dest), 0);
+        // Sanity: the planner really does rewrite it, otherwise this test would
+        // pass for the wrong reason.
+        let planned = super::plan_entries(&entries);
+        assert_ne!(planned[0].plan, "CON", "a device name must be rewritten");
+
+        std::fs::write(dest.join(&planned[0].plan), b"x").unwrap();
+        assert_eq!(
+            conflicts_in(&entries, &[], &dest),
+            1,
+            "the file named the way the run will write it is a conflict"
+        );
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// 只问选中的那些条目：用户勾了一个子目录，问到的就该只是那一片。
+    #[test]
+    fn the_question_covers_only_the_selection() {
+        let dest = scratch("conflicts-selection");
+        std::fs::write(dest.join("a.txt"), b"old").unwrap();
+        std::fs::write(dest.join("b.txt"), b"old").unwrap();
+        let entries = vec![entry(0, "a.txt", false), entry(1, "b.txt", false)];
+        // 空选择 = 整个归档。
+        assert_eq!(conflicts_in(&entries, &[], &dest), 2);
+        // 只选 a.txt。
+        assert_eq!(conflicts_in(&entries, &[0], &dest), 1);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// 大小写不该骗过预检：Windows 上 `a.txt` 和 `A.TXT` 是同一个文件，
+    /// 报「没有冲突」等于替用户决定覆盖。
+    #[test]
+    fn case_differences_still_count_as_a_conflict() {
+        let dest = scratch("conflicts-case");
+        std::fs::write(dest.join("A.TXT"), b"old").unwrap();
+        let entries = vec![entry(0, "a.txt", false)];
+        assert_eq!(
+            conflicts_in(&entries, &[], &dest),
+            1,
+            "the destination filesystem would treat these as one file"
+        );
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// 代价不能随条目数线性堆 `stat`：一个文件夹只该读一次。
+    ///
+    /// 数的是「读了几次目录」，不是耗时 —— 调试构建里耗时主要由路径规划器
+    /// 决定，用秒表去证明磁盘行为只会得到一个会飘的测试。
+    #[test]
+    fn a_wide_folder_is_listed_once_rather_than_probed_per_entry() {
+        let dest = scratch("conflicts-wide");
+        let entries: Vec<ArchiveEntry> = (0..5_000)
+            .map(|i| entry(i, &format!("f{i}.txt"), false))
+            .collect();
+        let (count, folders) = super::conflicts_in_counted(&entries, &[], &dest);
+        assert_eq!(count, 0, "the folder is empty");
+        assert_eq!(
+            folders, 1,
+            "5000 files in one folder must cost one listing, not one probe per file"
+        );
+
+        // 两个子目录 → 两次列举，加上根目录一共三次。
+        let nested = vec![
+            entry(0, "a/one.txt", false),
+            entry(1, "a/two.txt", false),
+            entry(2, "b/three.txt", false),
+            entry(3, "root.txt", false),
+        ];
+        let (_, folders) = super::conflicts_in_counted(&nested, &[], &dest);
+        assert_eq!(folders, 3, "one listing per folder, including the root");
+        let _ = std::fs::remove_dir_all(&dest);
+    }
 
     /// `has_link_ancestor` is the guard that stops an archive from writing
     /// *through* a link entry and out of the destination.

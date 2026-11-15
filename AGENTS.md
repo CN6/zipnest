@@ -57,6 +57,34 @@ otherwise violate. Read it first, every session.
   the window's state does not survive that restart.
 - The window position changes on every restart — re-snapshot coordinates before driving the UI.
 
+## Scripts (use these instead of retyping the loop)
+
+Every step below used to be hand-typed on each iteration, which is where most of
+the wall-clock time in a session went. All four live in `scripts\` and are
+PowerShell 5.1-compatible:
+
+- `scripts\dev-run.ps1 [-Release] [-NoBuild] [-ExtraArgs <path>]` — kills the
+  running instance, rebuilds, relaunches and **waits for the real window**: it
+  polls for the largest visible window and requires its rect to hold still for
+  two samples, because `MainWindowHandle` goes non-zero while the app is still the
+  16x16 startup-flash window (see "Startup flash"). It prints
+  `pid=… hwnd=… rect=x,y WxH`. Never `sleep 5` after a launch again.
+- `scripts\ui-shot.ps1 [-Out <png>] [-ClientOnly] [-Method print]` — captures
+  one window (bounded to its rect, so the image is small enough to read) and
+  prints the rect it used. This is the replacement for a full-desktop
+  `Screenshot` followed by guessing where the window sits. `-Method print` is
+  only for capture-without-focus; glow/OpenGL usually comes back black.
+- `scripts\ship.ps1 [-Publish] [-SkipTests] [-SkipBuild] [-SkipPayload]
+  [-SkipInstalledCopy]` — runs the release recipe below end to end: tests,
+  clippy, both release builds, the GUI-subsystem check, `emit-portable.ps1`,
+  `makensis`, the portable zip and the installed copy under `D:\ZipNest`. Without
+  `-Publish` it stops there and prints the two artifact paths; `-Publish` adds
+  the commit, tag, push, `gh release create` and the local cleanup. Step 1
+  (version bump + CHANGELOG) stays manual and is enforced by
+  `check-versions.ps1`, which the script runs first.
+- `scripts\check-syntax.ps1` — parse-checks every script in `scripts\` without
+  running it. Use it after editing one.
+
 ## Shipping a release (Windows) - exact recipe
 
 `apps/zipnest-native` is the real app (egui, no WebView2). The older Tauri/WebView2

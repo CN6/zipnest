@@ -7,7 +7,7 @@ description = "ZipNest native UI (egui) — no WebView2"
 
 [dependencies]
 zipnest-ipc = { path = "../../crates/zipnest-ipc" }
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit", "links", "system_fonts", "x11", "wayland"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit", "links", "system_fonts", "x11", "wayland", "clipboard"] }
 egui = "0.37"
 # The parser epaint itself uses to load a face. `epaint::text::FontFace::new` is
 # fallible on exactly one call — `skrifa::FontRef::from_index` — and

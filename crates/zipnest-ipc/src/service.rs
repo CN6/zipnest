@@ -738,6 +738,44 @@ impl IpcService {
         self.jobs.cancel(job_id)
     }
 
+    /// How many of `paths` (an empty list = the whole archive) would land on a
+    /// file that already exists in `dest`.
+    ///
+    /// This is what lets the extract dialog ask "覆盖 / 跳过 / 自动重命名" only
+    /// when there is really something in the way. Before v0.4.39 the question
+    /// was opened by the button press alone, so a destination that did not hold
+    /// a single one of these names still got asked.
+    ///
+    /// Runs on the caller's thread and takes no archive lock: it reads the
+    /// entry list cached at open time (see [`ArchiveRegistry::entries`]) and
+    /// then stats the destination, so it stays answerable while an extraction
+    /// is running and would otherwise hold that mutex for its whole duration.
+    /// Type of the answer mirrors [`archive_core::conflicts_in`].
+    pub fn count_conflicts(
+        &self,
+        id: u64,
+        paths: Vec<String>,
+        dest: String,
+    ) -> Result<u64, IpcError> {
+        // Same rule as the extraction itself (see `extract_with_delete`): a
+        // relative destination would resolve against whatever directory the
+        // process happened to start in, and the answer would be about a folder
+        // the user never named.
+        let dest = dest.trim();
+        if !std::path::Path::new(dest).is_absolute() {
+            return Err(IpcError::new("error.io"));
+        }
+        let entries = self.cached_entries(id)?;
+        // The same expansion the job will use, so "selected a folder" means the
+        // same set of files in both places.
+        let wanted = select_entries(&entries, &paths);
+        Ok(archive_core::conflicts_in(
+            &entries,
+            &wanted,
+            std::path::Path::new(dest),
+        ))
+    }
+
     /// Queue an extract job (behind any active one) and return its id.
     ///
     /// The runner holds the archive's mutex for the whole extraction, so the
@@ -1524,5 +1562,97 @@ mod tests {
         assert_eq!(wanted.len(), n as usize);
         assert_eq!(wanted.first(), Some(&0));
         assert_eq!(wanted.last(), Some(&(n - 1)));
+    }
+
+    // --- "is anything in the way" -----------------------------------------
+
+    /// 打开一个真实归档（`fixtures/plain.zip`：`a.txt`、`c.txt`、`sub/b.txt`），
+    /// 好让下面的预检走完整的 IPC 路径而不是手搓的条目表。
+    fn service_with_plain_zip(name: &str) -> (IpcService, u64, std::path::PathBuf) {
+        let svc = service_with_settings(name);
+        crate::sweep_stale_test_temp("zipnest-plain-");
+        let base = std::env::temp_dir().join(format!("zipnest-plain-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let zip = base.join("plain.zip");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("plain.zip");
+        std::fs::copy(&fixture, &zip).expect("fixtures/plain.zip must exist");
+        let opened = svc
+            .open_archive(zip.to_string_lossy().into(), None)
+            .expect("the fixture opens");
+        (svc, opened.id, base)
+    }
+
+    /// 目标目录是空的 ⇒ 0，UI 因此不会问「文件已存在」。这就是 v0.4.38 的缺陷：
+    /// 问题是按钮打开的，和磁盘无关。
+    #[test]
+    fn an_untouched_destination_reports_no_conflicts() {
+        let (svc, id, base) = service_with_plain_zip("conflict-none");
+        let dest = base.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let n = svc
+            .count_conflicts(id, Vec::new(), dest.to_string_lossy().into())
+            .expect("an existing destination can be inspected");
+        assert_eq!(n, 0);
+
+        // 目录还不存在时同样为 0：解压会建它，没有东西可撞。
+        let missing = base.join("not-created-yet");
+        assert_eq!(
+            svc.count_conflicts(id, Vec::new(), missing.to_string_lossy().into())
+                .unwrap(),
+            0
+        );
+
+        svc.close_archive(id);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 真有同名文件时数出来，并且跟着选择走。
+    #[test]
+    fn the_count_follows_what_is_on_disk_and_what_is_selected() {
+        let (svc, id, base) = service_with_plain_zip("conflict-count");
+        let dest = base.join("out");
+        std::fs::create_dir_all(dest.join("sub")).unwrap();
+        std::fs::write(dest.join("a.txt"), b"old").unwrap();
+        std::fs::write(dest.join("sub/b.txt"), b"old").unwrap();
+        let dest_s = dest.to_string_lossy().to_string();
+
+        assert_eq!(svc.count_conflicts(id, Vec::new(), dest_s.clone()).unwrap(), 2);
+        // 只选根上的 a.txt。
+        assert_eq!(
+            svc.count_conflicts(id, vec!["a.txt".into()], dest_s.clone())
+                .unwrap(),
+            1
+        );
+        // 选子目录 `sub`：展开成 sub/ 和 sub/b.txt，只有后者是文件且存在。
+        assert_eq!(
+            svc.count_conflicts(id, vec!["sub".into()], dest_s.clone())
+                .unwrap(),
+            1
+        );
+
+        svc.close_archive(id);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 相对路径和不存在的归档都要有话说，而不是悄悄给出 0。
+    #[test]
+    fn the_question_refuses_a_relative_destination_and_an_unknown_archive() {
+        let (svc, id, base) = service_with_plain_zip("conflict-errors");
+        let err = svc
+            .count_conflicts(id, Vec::new(), "just-a-folder-name".into())
+            .expect_err("a relative destination must be refused, like extract does");
+        assert_eq!(err.key, "error.io");
+        let err = svc
+            .count_conflicts(u64::MAX, Vec::new(), base.to_string_lossy().into())
+            .expect_err("an unknown archive has no entries to check");
+        assert_eq!(err.key, "error.not_an_archive");
+        svc.close_archive(id);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
