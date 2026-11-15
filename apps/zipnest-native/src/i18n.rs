@@ -100,8 +100,11 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> = std::sync:
             "extract.title" => "解压到",
             "extract.dest" => "目标文件夹",
             "extract.browse" => "浏览…",
-            "extract.overwrite" => "覆盖已存在文件",
-            "extract.policy_saved" => "（设置里定的）",
+            "conflict.title" => "文件已存在",
+            "conflict.body" => "解压时遇到同名文件要怎么处理？",
+            "conflict.overwrite" => "覆盖",
+            "conflict.skip" => "跳过",
+            "conflict.rename" => "自动重命名",
             "extract.start" => "开始解压",
             "extract.delete" => "解压并删除",
             "extract.delete_hint" => "解压成功后会永久删除原压缩包；仅在整个压缩包一起解压时可用，失败或取消时保留。",
@@ -201,7 +204,7 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> = std::sync:
             "job.canceled" => "取消",
             "job.ok" => "完成",
             "job.ok_deleted" => "解压完成，原压缩包已删除",
-            "job.ok_skipped" => "完成（{count} 个已存在的文件按你的设置跳过）",
+            "job.ok_skipped" => "完成（{count} 个已存在的文件按你的选择跳过）",
             "job.ok_renamed" => "完成（{count} 个怪名字已自动改成 Windows 能用的名字，文件都在）",
             "job.ok_create_skipped" => "已生成压缩包，但有 {count} 项指向别处的链接没有打进去",
             "job.create_skipped.header" => "{count} 项是指向别处的链接（符号链接或目录联接），没有打进压缩包：",
@@ -238,7 +241,6 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> = std::sync:
             "settings.language.zh" => "简体中文",
             "settings.language.en" => "English",
             "settings.default_dir" => "默认解压目录",
-            "settings.overwrite" => "覆盖策略",
             "settings.ui_zoom" => "界面缩放",
             "settings.ui_zoom.percent" => "{percent}%",
             "settings.max_extract" => "单次解压上限",
@@ -247,11 +249,6 @@ static ZH: std::sync::LazyLock<HashMap<&'static str, &'static str>> = std::sync:
             "settings.auto_close" => "完成后自动关闭窗口",
             "settings.auto_close.hint" => "压缩或解压完成后自动关掉窗口。关掉后你就看不到「完成」提示和输出位置了，所以默认不自动关闭。",
             "settings.version" => "当前版本",
-            "settings.overwrite.hint" => "文件已存在时",
-            "settings.overwrite.ask" => "询问我",
-            "settings.overwrite.overwrite" => "覆盖",
-            "settings.overwrite.skip" => "跳过",
-            "settings.overwrite.rename" => "自动重命名",
             "settings.shell.associate" => "默认用 ZipNest 打开压缩包",
             "settings.shell.assoc_hint" => "安装后会接管 ZIP / 7Z / RAR / TAR / GZ / BZ2 / XZ / ISO 的默认打开方式；取消勾选会立刻还回去。",
             "settings.shell.blocked" => "系统给 {exts} 记住了别的默认程序，所以要再改回来一次 —— 点下面的按钮就行，不用去系统设置里翻。",
@@ -305,8 +302,11 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> = std::sync:
             "extract.title" => "Extract to",
             "extract.dest" => "Destination folder",
             "extract.browse" => "Browse…",
-            "extract.overwrite" => "Overwrite existing files",
-            "extract.policy_saved" => "(from Settings)",
+            "conflict.title" => "Files already exist",
+            "conflict.body" => "What should happen to files that are already in the destination?",
+            "conflict.overwrite" => "Overwrite",
+            "conflict.skip" => "Skip",
+            "conflict.rename" => "Rename automatically",
             "extract.start" => "Extract",
             "extract.delete" => "Extract and delete",
             "extract.delete_hint" => "Deletes the source archive after a successful extraction. Only available when extracting the whole archive; failed or cancelled runs keep it.",
@@ -406,7 +406,7 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> = std::sync:
             "job.canceled" => "Cancel",
             "job.ok" => "Done",
             "job.ok_deleted" => "Extraction complete, source archive deleted",
-            "job.ok_skipped" => "Done ({count} existing files left alone per your setting)",
+            "job.ok_skipped" => "Done ({count} existing files left alone as you chose)",
             "job.ok_renamed" => "Done ({count} odd names were rewritten so Windows could store them — nothing is missing)",
             "job.ok_create_skipped" => "Archive created, but {count} links pointing elsewhere were left out",
             "job.create_skipped.header" => "{count} of these point elsewhere (symbolic links or directory junctions) and were not packed:",
@@ -443,7 +443,6 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> = std::sync:
             "settings.language.zh" => "Simplified Chinese",
             "settings.language.en" => "English",
             "settings.default_dir" => "Default extract folder",
-            "settings.overwrite" => "Overwrite policy",
             "settings.ui_zoom" => "UI zoom",
             "settings.ui_zoom.percent" => "{percent}%",
             "settings.max_extract" => "Extract limit",
@@ -452,11 +451,6 @@ static EN: std::sync::LazyLock<HashMap<&'static str, &'static str>> = std::sync:
             "settings.auto_close" => "Close the window when a job finishes",
             "settings.auto_close.hint" => "Close the window by itself after a create or extract job. Its completion message and output path go with it, so this is off by default.",
             "settings.version" => "Current version",
-            "settings.overwrite.hint" => "If a file exists",
-            "settings.overwrite.ask" => "Ask me",
-            "settings.overwrite.overwrite" => "Overwrite",
-            "settings.overwrite.skip" => "Skip",
-            "settings.overwrite.rename" => "Rename automatically",
             "settings.shell.associate" => "Open archives with ZipNest by default",
             "settings.shell.assoc_hint" => "Takes over the default handler for ZIP / 7Z / RAR / TAR / GZ / BZ2 / XZ / ISO on install; unticking hands them straight back.",
             "settings.shell.blocked" => "Windows has another default app recorded for {exts}, so it needs changing back once — the button below does that, with no trip to Windows Settings.",
@@ -564,11 +558,6 @@ mod tests {
         }
         for volume in ["off", "10m", "100m", "1g", "custom"] {
             let key = format!("create.volume.{volume}");
-            assert!(ZH.deref().contains_key(key.as_str()), "zh-CN lacks {key}");
-            assert!(EN.deref().contains_key(key.as_str()), "en-US lacks {key}");
-        }
-        for policy in ["ask", "overwrite", "skip", "rename"] {
-            let key = format!("settings.overwrite.{policy}");
             assert!(ZH.deref().contains_key(key.as_str()), "zh-CN lacks {key}");
             assert!(EN.deref().contains_key(key.as_str()), "en-US lacks {key}");
         }

@@ -98,26 +98,27 @@ fn crisper_tweak() -> egui::FontTweak {
     }
 }
 
-/// The face index to actually load: `index` when the file has that many faces,
-/// else 0.
+/// The face index to actually load: `index` when the file really holds a face
+/// there, else face `0`, else `None` — do not register this file at all.
 ///
-/// epaint has no missing-face fallback — `Family::new` calls
-/// `panic!("Error parsing … TTF/OTF font file")` when `FontRef::from_index`
-/// fails — so a `.ttc` that arrives with fewer faces than we assume (an
-/// OEM or user-replaced font at a system path) would take the whole process
-/// down at startup under `windows_subsystem = "windows"`, i.e. silently.
-fn clamp_face_index(bytes: &[u8], index: u32) -> u32 {
-    // Offset 8 of a "ttcf" header is numFonts, big-endian u32.
-    let faces = if bytes.len() >= 12 && &bytes[0..4] == b"ttcf" {
-        u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])
-    } else {
-        1
-    };
-    if index < faces {
-        index
-    } else {
-        0
-    }
+/// epaint has no missing-face fallback: `family::Family::new` calls
+/// `panic!("Error parsing … TTF/OTF font file")` whenever a configured font
+/// fails to parse, and with `windows_subsystem = "windows"` that panic is a
+/// launch with no window and no message at all. The six paths above are system
+/// paths, but a user can replace a font file and an OEM image can ship a stub,
+/// so each file is checked before it is registered.
+///
+/// Counting the faces of a `ttcf` (the previous guard) is not enough: it says
+/// nothing about whether the bytes parse — a truncated collection, or an
+/// `.lnk` sitting where a font should be, went straight through to the panic.
+/// So the check is the parser itself, `skrifa::FontRef::from_index`, which is
+/// exactly the call `epaint::text::FontFace::new` makes. It is also the only
+/// fallible step there — `metrics`, `charmap` and `outline_glyphs` cannot fail
+/// once it has succeeded — so a file that passes here cannot panic epaint.
+fn usable_face_index(bytes: &[u8], index: u32) -> Option<u32> {
+    [index, 0]
+        .into_iter()
+        .find(|&face| skrifa::FontRef::from_index(bytes, face).is_ok())
 }
 
 pub fn install_fonts(ctx: &egui::Context) {
@@ -145,11 +146,13 @@ pub fn install_fonts(ctx: &egui::Context) {
             let Ok(bytes) = std::fs::read(path) else {
                 return;
             };
-            // A `.ttc` can hold fewer faces than the index we ask for (or the
-            // path may hold a plain single-face file). epaint *panics* on a bad
-            // face index — `family.rs` has no fallback — so clamp it here and
-            // degrade to face 0 rather than take the process down at startup.
-            let index = clamp_face_index(&bytes, index);
+            // Parse-check first: a font file that cannot be parsed must never
+            // reach epaint, which treats it as a panic rather than an error.
+            // A file that fails is not registered at all, so the families below
+            // fall through to the next (or the built-in) face instead.
+            let Some(index) = usable_face_index(&bytes, index) else {
+                return;
+            };
             let data = egui::FontData::from_blob(std::sync::Arc::new(bytes), index)
                 .tweak(crisper_tweak());
             fonts.font_data.insert(key.clone(), std::sync::Arc::new(data));
@@ -235,6 +238,21 @@ pub fn emphasis(text: impl Into<String>) -> egui::RichText {
 
 fn rgb(r: u8, g: u8, b: u8) -> Color32 {
     Color32::from_rgb(r, g, b)
+}
+
+/// `color` at `factor` of its own RGB, still fully opaque.
+///
+/// This is the palette's way to darken towards a light surface. It has to be
+/// spelled out because [`Color32`] is *premultiplied*: `gamma_multiply(0.6)`
+/// scales alpha along with RGB, so the result composites as
+/// `0.6·color + 0.4·surface` — it moves the colour *towards* the surface it was
+/// meant to stand out from, and the more so the smaller the factor. On the
+/// file-type badge that made the three-letter label fainter than plain accent
+/// (measured 1.66:1 light / 1.50:1 dark on the ZIP badge, against 2.35 / 1.93
+/// at full accent). Multiplying `r`/`g`/`b` instead keeps alpha at 255.
+pub fn shade(color: Color32, factor: f32) -> Color32 {
+    let channel = |c: u8| (f32::from(c) * factor).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(channel(color.r()), channel(color.g()), channel(color.b()))
 }
 
 fn visuals(mode: Mode) -> egui::Visuals {
@@ -517,15 +535,31 @@ pub fn primary_button_enabled(ui: &mut egui::Ui, text: &str, enabled: bool) -> e
 /// a pale blue (rgb 88,166,255) and white on it is only 2.53:1 — below the 3:1
 /// floor for large text, let alone body. rgb(20,20,20) is 7.29:1 on the same
 /// fill. Every accent-filled control in the app — the primary buttons, the
-/// empty-state button and the selected chip — reads it from here, so the rule
-/// lives in one place.
+/// empty-state button, the selected chip and the progress bar's percentage —
+/// reads it from here, so the rule lives in one place.
 pub fn on_accent(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
+    on_accent_color(ui.visuals().dark_mode)
+}
+
+/// [`on_accent`] for code that has the theme but not a [`egui::Ui`] — the
+/// contrast tests, and any painting done straight to a painter.
+pub fn on_accent_color(dark: bool) -> Color32 {
+    if dark {
         rgb(20, 20, 20)
     } else {
         Color32::WHITE
     }
 }
+
+/// How far the accent fill reaches the progress bar's percentage label.
+///
+/// egui paints that label one `item_spacing` inside the track's left edge
+/// (~8 points) and at [`TEXT_BODY`] "100%" is ~34 points wide, so the fill has
+/// to cover ~42 of the bar's 360 points — 0.12 — before the whole label is on
+/// the accent. Below this the label is on the *track* and takes the track's
+/// ink instead; the two inks are equally readable, and the switch is invisible
+/// in normal use because the bar passes 15% within a few frames.
+pub const PROGRESS_LABEL_ON_FILL: f32 = 0.15;
 
 /// Subtle ghost button (no fill until hovered) for secondary actions.
 ///
@@ -889,7 +923,40 @@ pub fn system_prefers_dark() -> bool {
 }
 
 #[cfg(test)]
+pub mod contrast {
+    //! WCAG 2.x contrast, for tests only.
+    //!
+    //! Every colour decision in this file is a measurement, so the measuring
+    //! stick lives next to them. Exposed to the crate's other test modules
+    //! (`theme::contrast::ratio`), which is why this is not just a helper
+    //! inside `mod tests`.
+    use eframe::egui::Color32;
+
+    /// WCAG 2.x relative luminance of an opaque colour.
+    fn luminance(c: Color32) -> f32 {
+        let channel = |v: u8| {
+            let v = f32::from(v) / 255.0;
+            if v <= 0.040_45 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+    }
+
+    /// Contrast ratio between two opaque colours: 1.0 (identical) to 21.0
+    /// (black on white). The app's floor for body-sized text is 4.5:1.
+    pub fn ratio(a: Color32, b: Color32) -> f32 {
+        let (x, y) = (luminance(a), luminance(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::contrast::ratio;
     use super::*;
 
     #[test]
@@ -906,5 +973,78 @@ mod tests {
         // Text and canvas must contrast with the surface they sit on.
         assert!(light.panel_fill.r() > light.window_stroke.color.r());
         assert!(dark.panel_fill.r() < dark.window_fill.r());
+    }
+
+    /// The progress bar's percentage is painted on the bar's accent fill. It
+    /// used to inherit `selection.stroke.color` — the accent itself — which
+    /// measured 4.39:1 in light mode and 3.36:1 in dark.
+    #[test]
+    fn the_progress_percentage_clears_4_5_to_1_on_the_accent_fill() {
+        for (dark, accent, label) in [(false, ACCENT_LIGHT, "light"), (true, ACCENT_DARK, "dark")] {
+            let measured = ratio(on_accent_color(dark), accent);
+            assert!(
+                measured >= 4.5,
+                "{label}: on_accent on the accent fill is {measured:.2}:1"
+            );
+        }
+    }
+
+    /// The track is what the label sits on until the fill reaches it, so the
+    /// body text colour has to clear 4.5:1 there too.
+    #[test]
+    fn the_progress_label_is_readable_on_the_track() {
+        for (mode, label) in [(Mode::Light, "light"), (Mode::Dark, "dark")] {
+            let v = visuals(mode);
+            let measured = ratio(v.text_color(), v.extreme_bg_color);
+            assert!(measured >= 4.5, "{label}: track ink is {measured:.2}:1");
+        }
+    }
+
+    /// [`PROGRESS_LABEL_ON_FILL`] has to be past the point where the fill
+    /// actually reaches the label's end: 360-point bar, label starts one
+    /// `item_spacing` in, "100%" is ~34 points wide at [`TEXT_BODY`].
+    #[test]
+    fn the_threshold_puts_the_label_on_the_fill_not_the_track() {
+        let label_reach = 8.0 + 34.0;
+        assert!(PROGRESS_LABEL_ON_FILL * 360.0 > label_reach);
+    }
+
+    /// The font guard must reject anything epaint would panic on. `ttcf`
+    /// headers are the trap: the old code trusted the face count and returned
+    /// index 0 for a collection whose face table points nowhere.
+    #[test]
+    fn an_unparseable_font_is_never_registered() {
+        assert_eq!(usable_face_index(b"", 0), None);
+        assert_eq!(usable_face_index(b"not a font at all", 0), None);
+        // A file that only *looks* like a collection: "ttcf", version 1.0,
+        // numFonts = 1, then no face-offset table at all.
+        let stub = [
+            b't', b't', b'c', b'f', 0x00, 0x01, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x01,
+        ];
+        assert_eq!(usable_face_index(&stub, 0), None);
+        // And a bare sfnt magic with no table directory behind it.
+        assert_eq!(usable_face_index(&[0x00, 0x01, 0x00, 0x00], 0), None);
+    }
+
+    /// The positive control: the faces the app actually asks for resolve, and
+    /// a request past the last face falls back to face 0 instead of `None`.
+    #[test]
+    fn the_real_system_faces_resolve() {
+        let Ok(ttc) = std::fs::read("C:\\Windows\\Fonts\\msyh.ttc") else {
+            return; // Not this machine — nothing to assert.
+        };
+        assert_eq!(usable_face_index(&ttc, 1), Some(1));
+        // `msyh.ttc` holds one face? Then index 1 falls back; if it holds more,
+        // index 1 is itself valid — either way the answer is a face that parses.
+        let out_of_range = usable_face_index(&ttc, u32::MAX);
+        assert_eq!(out_of_range, Some(0));
+
+        let Ok(segoe) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") else {
+            return;
+        };
+        assert_eq!(usable_face_index(&segoe, 0), Some(0));
+        // A `.ttf` asked for face 1 has no such face: fall back to 0.
+        assert_eq!(usable_face_index(&segoe, 1), Some(0));
     }
 }

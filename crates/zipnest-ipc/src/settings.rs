@@ -20,7 +20,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const LANGUAGES: [&str; 3] = ["system", "zh-CN", "en-US"];
-const OVERWRITE: [&str; 4] = ["ask", "overwrite", "skip", "rename"];
 const THEMES: [&str; 3] = ["system", "light", "dark"];
 
 /// Accepted range for [`Settings::preview_max_bytes`]: 1 KiB ..= 512 MiB.
@@ -50,8 +49,6 @@ pub struct Settings {
     pub language: String,
     /// Empty means "next to the archive".
     pub default_extract_dir: String,
-    /// `"ask" | "overwrite" | "skip" | "rename"`.
-    pub overwrite_policy: String,
     /// Register per-user file associations (HKCU). **On by default**: a fresh
     /// install is expected to open archives with ZipNest, so the app claims the
     /// handler on its first run and the installer does the same. Unticking it
@@ -101,7 +98,6 @@ impl Default for Settings {
         Self {
             language: "system".into(),
             default_extract_dir: String::new(),
-            overwrite_policy: "ask".into(),
             associate: true,
             context_menu: true,
             // Explicitly all nine rather than an empty "means everything" list:
@@ -133,7 +129,6 @@ impl Default for Settings {
 pub struct SettingsPatch {
     pub language: Option<String>,
     pub default_extract_dir: Option<String>,
-    pub overwrite_policy: Option<String>,
     pub associate: Option<bool>,
     pub context_menu: Option<bool>,
     pub assoc_extensions: Option<Vec<String>>,
@@ -164,12 +159,6 @@ impl Settings {
                 return Err(invalid());
             }
             self.language = v;
-        }
-        if let Some(v) = patch.overwrite_policy {
-            if !OVERWRITE.contains(&v.as_str()) {
-                return Err(invalid());
-            }
-            self.overwrite_policy = v;
         }
         if let Some(v) = patch.default_extract_dir {
             self.default_extract_dir = v;
@@ -230,9 +219,6 @@ impl Settings {
     fn sanitize(&mut self) {
         if !LANGUAGES.contains(&self.language.as_str()) {
             self.language = "system".into();
-        }
-        if !OVERWRITE.contains(&self.overwrite_policy.as_str()) {
-            self.overwrite_policy = "ask".into();
         }
         if !THEMES.contains(&self.theme_mode.as_str()) {
             self.theme_mode = "system".into();
@@ -505,7 +491,6 @@ mod tests {
     fn defaults_are_sane() {
         let s = Settings::default();
         assert_eq!(s.language, "system");
-        assert_eq!(s.overwrite_policy, "ask");
         // Integration is claimed out of the box (v0.4.8): a fresh install opens
         // archives with ZipNest without the user hunting for a checkbox.
         assert!(s.associate && s.context_menu);
@@ -573,7 +558,7 @@ mod tests {
         assert_eq!(reopened.get().language, "en-US");
         assert!(reopened.get().associate);
         // Untouched fields keep their defaults.
-        assert_eq!(reopened.get().overwrite_policy, "ask");
+        assert_eq!(reopened.get().theme_mode, "system");
     }
 
     #[test]
@@ -754,11 +739,14 @@ mod tests {
         // with defaults on the next save.
         let path = tmp_path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The retired `overwrite_policy` key is deliberately still in this
+        // file: a settings.json written by v0.4.37 and earlier must keep
+        // loading, not fall back to defaults and overwrite every preference on
+        // the next save. `serde` ignores keys the struct no longer has.
         std::fs::write(&path, "\u{feff}{\"language\":\"zh-CN\",\"overwrite_policy\":\"rename\"}")
             .unwrap();
         let store = SettingsStore::new(path);
         assert_eq!(store.get().language, "zh-CN");
-        assert_eq!(store.get().overwrite_policy, "rename");
     }
 
     #[test]
@@ -849,7 +837,6 @@ mod tests {
         .unwrap();
         let s = SettingsStore::new(path).get().clone();
         assert_eq!(s.language, "system");
-        assert_eq!(s.overwrite_policy, "ask");
         assert_eq!(s.preview_max_bytes, PREVIEW_MAX_BYTES.1);
         assert_eq!(s.ui_zoom, UI_ZOOM.1);
         // Unknown-to-the-file field still takes its default.

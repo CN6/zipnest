@@ -857,6 +857,37 @@ struct PasswordPrompt {
     then: PasswordThen,
 }
 
+/// The "what about files that already exist" question, waiting to be answered.
+///
+/// Every extraction goes through it: the answer decides what the engine does
+/// with a name that is already taken, and it belongs to *this* run rather than
+/// to a saved preference — the same user may want to replace a file here and
+/// keep one there.
+///
+/// The request is kept whole — source selection, destination, "delete the
+/// archive", and the password — so answering does not send the user back to
+/// the extract dialog to fill it in again.
+struct ConflictPrompt {
+    req: ExtractRequest,
+    password: Option<String>,
+}
+
+/// The three answers the "files already exist" question offers, in the order
+/// they are laid out next to Cancel (the row is right-to-left, so the first
+/// entry sits closest to Cancel).
+///
+/// These are the engine's own policies, spelled exactly as `OnConflict` accepts
+/// them. `"ask"` is deliberately absent: it is not a policy, and
+/// `OnConflict::from_policy` reads anything unrecognised as **overwrite** — a
+/// stray "ask" reaching the engine would replace files nobody agreed to
+/// replace. That was the whole defect: a saved four-option setting whose "ask"
+/// was answered by an unticked checkbox.
+const CONFLICT_CHOICES: [(&str, &str); 3] = [
+    ("rename", "conflict.rename"),
+    ("skip", "conflict.skip"),
+    ("overwrite", "conflict.overwrite"),
+];
+
 /// Which column the browser sorts by. There is no "unsorted": the engine's
 /// order was the entry index, which looked arbitrary to a user.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -994,6 +1025,11 @@ struct App {
     archive_password: Option<String>,
     /// The password prompt on screen, if any.
     password_prompt: Option<PasswordPrompt>,
+    /// The "files already exist" question, when the saved policy is 询问 and
+    /// the destination really has something in the way. `None` the rest of the
+    /// time — including for an 询问 run with nothing to conflict with, which
+    /// therefore starts without asking anything.
+    conflict_prompt: Option<ConflictPrompt>,
     /// The extract request the running or last job belongs to, so a password
     /// refused after the job started can be answered without losing what the
     /// user picked.
@@ -1048,7 +1084,6 @@ struct App {
     /// Extra lines under an error message: which entries failed and why. Kept
     /// apart from `error` so a failure dialog can list them.
     error_detail: Vec<String>,
-    overwrite: bool,
     /// "Also delete the source archive" — a checkbox in the extract dialog, not
     /// a third button beside the primary action: a destructive action sitting
     /// next to the one the user meant to click is one slip away from data loss.
@@ -1252,6 +1287,7 @@ impl App {
             rows: Vec::new(),
             archive_password: None,
             password_prompt: None,
+            conflict_prompt: None,
             last_extract: None,
             selected: Default::default(),
             sort_key: SortKey::Name,
@@ -1273,7 +1309,6 @@ impl App {
             renamed_entries: Vec::new(),
             skipped_links: Vec::new(),
             error_detail: Vec::new(),
-            overwrite: true,
             delete_source: false,
             show_create: false,
             create_sources: Vec::new(),
@@ -2826,14 +2861,32 @@ impl App {
         });
     }
 
+    /// Start an extract request, routing a password refusal into its prompt.
+    ///
+    /// Shared by the extract dialog and the conflict question so a request that
+    /// reaches either one behaves identically — including keeping everything it
+    /// collected when the archive turns out to need a password.
+    fn start_extract(&mut self, req: ExtractRequest, password: Option<String>) {
+        match self.begin_extract(req.clone(), password) {
+            None => {}
+            Some(key) if is_password_key(&key) => {
+                self.password_prompt = Some(PasswordPrompt {
+                    path: self.archive_path.clone(),
+                    text: String::new(),
+                    retry: key == "error.password_incorrect",
+                    focus: true,
+                    then: PasswordThen::Extract(req),
+                });
+            }
+            Some(key) => self.error = Some(self.t(&key)),
+        }
+    }
+
     /// Open the extract dialog with its defaults filled in. Shared by the
     /// toolbar button and the "解压到…" context-menu verb so the two cannot
     /// drift: the destination and the overwrite default are decided here once.
     fn begin_extract_dialog(&mut self) {
         self.extract_dest = self.default_extract_dest();
-        // The dialog checkbox mirrors the saved policy; "ask" starts from "do
-        // not overwrite", the safe default.
-        self.overwrite = self.settings.overwrite_policy == "overwrite";
         // Deleting the source is destructive, so it never starts ticked: the
         // answer to "which folder" must not also authorise a deletion the user
         // did not ask for.
@@ -2928,27 +2981,11 @@ impl App {
                         .wrap(),
                     );
                 }
-                ui.add_space(12.0);
-                // The saved conflict policy decides what this dialog offers: "ask"
-                // shows the checkbox, the other three are shown as a fixed setting
-                // so a saved policy is never silently ignored.
-                let policy = self.settings.overwrite_policy.clone();
-                let ask = policy == "ask";
-                if ask {
-                    let overwrite_label = self.t("extract.overwrite");
-                    ui.checkbox(&mut self.overwrite, overwrite_label);
-                } else {
-                    // A saved policy is a fact, not a choice: say it on one line
-                    // instead of spending a caption and a value line on it.
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(self.t(&format!("settings.overwrite.{policy}")))
-                                .color(theme::secondary(ui)),
-                        );
-                        ui.label(self.t("extract.policy_saved"));
-                    });
-                }
                 ui.add_space(theme::FIELD_GAP);
+                // What happens to files that already exist is *not* a setting
+                // and not a second decision here: it is asked once, when the
+                // run actually starts (see `conflict_dialog`), because that is
+                // the only moment the answer has a destination to apply to.
                 // Deleting the source is only safe when everything in it is being
                 // extracted; a partial selection would lose the rest. It is a
                 // checkbox rather than a third button: a destructive action
@@ -2992,44 +3029,26 @@ impl App {
                 let prompt_open = self.password_prompt.is_some();
                 let enter = !prompt_open && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if clicked || (can && enter) {
-                    let dest = self.extract_dest.clone();
-                    let on_conflict = if ask {
-                        if self.overwrite {
-                            "overwrite"
-                        } else {
-                            "skip"
-                        }
-                    } else {
-                        policy.as_str()
-                    }
-                    .to_string();
                     let req = ExtractRequest {
                         archive_id: arch_id,
                         sources: srcs.iter().cloned().collect(),
-                        dest,
-                        on_conflict,
+                        dest: self.extract_dest.clone(),
+                        // Answered by the conflict question that opens next.
+                        on_conflict: String::new(),
                         delete_archive: self.delete_source,
                         silent: false,
                     };
                     // The password the archive was opened with, if any. The service
                     // also remembers it per archive, but passing it here keeps a
                     // re-opened archive (new id) working the same way.
-                    match self.begin_extract(req.clone(), self.archive_password.clone()) {
-                        None => {}
-                        Some(key) if is_password_key(&key) => {
-                            // Encrypted contents, no password yet: keep everything
-                            // this dialog collected and ask for the password rather
-                            // than making the user redo the dialog afterwards.
-                            self.password_prompt = Some(PasswordPrompt {
-                                path: self.archive_path.clone(),
-                                text: String::new(),
-                                retry: key == "error.password_incorrect",
-                                focus: true,
-                                then: PasswordThen::Extract(req),
-                            });
-                        }
-                        Some(key) => self.error = Some(self.t(&key)),
-                    }
+                    self.conflict_prompt = Some(ConflictPrompt {
+                        req,
+                        password: self.archive_password.clone(),
+                    });
+                    // The extract dialog is finished: the conflict question is
+                    // the only thing left to answer, and leaving both on screen
+                    // would put a working 开始 behind it.
+                    close = true;
                     self.show_extract = false;
                 }
                 if !prompt_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -3190,8 +3209,79 @@ impl App {
         self.password_prompt = Some(prompt);
     }
 
-    /// Draw the create page, in the main window, instead of the archive view.
+    /// Put the "these files already exist" question, when there is one.
     ///
+    /// This is what `"ask"` in Settings means, and the only point in the app
+    /// where a conflict is decided: the extract dialog states the saved policy
+    /// and never re-asks for it, and a run with nothing in the way starts
+    /// without this window appearing at all (see `conflict_decision`).
+    ///
+    /// Three answers, all of them real engine policies, plus Cancel. Cancel is
+    /// a real answer too: the extraction does not start.
+    fn conflict_dialog(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.conflict_prompt.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut answer: Option<&'static str> = None;
+        let mut cancel = false;
+        let title = self.t("conflict.title");
+        let center = ctx.content_rect().center() - egui::vec2(200.0, 70.0);
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(400.0)
+            .default_pos(center)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                // No count and no saved answer: this dialog *is* the question,
+                // asked once per run, and whichever button is pressed is the
+                // policy the engine gets.
+                ui.add(egui::Label::new(self.t("conflict.body")).wrap());
+                ui.add_space(14.0);
+                // Windows' order and Win11's placement: the actions against the
+                // right edge, the affirmative one first, Cancel last and
+                // separated by air rather than a hairline.
+                let clicked = ui
+                    .allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), theme::CONTROL_H),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.button(self.t("extract.cancel")).clicked() {
+                                cancel = true;
+                            }
+                            let mut set = None;
+                            for (value, key) in CONFLICT_CHOICES {
+                                if ui.button(self.t(key)).clicked() {
+                                    set = Some(value);
+                                }
+                            }
+                            set
+                        },
+                    )
+                    .inner;
+                answer = clicked;
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        // Closing the window with its own ✕ means "not now", the same as Cancel:
+        // a click on the title bar must not silently start an extraction.
+        if cancel || !open {
+            return;
+        }
+        match answer {
+            Some(policy) => {
+                let mut req = prompt.req;
+                req.on_conflict = policy.to_string();
+                self.start_extract(req, prompt.password);
+            }
+            // No answer yet (the window was simply repainted): keep asking.
+            None => self.conflict_prompt = Some(prompt),
+        }
+    }
+
+    /// Draw the create page, in the main window, instead of the archive view.
     /// It is a page rather than a window: the toolbar becomes the Back row, the
     /// archive list gives way to the form, and the app keeps showing exactly one
     /// window. It arrived here by way of two dead ends, both worth remembering:
@@ -3860,23 +3950,9 @@ impl App {
                                     });
                                     theme::hint(ui, &self.t("settings.default_dir.hint"));
                                     ui.add_space(theme::FIELD_GAP);
-                                    // 带语境：明确这是"文件已存在时"的处理方式
-                                    let label = self.t("settings.overwrite.hint");
-                                    theme::field(ui, &label, false, |ui| {
-                                        ui.horizontal_wrapped(|ui| {
-                                            for (v, k) in [
-                                                ("ask", "settings.overwrite.ask"),
-                                                ("overwrite", "settings.overwrite.overwrite"),
-                                                ("skip", "settings.overwrite.skip"),
-                                                ("rename", "settings.overwrite.rename"),
-                                            ] {
-                                                let sel = self.settings.overwrite_policy == v;
-                                                if theme::chip(ui, sel, &self.t(k)).clicked() {
-                                                    self.settings.overwrite_policy = v.to_string();
-                                                }
-                                            }
-                                        });
-                                    });
+                                    // 同名文件怎么处理不再是一个设置项：它在
+                                    // 每次开始解压时问一次（见 conflict_dialog），
+                                    // 因为答案取决于这一次解压到哪里。
                                     let label = self.t("settings.max_extract");
                                     let hint = self.t("settings.max_extract.hint");
                                     let (_, mark) = theme::field(ui, &label, true, |ui| {
@@ -4114,7 +4190,6 @@ impl App {
         let _ = svc.settings_set(SettingsPatch {
             language: Some(self.settings.language.clone()),
             default_extract_dir: Some(self.settings.default_extract_dir.clone()),
-            overwrite_policy: Some(self.settings.overwrite_policy.clone()),
             preview_max_bytes: Some(self.settings.preview_max_bytes),
             max_extract_bytes: Some(self.settings.max_extract_bytes),
             theme_mode: Some(self.settings.theme_mode.clone()),
@@ -4348,7 +4423,32 @@ impl App {
             .default_pos(center)
             .show(ctx, |ui| {
                 let bar = if j.finished { 1.0 } else { j.pct() };
-                ui.add_sized([360.0, 22.0], egui::ProgressBar::new(bar).show_percentage());
+                // The bar fills with the accent, and the percentage is painted
+                // *on* that fill, so the label takes the same ink as every
+                // other accent-filled control. Both halves of this pair used to
+                // be egui's defaults: the fill was `selection.bg_fill` (a pale
+                // blue that sat 1.29:1 off the white track in light mode — a
+                // bar you could not see filling), and the label inherited
+                // `selection.stroke.color`, i.e. the accent itself, which
+                // measured 4.39:1 light / 3.36:1 dark on that fill.
+                //
+                // Below `PROGRESS_LABEL_ON_FILL` the fill has not reached the
+                // label yet, so the label belongs to the *track* and takes the
+                // ordinary text colour there (13.8:1 dark, 17.2:1 light).
+                let ink = if bar >= theme::PROGRESS_LABEL_ON_FILL {
+                    theme::on_accent(ui)
+                } else {
+                    ui.visuals().text_color()
+                };
+                ui.scope(|ui| {
+                    ui.style_mut().visuals.override_text_color = Some(ink);
+                    ui.add_sized(
+                        [360.0, 22.0],
+                        egui::ProgressBar::new(bar)
+                            .fill(ui.visuals().hyperlink_color)
+                            .show_percentage(),
+                    );
+                });
                 if j.finished {
                     if j.ok {
                         // 有链接没进包时这一行不是「完成」该有的绿色：包是好的，
@@ -5067,6 +5167,7 @@ impl eframe::App for App {
         }
 
         self.extract_dialog(ctx);
+        self.conflict_dialog(ctx);
         self.password_dialog(ctx);
         self.donate_dialog(ctx);
         self.help_window(ctx);
@@ -5177,7 +5278,24 @@ fn scroll_points_per_notch(row_height: f32) -> f32 {
 // Table painting helpers
 // ---------------------------------------------------------------------------
 
+/// The badge's paper. Light in both themes on purpose: the type colours were
+/// chosen against a white page, and a dark page would need a second palette.
+const BADGE_PAGE_LIGHT: egui::Color32 = egui::Color32::from_rgb(250, 250, 252);
+const BADGE_PAGE_DARK: egui::Color32 = egui::Color32::from_rgb(226, 228, 234);
+
+/// How far the type colour is darkened for the three letters on the badge.
+///
+/// Any factor from 0.4 to 0.6 keeps every type colour above 4.5:1 against both
+/// pages; 0.55 is the point where the lightest of them (ZIP's orange) still
+/// clears it in the darker *theme* — 6.52:1 on the light page, 5.35:1 on the
+/// dark one — while the badge label stays visibly the colour of its type
+/// rather than a grey. Lower factors only lose the hue.
+const BADGE_LABEL_SHADE: f32 = 0.55;
+
 /// Paints the folder / file badge for one row.
+///
+/// The badge's page is light in **both** themes, so the three-letter label is
+/// the type colour darkened towards it — see [`BADGE_LABEL_SHADE`].
 fn paint_entry_icon(p: &egui::Painter, icon_rect: egui::Rect, e: &EntryDto, dark: bool) {
     if e.is_dir {
         let amber = egui::Color32::from_rgb(236, 184, 70);
@@ -5202,15 +5320,9 @@ fn paint_entry_icon(p: &egui::Painter, icon_rect: egui::Rect, e: &EntryDto, dark
     let page =
         egui::Rect::from_min_size(icon_rect.min + egui::vec2(4.0, 2.0), egui::vec2(14.0, 16.0));
     let (fill, outline) = if dark {
-        (
-            egui::Color32::from_rgb(226, 228, 234),
-            egui::Color32::from_rgb(120, 124, 132),
-        )
+        (BADGE_PAGE_DARK, egui::Color32::from_rgb(120, 124, 132))
     } else {
-        (
-            egui::Color32::from_rgb(250, 250, 252),
-            egui::Color32::from_rgb(160, 160, 170),
-        )
+        (BADGE_PAGE_LIGHT, egui::Color32::from_rgb(160, 160, 170))
     };
     p.rect_filled(page, egui::CornerRadius::same(2), fill);
     p.rect_stroke(
@@ -5225,16 +5337,24 @@ fn paint_entry_icon(p: &egui::Painter, icon_rect: egui::Rect, e: &EntryDto, dark
         accent,
     );
     if let Some(txt) = label {
-        // Darkened towards the page it sits on. At full accent the three-letter
-        // label measured 2.35:1 against the badge's white page — the faintest
-        // readable text anywhere in the app. 0.6 brings it to 5.7:1 and keeps
-        // the type-colour coding (the top bar stays full accent).
+        // The type colour darkened towards the page it sits on, and *darker*
+        // than the colour of the bar above it, which stays full accent.
+        //
+        // Opaque, not translucent: `Color32` is premultiplied, so
+        // `gamma_multiply(0.6)` dims alpha too and the label composites as
+        // 0.6·accent + 0.4·page — it moves towards the page it was meant to
+        // move away from, ending fainter than plain accent. That was measured:
+        // the ZIP label read 1.66:1 light / 1.50:1 dark, against 2.35 / 1.93 at
+        // full accent. At [`BADGE_LABEL_SHADE`] it is 6.52:1 light / 5.35:1
+        // dark, and every other type colour is darker still (EXE 11.2 / 9.2,
+        // the neutral grey 9.1 / 7.4) — the badge label is now the least
+        // legible *per-type* ink in the app, and still above 4.5:1.
         p.text(
             page.center() + egui::vec2(1.0, 5.0),
             egui::Align2::CENTER_CENTER,
             txt,
             egui::FontId::proportional(theme::TEXT_BADGE),
-            accent.gamma_multiply(0.6),
+            theme::shade(accent, BADGE_LABEL_SHADE),
         );
     }
 }
@@ -6262,5 +6382,80 @@ mod sort_tests {
         // `natural_cmp` calls these equal, so the tie-break has to decide, and
         // it has to decide the same way every time: uppercase sorts first.
         assert_eq!(names(&rows), ["B.txt", "b.txt"]);
+    }
+}
+
+#[cfg(test)]
+mod badge_contrast_tests {
+    use super::{entry_accent, BADGE_LABEL_SHADE, BADGE_PAGE_DARK, BADGE_PAGE_LIGHT};
+    use crate::theme::{self, contrast::ratio};
+
+    /// 徽标上的三字母标签是应用里唯一一处「按文件类型着色」的文字，它的对比度
+    /// 已经被算错过两次（满色一次、`gamma_multiply` 一次），两次都是凭感觉改颜色
+    /// 而不是算数。这个测试把数字钉住：每个类型色、两种主题的纸面，都必须 ≥ 4.5:1。
+    #[test]
+    fn every_type_colour_is_readable_on_both_badge_pages() {
+        // One extension per palette entry, plus the neutral fallback.
+        let types = [
+            "exe", "png", "mp3", "mp4", "zip", "pdf", "docx", "xlsx", "dat",
+        ];
+        for ext in types {
+            let (accent, label) = entry_accent(ext);
+            if ext == "dat" {
+                assert!(label.is_none(), "the fallback has no label to paint");
+                continue;
+            }
+            assert!(label.is_some(), "{ext} paints no label");
+            let ink = theme::shade(accent, BADGE_LABEL_SHADE);
+            for (page, name) in [(BADGE_PAGE_LIGHT, "light"), (BADGE_PAGE_DARK, "dark")] {
+                let measured = ratio(ink, page);
+                assert!(
+                    measured >= 4.5,
+                    "{ext} on the {name} page is {measured:.2}:1"
+                );
+            }
+        }
+    }
+
+    /// `shade` must not scale alpha — that was the whole defect. A translucent
+    /// result would composite with the page and read as a *lighter* colour.
+    #[test]
+    fn shading_keeps_the_ink_opaque() {
+        for ext in ["exe", "png", "mp3", "mp4", "zip", "pdf", "docx", "xlsx"] {
+            let (accent, _) = entry_accent(ext);
+            assert_eq!(theme::shade(accent, BADGE_LABEL_SHADE).a(), 255);
+        }
+    }
+}
+
+#[cfg(test)]
+mod conflict_choice_tests {
+    use super::CONFLICT_CHOICES;
+    use crate::i18n;
+
+    /// 「文件已存在」只给三个答案，而且每一个都必须是引擎认识的真策略。
+    ///
+    /// `"ask"` 绝不能出现在这里：`OnConflict::from_policy` 把认不出的字符串当成
+    /// 「覆盖」，一旦传下去就是在用户没同意的情况下替换文件。旧版本的四项设置
+    /// 正是这样错的——「询问」被一个默认不勾的复选框替答成了「跳过」。
+    #[test]
+    fn the_question_offers_only_real_policies() {
+        assert_eq!(
+            CONFLICT_CHOICES.map(|(value, _)| value),
+            ["rename", "skip", "overwrite"]
+        );
+        assert!(
+            !CONFLICT_CHOICES.iter().any(|(value, _)| *value == "ask"),
+            "the question must never answer itself with a policy the engine does not have"
+        );
+    }
+
+    /// 三个按钮的文字两种语言都得有，否则界面上会出现裸的 key。
+    #[test]
+    fn every_choice_is_translated_in_both_languages() {
+        for (_, key) in CONFLICT_CHOICES {
+            assert_ne!(i18n::tr("zh-CN", key), key, "zh-CN lacks {key}");
+            assert_ne!(i18n::tr("en-US", key), key, "en-US lacks {key}");
+        }
     }
 }

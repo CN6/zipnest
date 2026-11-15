@@ -82,13 +82,8 @@ pub fn render(d: &Diagnostics) -> String {
         s.associate, s.context_menu, s.integration_applied
     ));
     out.push_str(&format!(
-        "settings: lang={} theme={} zoom={} overwrite={} preview_max={} extract_max={}\n",
-        s.language,
-        s.theme_mode,
-        s.ui_zoom,
-        s.overwrite_policy,
-        s.preview_max_bytes,
-        s.max_extract_bytes
+        "settings: lang={} theme={} zoom={} preview_max={} extract_max={}\n",
+        s.language, s.theme_mode, s.ui_zoom, s.preview_max_bytes, s.max_extract_bytes
     ));
     out.push_str(&format!(
         "engine (7z.dll): {}\n",
@@ -141,7 +136,6 @@ mod tests {
             language: "zh-CN".into(),
             theme_mode: "system".into(),
             ui_zoom: 125,
-            overwrite_policy: "rename".into(),
             associate: true,
             context_menu: true,
             integration_applied: true,
