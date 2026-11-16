@@ -440,6 +440,25 @@ if (-not $giteeTokenPath) {
     try {
         $probe = Invoke-RestMethod -Uri $giteeApi -Headers $auth -Method Get -TimeoutSec 30
         Write-Host "  repo: $($probe.full_name)"
+        # Gitee created the repository private even though the request said
+        # `private = false`, which makes every anonymous request 403 - the
+        # mirror then serves nobody, and only the check at the end of this block
+        # notices. Fix it here rather than leaving it to that warning.
+        if ($probe.private) {
+            $fixBody = @{
+                access_token = $giteeToken
+                name         = 'zipnest'
+                path         = 'zipnest'
+                private      = $false
+            } | ConvertTo-Json
+            try {
+                $null = Invoke-RestMethod -Uri $giteeApi -Method Patch `
+                    -ContentType 'application/json; charset=utf-8' -Body $fixBody -TimeoutSec 30
+                Write-Host '  repo was private; made it public'
+            } catch {
+                Warn "the Gitee repo is private and could not be made public: $($_.Exception.Message)"
+            }
+        }
     } catch {
         Write-Host '  repo missing; creating zipnest/zipnest'
         $body = @{
@@ -553,6 +572,12 @@ if (-not $giteeTokenPath) {
         $status = if ($lastLine) { $lastLine.ToString() } else { "curl exit $curlCode" }
         if ($status -match ' 200') {
             Write-Host "  anonymous download OK: $status"
+        } elseif ($status -match ' 403') {
+            # 403 on a public repo means it is actually private. The release is
+            # already published by this point, so the fix is a PATCH, not a
+            # re-run - and turning a warning into a failure here is what makes
+            # somebody look.
+            Fail "the Gitee mirror answers 403 to an anonymous download ($url) - the repository is probably private; make it public, then re-check by hand"
         } else {
             Warn "anonymous download check returned '$status' - verify by hand: $url"
         }
