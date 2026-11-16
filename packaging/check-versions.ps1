@@ -138,8 +138,10 @@ $memberManifests = @(
     'crates\archive-security\Cargo.toml',
     'crates\archive-jobs\Cargo.toml',
     'crates\zipnest-ipc\Cargo.toml',
+    'crates\zipnest-update\Cargo.toml',
     'apps\zipnest-native\Cargo.toml',
-    'apps\zipnest-shell\Cargo.toml'
+    'apps\zipnest-shell\Cargo.toml',
+    'tools\zipnest-release\Cargo.toml'
 )
 foreach ($rel in $memberManifests) {
     $memberText = Read-Utf8 (Join-Path $repo $rel)

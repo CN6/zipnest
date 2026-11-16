@@ -15,6 +15,14 @@
 *.pdb binary
 *.msi binary
 *.zip binary
+# The detached Ed25519 signature is 64 raw bytes. Without this, core.autocrlf
+# (on here) rewrites any 0x0D 0x0A inside it to 0x0A roughly 78% of the time -
+# a random 64-byte blob contains no NUL often enough to be classified as text -
+# and the committed/pushed signature is then 63 bytes, which every client
+# rejects with "expected 64 bytes". The mirror copies and fresh clones all get
+# that broken blob, so the release would be silently uninstallable.
+update.json.sig binary
+*.sig binary
 *.7z binary
 *.rar binary
 *.tar binary

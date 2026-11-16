@@ -1,0 +1,25 @@
+[package]
+name = "zipnest-release"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Release-side tooling: generate the Ed25519 update key and sign update.json."
+# Never shipped to users. It holds the signing half of the update trust model,
+# so it must not end up in the installer payload.
+publish = false
+
+[dependencies]
+ring = "0.17"
+zipnest-update = { path = "../../crates/zipnest-update" }
+serde_json = "1"
+
+[lib]
+name = "zipnest_release"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zipnest-release"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"

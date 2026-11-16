@@ -3,13 +3,13 @@ resolver = "2"
 # The shipped app is `apps/zipnest-native` (egui) plus `apps/zipnest-shell` for
 # the Win11 context-menu package. The older Tauri/WebView2 UI was removed in
 # v0.4.22; it was never shipped.
-members = ["crates/archive-security", "crates/archive-core", "crates/archive-jobs", "crates/zipnest-ipc", "apps/zipnest-native", "apps/zipnest-shell"]
+members = ["crates/archive-security", "crates/archive-core", "crates/archive-jobs", "crates/zipnest-ipc", "crates/zipnest-update", "apps/zipnest-native", "apps/zipnest-shell", "tools/zipnest-release"]
 
 [workspace.package]
 # The only place a release version is typed: every member inherits it with
 # version.workspace = true, and packaging/check-versions.ps1 compares it with
 # the installer, the MSIX manifest, the README and the CHANGELOG.
-version = "0.4.39"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 

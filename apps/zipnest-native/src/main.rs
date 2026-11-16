@@ -148,65 +148,74 @@ fn format_mtime_local(ms_since_epoch: u64) -> Option<String> {
 // the README and the CHANGELOG. It used to be a hand-typed literal here, and it
 // sat at 0.4.0 for ten releases.
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const UPDATE_API: &str = "https://api.github.com/repos/CN6/zipnest/releases/latest";
-/// Derived from [`CURRENT_VERSION`] on purpose: a hand-typed string here sat at
-/// `0.4.0` for ten releases (the release checklist asked for it every time and
-/// nobody could tell). `packaging\check-versions.ps1` fails the build if a
-/// literal version comes back.
+/// The release page, kept as the last-resort escape hatch. A user whose browser
+/// already has a working proxy is better served in five seconds there than by
+/// waiting on a mirror chain that keeps failing.
+const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
+/// `User-Agent` for every update request. Derived from [`CURRENT_VERSION`] on
+/// purpose: a hand-typed string here sat at `0.4.0` for ten releases, and
+/// `packaging\check-versions.ps1` fails the build if a literal comes back.
 static UPDATE_UA: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("ZipNest-Updater/{CURRENT_VERSION}"));
-const RELEASES_PAGE: &str = "https://github.com/CN6/zipnest/releases/latest";
+
+/// How long an automatic check stays fresh.
+///
+/// A check costs one request against whatever the mirror's quota is, and it runs
+/// on every launch by default — 6 h turns "one per launch" into at most four a
+/// day on a machine that is always open. Manual checks ignore this.
+const AUTO_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
 #[derive(Clone, Default)]
 enum UpdateState {
     #[default]
     Idle,
     Checking,
+    /// A newer release exists. `in_app` is false when the installed version is
+    /// older than the manifest's `min_version`, in which case only the browser
+    /// path is offered.
     Found {
-        tag: String,
-        url: String,
+        version: String,
+        notes: String,
+        size: u64,
+        in_app: bool,
     },
+    Downloading {
+        done: u64,
+        total: u64,
+        /// 1-based index of the source being tried, for "第 2 个源" in the text.
+        source: usize,
+    },
+    /// Downloaded and hashed; waiting for the user to press 立即更新.
+    Ready {
+        path: String,
+        version: String,
+        /// SHA-256 taken from the signed manifest. The watcher re-checks it
+        /// immediately before elevating: the download verified the file, but
+        /// the watcher then waits for the app to exit and for the UAC answer,
+        /// and the path could be replaced in that window.
+        sha256: String,
+    },
+    /// The installer is being started (the process may already be gone).
+    Installing,
+    /// A one-shot message shown after a restart that followed an install
+    /// attempt, so the user learns whether it actually worked.
+    Notice(String),
     Failed(String),
 }
 
-fn parse_version(tag: &str) -> Vec<u32> {
-    tag.trim_start_matches('v')
-        .split('.')
-        .filter_map(|p| p.parse::<u32>().ok())
-        .collect()
+/// Shared between the UI thread and the worker threads.
+#[derive(Default)]
+struct UpdateShared {
+    state: UpdateState,
+    /// Set while a download is running; the worker polls it.
+    cancel: Arc<zipnest_update::download::CancelFlag>,
+    /// Last check attempt, for [`AUTO_CHECK_INTERVAL`]. Recorded even when the
+    /// check failed, so an offline machine does not retry on every launch.
+    last_check: Option<std::time::Instant>,
 }
 
-fn is_newer(tag: &str) -> bool {
-    parse_version(CURRENT_VERSION) < parse_version(tag)
-}
+type UpdateHandle = Arc<Mutex<UpdateShared>>;
 
-fn fetch_latest() -> Result<(String, String), String> {
-    // ureq 3 takes the timeout on the agent, not on the request, so every call
-    // builds one. Without a timeout the check waits for Windows' TCP timeouts —
-    // on a machine whose network drops packets instead of refusing them, the
-    // spinner in the status bar never stopped. Both bounds are short because
-    // this is a background courtesy, never something to wait on.
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(10)))
-        .build()
-        .into();
-    let body = agent
-        .get(UPDATE_API)
-        .header("User-Agent", UPDATE_UA.as_str())
-        .call()
-        .map_err(|e| e.to_string())?
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| e.to_string())?;
-    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    let tag = v["tag_name"].as_str().unwrap_or("").to_string();
-    let url = v["html_url"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(RELEASES_PAGE)
-        .to_string();
-    Ok((tag, url))
-}
 
 /// Hand a URL (web page, or `mailto:`) to whatever Windows has registered for
 /// it. `start` needs the empty "" title argument before a quoted URL.
@@ -505,26 +514,352 @@ fn release_default_formats(list: &[String]) -> Vec<String> {
 /// error dialog nobody asked for. The background thread therefore leaves the
 /// state alone while it works, and only writes `Found`; "no update" and "the
 /// request failed" are both non-events on that path.
-fn spawn_update_check(state: Arc<Mutex<UpdateState>>, manual: bool) {
+///
+/// What changed in v0.5.0: the release is discovered from a **signed static
+/// manifest** rather than `api.github.com`, whose unauthenticated budget is 60
+/// requests per hour per IP — shared with every other GitHub user behind a
+/// Chinese carrier NAT, so a startup check can fail with 403 for reasons that
+/// have nothing to do with the firewall. See
+/// `crates/zipnest-update/src/manifest.rs`. The silent path is unchanged, and now
+/// also respects [`AUTO_CHECK_INTERVAL`].
+fn spawn_update_check(
+    update: UpdateHandle,
+    manual: bool,
+    interval: Option<std::time::Duration>,
+    repaint: egui::Context,
+) {
     std::thread::spawn(move || {
-        if manual {
-            *state.lock().unwrap() = UpdateState::Checking;
+        {
+            let mut g = update.lock().unwrap();
+            // The automatic path skips a check that is still fresh, and never
+            // disturbs a state the user is looking at.
+            if !manual
+                && g.last_check
+                    .is_some_and(|t| t.elapsed() < interval.unwrap_or(AUTO_CHECK_INTERVAL))
+            {
+                return;
+            }
+            if !manual && !matches!(g.state, UpdateState::Idle) {
+                return;
+            }
+            if manual {
+                g.state = UpdateState::Checking;
+                drop(g);
+                // The guard must be released before waking the UI: the repaint
+                // handler runs on the UI thread and would block on this same
+                // mutex if it locked before we let go.
+                repaint.request_repaint();
+            }
         }
-        match fetch_latest() {
-            Ok((tag, url)) => {
-                if is_newer(&tag) {
-                    *state.lock().unwrap() = UpdateState::Found { tag, url };
-                } else if manual {
-                    *state.lock().unwrap() = UpdateState::Idle;
+        let agent = zipnest_update::manifest_agent();
+        let lang = i18n::os_language();
+        let result = zipnest_update::check(&agent, UPDATE_UA.as_str(), CURRENT_VERSION, lang);
+        let mut g = update.lock().unwrap();
+        g.last_check = Some(std::time::Instant::now());
+        let mut changed = false;
+        match result {
+            // An automatic check may write `Found` only if nothing has happened
+            // since it started: its fetch can take most of a minute, and the
+            // user may have run a manual check and started a download in the
+            // meantime. Overwriting that with a stale `Found` hid the progress
+            // dialog for up to STALL_TIMEOUT.
+            Ok(Some(offer)) if manual || matches!(g.state, UpdateState::Idle) => {
+                let notes = offer.notes(lang).to_string();
+                // A portable copy cannot be updated in place: installing would
+                // put a second copy in Program Files while the user keeps
+                // launching the old exe. `start_install` refuses too, but by
+                // then the whole installer has been downloaded — on exactly the
+                // slow connection this feature exists for. Ask here instead.
+                let portable = std::env::current_exe()
+                    .map(|exe| {
+                        matches!(
+                            zipnest_update::install::detect(&exe),
+                            zipnest_update::install::InstallMode::Portable
+                        )
+                    })
+                    .unwrap_or(true);
+                g.state = UpdateState::Found {
+                    version: offer.version,
+                    notes,
+                    size: offer.installer_size,
+                    in_app: offer.in_app_install && !portable,
+                };
+                changed = true;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if manual {
+                    g.state = UpdateState::Idle;
+                    changed = true;
                 }
             }
             Err(e) => {
                 if manual {
-                    *state.lock().unwrap() = UpdateState::Failed(e);
+                    g.state = UpdateState::Failed(e.message_key().to_string());
+                    changed = true;
                 }
             }
         }
+        drop(g);
+        // egui sleeps while the window is idle and only paints in response to
+        // input. Writing `Found` from a worker thread without this call is why
+        // the "new version" dialog used to sit invisible until the mouse moved.
+        if changed {
+            repaint.request_repaint();
+        }
     });
+}
+
+/// Download the installer for `version`, verify it, and report through `update`.
+///
+/// Runs on its own thread. Every failure lands in `UpdateState::Failed` with an
+/// i18n key, never with a raw English error string: `ureq`'s own text ("http
+/// 403", "io: …") means nothing to a user.
+fn spawn_update_download(update: UpdateHandle, version: String, repaint: egui::Context) {
+    // Claim the download synchronously, on the UI thread, before the worker
+    // touches the network:
+    //
+    // * The state moves to `Downloading` here, so the button that started this
+    //   is gone by the time the frame ends. Otherwise a double-click spawned two
+    //   workers that opened the same `.part` with `append(true)` and wrote
+    //   interleaved bytes.
+    // * The cancel flag is installed here too, and the worker only *reads* it.
+    //   Previously the worker replaced it after its manifest re-fetch (up to
+    //   ~80 s on a blocked line), so a cancel pressed in that window was wiped
+    //   out and the download ran to completion against the user's wishes.
+    let cancel = {
+        let mut g = update.lock().unwrap();
+        g.cancel = Arc::new(zipnest_update::download::CancelFlag::default());
+        g.state = UpdateState::Downloading {
+            done: 0,
+            total: 0,
+            source: 1,
+        };
+        Arc::clone(&g.cancel)
+    };
+    repaint.request_repaint();
+    std::thread::spawn(move || {
+        let cancelled = || cancel.is_cancelled();
+        // Re-fetch the manifest to get the exact asset (size + hash) for this
+        // version: a manifest that changed between the check and the download
+        // must not be able to hand us a file the check never saw.
+        let agent = zipnest_update::manifest_agent();
+        let fetched = zipnest_update::fetch_manifest(&agent, UPDATE_UA.as_str());
+        let (manifest, _bytes, _src) = match fetched {
+            Ok(v) => v,
+            Err(e) => {
+                update.lock().unwrap().state = UpdateState::Failed(e.message_key().to_string());
+                repaint.request_repaint();
+                return;
+            }
+        };
+        if zipnest_update::version::is_newer(&version, &manifest.version)
+            || manifest.version != version
+        {
+            update.lock().unwrap().state =
+                UpdateState::Failed("update.error.manifest".to_string());
+            repaint.request_repaint();
+            return;
+        }
+        let Some(asset) = manifest.installer().cloned() else {
+            update.lock().unwrap().state =
+                UpdateState::Failed("update.error.manifest".to_string());
+            repaint.request_repaint();
+            return;
+        };
+        let urls = zipnest_update::source::installer_sources(&version, &asset.name, None);
+        let dir = zipnest_update::install::updates_dir(&version);
+        {
+            // Now that the real size is known, fill it in. Still `Downloading`,
+            // so an early cancel cannot be overwritten here either.
+            let mut g = update.lock().unwrap();
+            if let UpdateState::Downloading { total, .. } = &mut g.state {
+                *total = asset.size;
+            }
+        }
+        let result = zipnest_update::download::download(
+            &asset,
+            &urls,
+            &dir,
+            |p| {
+                let mut g = update.lock().unwrap();
+                if let UpdateState::Downloading { done, total, source } = &mut g.state {
+                    *done = p.done;
+                    *total = p.total;
+                    *source = p.source_index + 1;
+                }
+                drop(g);
+                repaint.request_repaint();
+            },
+            cancelled,
+        );
+        // A cancel (or a state the user has since moved away from) wins: only
+        // write the outcome if this download is still the thing on screen.
+        let mut g = update.lock().unwrap();
+        if matches!(g.state, UpdateState::Downloading { .. }) {
+            g.state = match result {
+                Ok(path) => UpdateState::Ready {
+                    path: path.to_string_lossy().to_string(),
+                    version,
+                    sha256: asset.sha256.clone(),
+                },
+                Err(e) => UpdateState::Failed(e.message_key().to_string()),
+            };
+        }
+        drop(g);
+        repaint.request_repaint();
+    });
+}
+
+/// Hand the downloaded installer to the elevated installer via a detached
+/// watcher, then quit.
+///
+/// The order matters and is not the obvious one:
+///
+/// 1. Copy this exe to `%LOCALAPPDATA%\ZipNest\updater\` and start it with
+///    `--apply-update`. The copy is load-bearing — a watcher running from the
+///    install directory would make the installer skip its own locked exe.
+/// 2. Write the pending record, so the next launch can say what happened.
+/// 3. **Quit.** In `/S` mode the installer's forced-close question is
+///    pre-answered "no"; if ZipNest is still running after ten polite
+///    `taskkill` attempts it aborts with exit code 2 and writes nothing.
+fn start_install(
+    update: UpdateHandle,
+    setup: &str,
+    version: &str,
+    sha256: &str,
+) -> Result<(), String> {
+    let setup = std::path::PathBuf::from(setup);
+    if !setup.is_file() {
+        return Err("update.error.install".into());
+    }
+    // Only an install the NSIS installer made can be updated in place; a
+    // portable copy would get a *second* install in Program Files while the
+    // user keeps launching the portable exe at the old version.
+    // Every failure below returns an i18n *key*: the dialog renders whatever
+    // string lands in `UpdateState::Failed` through the translation table, so a
+    // raw OS message ("... (os error 32)") would be shown verbatim in a Chinese
+    // window. The OS text goes to stderr for a bug report instead.
+    let exe = std::env::current_exe().map_err(|e| {
+        eprintln!("ZipNest: update: current_exe failed: {e}");
+        "update.error.install".to_string()
+    })?;
+    let install_dir = match zipnest_update::install::detect(&exe) {
+        zipnest_update::install::InstallMode::Installed { install_dir } => install_dir,
+        zipnest_update::install::InstallMode::Portable => {
+            return Err("update.error.portable".into())
+        }
+    };
+    let watcher = zipnest_update::install::stage_watcher().map_err(|e| {
+        eprintln!("ZipNest: update: could not stage the watcher: {e}");
+        "update.error.install".to_string()
+    })?;
+    zipnest_update::install::write_pending(&zipnest_update::install::PendingInstall {
+        version: version.to_string(),
+        exit_code: None,
+        launch_error: None,
+        sha256: Some(sha256.to_string()),
+    })
+    .map_err(|e| {
+        eprintln!("ZipNest: update: could not write the pending record: {e}");
+        "update.error.install".to_string()
+    })?;
+    let pid = std::process::id();
+    let mut cmd = std::process::Command::new(&watcher);
+    cmd.args([
+        "--apply-update",
+        "--parent-pid",
+        &pid.to_string(),
+        "--setup",
+        &setup.to_string_lossy(),
+        "--install-dir",
+        &install_dir.to_string_lossy(),
+        "--version",
+        version,
+        "--sha256",
+        sha256,
+    ]);
+    #[cfg(windows)]
+    {
+        // DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB: the
+        // watcher has to outlive this process, and must not die with a job
+        // object this one may have been started under.
+        cmd.creation_flags(0x0000_0008 | CREATE_NO_WINDOW | 0x0100_0000);
+    }
+    cmd.spawn().map_err(|e| {
+        eprintln!("ZipNest: update: could not start the watcher: {e}");
+        // Undo the record: an install that never started must not be reported
+        // as "the installer did not finish" on the next launch.
+        zipnest_update::install::clear_pending();
+        "update.error.install".to_string()
+    })?;
+    update.lock().unwrap().state = UpdateState::Installing;
+    Ok(())
+}
+
+/// The `--apply-update` mode: wait for the app to exit, run the installer
+/// elevated, record the result, and start the app again.
+///
+/// This is the whole of the watcher. It runs from a copy of the exe in
+/// `%LOCALAPPDATA%`, never from the install directory.
+fn run_apply_update(args: &[String]) -> i32 {
+    let get = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let (Some(pid), Some(setup), Some(dir), Some(version)) = (
+        get("--parent-pid").and_then(|p| p.parse::<u32>().ok()),
+        get("--setup"),
+        get("--install-dir"),
+        get("--version"),
+    ) else {
+        return 1;
+    };
+    // Taken from the signed manifest. `None` only for a record written by an
+    // older build, which is a one-release window and still better than trusting
+    // whatever is at that path.
+    let sha256 = get("--sha256");
+    let setup = std::path::PathBuf::from(setup);
+    let dir = std::path::PathBuf::from(dir);
+
+    // The app is quitting right now; give it up to a minute. Waiting on the PID
+    // (not on the exe path) matters: the installer is about to replace that path.
+    zipnest_update::install::wait_for_process_exit(pid, std::time::Duration::from_secs(60));
+
+    let mut record = zipnest_update::install::PendingInstall {
+        version: version.clone(),
+        exit_code: None,
+        launch_error: None,
+        sha256: sha256.clone(),
+    };
+    match zipnest_update::install::launch_installer(&setup, &dir, sha256.as_deref()) {
+        Ok(zipnest_update::install::LaunchOutcome::Started) => {
+            match zipnest_update::install::await_installer(std::time::Duration::from_secs(600)) {
+                Ok(code) => record.exit_code = Some(code),
+                Err(e) => record.launch_error = Some(e),
+            }
+        }
+        // Declining the UAC prompt is a normal answer, not a failure to report
+        // as broken: keep the download, say 已取消, and let one click retry.
+        Ok(zipnest_update::install::LaunchOutcome::Cancelled) => {
+            record.launch_error = Some("cancelled".into());
+        }
+        Ok(zipnest_update::install::LaunchOutcome::Failed(code)) => {
+            record.launch_error = Some(format!("shell {code}"));
+        }
+        Err(e) => record.launch_error = Some(e),
+    }
+    let _ = zipnest_update::install::write_pending(&record);
+
+    // Start the app again either way. If the install failed, the old exe is
+    // still what runs, and its own version check will offer the update again.
+    let exe = dir.join("zipnest.exe");
+    if exe.is_file() {
+        zipnest_update::install::relaunch(&exe);
+    }
+    0
 }
 
 #[derive(Default, Clone)]
@@ -614,6 +949,14 @@ fn main() -> Result<(), eframe::Error> {
     //   zipnest.exe <archive>        → open that archive
     //   zipnest.exe --add <path>...  → open the create wizard pre-filled
     let args: Vec<String> = std::env::args().collect();
+    // The detached updater copy waits for this process, elevates the NSIS
+    // installer, records its exit code, and relaunches the installed exe. It
+    // must be handled before single-instance claiming or a watcher would hand
+    // its own command line to the already-running UI instead of doing work.
+    if args.iter().skip(1).any(|a| a == "--apply-update") {
+        let code = run_apply_update(&args);
+        std::process::exit(code);
+    }
     // `--unregister-shell` is what the uninstaller runs before deleting files:
     // it drops every HKCU integration this app ever wrote (context menus,
     // ProgIDs and the extension defaults we pointed at them) without starting
@@ -1146,7 +1489,7 @@ struct App {
     /// ~60 times a second for as long as the folder stayed on screen.
     mtime_cache: std::collections::HashMap<u64, String>,
     // auto-update
-    update: Arc<Mutex<UpdateState>>,
+    update: UpdateHandle,
 }
 
 impl App {
@@ -1198,8 +1541,20 @@ impl App {
         // Theme: light, dark, or whatever the system is set to. Applied here
         // rather than next to install_fonts because it needs the settings.
         theme::apply_setting(&cc.egui_ctx, &settings.theme_mode);
-        // Clean up a previously downloaded update installer that already ran
-        // (it is only needed while the update is being applied).
+        // Downloads live under %LOCALAPPDATA%\ZipNest\updates (not %TEMP%, which
+        // Disk Cleanup empties under us and where a freshly downloaded exe is the
+        // most-scanned file on the system). Drop every version but this one, the
+        // previous run's watcher copy, and the v0.2.x leftover in TEMP.
+        // Keep *two* directories: the version running now, and the one the last
+        // attempt was downloading. Keeping only the former deleted every
+        // in-progress `.part` at each launch (defeating the resume) and could
+        // delete the setup exe a still-running watcher was about to elevate.
+        let pending_version = zipnest_update::install::read_pending().map(|p| p.version);
+        let mut keep: Vec<&str> = vec![CURRENT_VERSION];
+        if let Some(v) = pending_version.as_deref() {
+            keep.push(v);
+        }
+        zipnest_update::install::clean_stale(&keep);
         let _ = std::fs::remove_file(std::env::temp_dir().join("zipnest-update-setup.exe"));
         // Fixed zoom from settings, applied ONCE at startup. Never re-zoom per
         // frame — that feedback loop made fullscreen flicker badly.
@@ -1230,15 +1585,67 @@ impl App {
             cc.egui_ctx
                 .load_texture("alipay", img, egui::TextureOptions::NEAREST)
         });
-        let update: Arc<Mutex<UpdateState>> = Default::default();
+        let update: UpdateHandle = Default::default();
+        // An update install took this process down a moment ago and the watcher
+        // started us again. Say whether it worked, once: the whole complaint
+        // behind v0.3.3 was "it closed and the version never changed", and the
+        // old flow had no way to tell the user what happened.
+        if let Some(pending) = zipnest_update::install::read_pending() {
+            let version = pending.version.clone();
+            // A record with neither an exit code nor a launch error is the
+            // marker `start_install` writes *before* the watcher runs: the
+            // install has started and its outcome is not known yet. Reporting
+            // that as "the installer did not finish" was a false failure for
+            // anyone who reopened ZipNest while the UAC prompt was still up.
+            // Leave the record alone; the watcher overwrites it with the result.
+            // ...unless the record has been sitting there for longer than the
+            // watcher could possibly need: then it was killed (reboot, Task
+            // Manager), no result is coming, and the honest answer is "it did
+            // not finish" rather than a progress message that never ends.
+            let in_flight = pending.exit_code.is_none()
+                && pending.launch_error.is_none()
+                && zipnest_update::install::pending_age()
+                    .is_some_and(|age| age < zipnest_update::install::PENDING_STALE);
+            if in_flight {
+                update.lock().unwrap().state = UpdateState::Notice(i18n::tr(
+                    &lang,
+                    "update.pending",
+                ));
+            } else {
+                // Only report the attempt that belongs to *this* build: a record
+                // written by a failed attempt still says the old version was not
+                // replaced, and its message is the useful part.
+                let (key, version) = match (pending.exit_code, pending.launch_error.as_deref()) {
+                    (Some(code), _) => {
+                        let result = zipnest_update::install::InstallResult::from_exit_code(code);
+                        match result.message_key() {
+                            Some(k) => (k.to_string(), version),
+                            None => ("update.installed".to_string(), version),
+                        }
+                    }
+                    (None, Some("cancelled")) => {
+                        ("update.error.cancelled".to_string(), version)
+                    }
+                    (None, _) => ("update.failed.installer".to_string(), version),
+                };
+                // The key carries a {version} placeholder only for the success line.
+                let text = i18n::tr(&lang, &key).replace("{version}", &version);
+                update.lock().unwrap().state = UpdateState::Notice(text);
+                zipnest_update::install::clear_pending();
+            }
+        }
         // Auto-check is user-controllable in Settings (on by default). It is
         // silent: no window, no spinner, no error dialog — only a real newer
         // release opens anything (see spawn_update_check).
         if settings.auto_check_update {
             let check = Arc::clone(&update);
+            // The result is written from a worker thread; egui sleeps while the
+            // window is idle, so without this wake the "new version" dialog
+            // would not appear until the user happened to move the mouse.
+            let wake = ctx.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                spawn_update_check(check, false);
+                spawn_update_check(check, false, None, wake);
             });
         }
         // Wake the UI when a later launch leaves a request in the queue: egui
@@ -2845,10 +3252,17 @@ impl App {
                     egui::RichText::new(status).color(theme::secondary(ui)),
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let upd = self.update.lock().unwrap().clone();
+                    let upd = self.update.lock().unwrap().state.clone();
                     if matches!(upd, UpdateState::Idle) {
                         if theme::ghost_button(ui, &self.t("update.check")).clicked() {
-                            spawn_update_check(Arc::clone(&self.update), true);
+                            // A manual check ignores the 6-hour interval; the
+                            // user asked for it now.
+                            spawn_update_check(
+                                Arc::clone(&self.update),
+                                true,
+                                None,
+                                ui.ctx().clone(),
+                            );
                         }
                     } else if matches!(upd, UpdateState::Checking) {
                         ui.add(egui::Spinner::new());
@@ -4302,63 +4716,213 @@ impl App {
     }
 
     fn update_window(&mut self, ctx: &egui::Context) {
-        let st = self.update.lock().unwrap().clone();
+        let st = self.update.lock().unwrap().state.clone();
         match st {
             UpdateState::Idle => {}
             UpdateState::Checking => {
-                let title = self.t("update.title");
-                let msg = self.t("update.checking");
-                egui::Window::new(title).collapsible(false).show(ctx, |ui| {
-                    ui.add(egui::Spinner::new());
-                    ui.label(msg);
-                });
-            }
-            UpdateState::Found { tag, url } => {
-                let title = self.t("update.title");
-                let found = format!("{} ({})", self.t("update.found"), tag);
-                let hint = self.t("update.hint");
-                let dl = self.t("update.download");
-                let cancel = self.t("extract.cancel");
-                let upd = Arc::clone(&self.update);
                 let mut open = true;
+                egui::Window::new(self.t("update.title"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(self.t("update.checking"));
+                    });
+                if !open {
+                    self.update.lock().unwrap().state = UpdateState::Idle;
+                }
+            }
+            UpdateState::Found {
+                version,
+                notes,
+                size,
+                in_app,
+            } => {
+                let update = Arc::clone(&self.update);
+                let repaint = ctx.clone();
+                let mut open = true;
+                let title = self.t("update.title");
+                let found = self
+                    .t("update.found")
+                    .replace("{version}", &version);
+                let hint = if in_app {
+                    self.t("update.hint")
+                } else {
+                    self.t("update.portable_hint")
+                };
                 egui::Window::new(title)
                     .collapsible(false)
-                    .default_width(380.0)
-                    .default_pos(ctx.content_rect().center() - egui::vec2(190.0, 60.0))
+                    .resizable(false)
+                    .default_width(410.0)
+                    .default_pos(ctx.content_rect().center() - egui::vec2(205.0, 90.0))
                     .open(&mut open)
                     .show(ctx, |ui| {
                         ui.label(found);
+                        ui.label(format!("{}  {}", self.t("update.size"), zipnest_update::pretty_size(size)));
+                        if !notes.is_empty() {
+                            ui.separator();
+                            ui.label(notes);
+                        }
                         ui.label(hint);
                         ui.horizontal(|ui| {
-                            if ui.button(dl).clicked() {
-                                open_shell_url(&url);
+                            if in_app {
+                                if ui.button(self.t("update.download")).clicked() {
+                                    spawn_update_download(
+                                        Arc::clone(&update),
+                                        version.clone(),
+                                        repaint.clone(),
+                                    );
+                                }
+                            } else if ui.button(self.t("update.browser")).clicked() {
+                                open_shell_url(RELEASES_PAGE);
                             }
-                            if ui.button(cancel).clicked() {
-                                *upd.lock().unwrap() = UpdateState::Idle;
+                            if ui.button(self.t("extract.cancel")).clicked() {
+                                update.lock().unwrap().state = UpdateState::Idle;
                             }
                         });
                     });
                 if !open {
-                    *self.update.lock().unwrap() = UpdateState::Idle;
+                    self.update.lock().unwrap().state = UpdateState::Idle;
                 }
             }
-            UpdateState::Failed(msg) => {
-                let title = self.t("update.title");
-                let failed = format!("{}: {}", self.t("update.failed"), msg);
-                let cancel = self.t("extract.cancel");
-                let upd = Arc::clone(&self.update);
+            UpdateState::Downloading {
+                done,
+                total,
+                source,
+            } => {
+                let update = Arc::clone(&self.update);
                 let mut open = true;
-                egui::Window::new(title)
+                let fraction = if total == 0 {
+                    0.0
+                } else {
+                    (done as f32 / total as f32).clamp(0.0, 1.0)
+                };
+                egui::Window::new(self.t("update.title"))
                     .collapsible(false)
+                    .resizable(false)
                     .open(&mut open)
                     .show(ctx, |ui| {
-                        ui.label(failed);
-                        if ui.button(cancel).clicked() {
-                            *upd.lock().unwrap() = UpdateState::Idle;
+                        ui.label(self.t("update.downloading"));
+                        ui.add(
+                            egui::ProgressBar::new(fraction)
+                                .fill(ui.visuals().hyperlink_color)
+                                .show_percentage(),
+                        );
+                        ui.label(format!(
+                            "{} / {} · {} {}",
+                            zipnest_update::pretty_size(done),
+                            zipnest_update::pretty_size(total),
+                            self.t("update.source"),
+                            source
+                        ));
+                        if ui.button(self.t("extract.cancel")).clicked() {
+                            update.lock().unwrap().cancel.cancel();
                         }
                     });
                 if !open {
-                    *self.update.lock().unwrap() = UpdateState::Idle;
+                    self.update.lock().unwrap().cancel.cancel();
+                    self.update.lock().unwrap().state = UpdateState::Idle;
+                }
+            }
+            UpdateState::Ready {
+                path,
+                version,
+                sha256,
+            } => {
+                let update = Arc::clone(&self.update);
+                let mut open = true;
+                let mut install = false;
+                // A running extract/create job holds files open and the
+                // installer cannot replace a ZipNest that is in use — it would
+                // abort with exit code 2 and leave the user on the old version
+                // believing the update ran. Say so before the click instead of
+                // after it, and keep the downloaded file so the retry is a
+                // single click.
+                let busy = self.job_running();
+                egui::Window::new(self.t("update.title"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.label(self.t("update.ready"));
+                        ui.label(format!("v{version}"));
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::Button::new(self.t("update.install")),
+                                )
+                                .clicked()
+                            {
+                                install = true;
+                            }
+                            if ui.button(self.t("extract.cancel")).clicked() {
+                                update.lock().unwrap().state = UpdateState::Idle;
+                            }
+                        });
+                        if busy {
+                            ui.label(self.t("update.error.busy"));
+                        }
+                    });
+                // Belt and braces: the button is already disabled above, but a
+                // job that starts in this same frame must not slip through.
+                if install && self.job_running() {
+                    self.update.lock().unwrap().state =
+                        UpdateState::Failed("update.error.busy".to_string());
+                } else if install {
+                    match start_install(Arc::clone(&self.update), &path, &version, &sha256) {
+                        Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(key) => self.update.lock().unwrap().state = UpdateState::Failed(key),
+                    }
+                } else if !open {
+                    self.update.lock().unwrap().state = UpdateState::Idle;
+                }
+            }
+            UpdateState::Installing => {
+                egui::Window::new(self.t("update.title"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(self.t("update.installing"));
+                    });
+            }
+            UpdateState::Notice(text) => {
+                let update = Arc::clone(&self.update);
+                let mut open = true;
+                egui::Window::new(self.t("update.title"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .default_width(420.0)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.label(text);
+                        if ui.button(self.t("job.close")).clicked() {
+                            update.lock().unwrap().state = UpdateState::Idle;
+                        }
+                    });
+                if !open {
+                    self.update.lock().unwrap().state = UpdateState::Idle;
+                }
+            }
+            UpdateState::Failed(key) => {
+                let update = Arc::clone(&self.update);
+                let mut open = true;
+                egui::Window::new(self.t("update.title"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .default_width(420.0)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.colored_label(error_color(ui), self.t("update.failed"));
+                        ui.label(self.t(&key));
+                        if ui.button(self.t("job.close")).clicked() {
+                            update.lock().unwrap().state = UpdateState::Idle;
+                        }
+                    });
+                if !open {
+                    self.update.lock().unwrap().state = UpdateState::Idle;
                 }
             }
         }

@@ -39,14 +39,19 @@
 
 ## 下载
 
-到 [Releases 页面](https://github.com/CN6/zipnest/releases/latest) 下载最新版（当前 **v0.4.39**）：
+到 [Releases 页面](https://github.com/CN6/zipnest/releases/latest) 下载最新版（当前 **v0.5.0**）：
 
 | 版本 | 文件 | 大小 | 说明 |
 | --- | --- | --- | --- |
-| **安装版（推荐）** | `ZipNest_0.4.39_x64-setup.exe` | 4.1 MB | 双击安装，注册右键菜单、**并自动设为压缩包默认打开程序**；装完可勾选是否创建桌面快捷方式 |
-| 便携版 | `ZipNest_0.4.39_x64_portable.zip` | 4.9 MB | 解压即用、免安装，放 U 盘带走也行（首次打开时自动设为默认） |
+| **安装版（推荐）** | `ZipNest_0.5.0_x64-setup.exe` | 4.1 MB | 双击安装，注册右键菜单、**并自动设为压缩包默认打开程序**；装完可勾选是否创建桌面快捷方式 |
+| 便携版 | `ZipNest_0.5.0_x64_portable.zip` | 4.9 MB | 解压即用、免安装，放 U 盘带走也行（首次打开时自动设为默认） |
 
 > 仅支持 **Windows 10 / 11（x64）**。完整改动记录见 [CHANGELOG](CHANGELOG.md)。
+
+**国内下载**：GitHub 在国内时常连不上，所以同一份安装包也放在
+[Gitee 镜像](https://gitee.com/zipnest/zipnest/releases/latest)，那边通常是满速的。
+安装版从 **v0.5.0** 起可以自己在软件里下载并安装更新（设置或状态栏的「检查更新」），
+下载线路会依次尝试 Gitee、公共加速站和 GitHub，安装包在运行前会做完整性校验。
 
 ## 功能
 

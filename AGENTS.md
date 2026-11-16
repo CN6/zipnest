@@ -100,7 +100,7 @@ UI that lived in `apps/zipnest` was removed in v0.4.22; it was never shipped.
    VERSION` and `OutFile` in `packaging/installer.nsi`, `Version` in
    `packaging/win11-shell/AppxManifest.xml`, and the version/file names in
    `README.md`. Add a `CHANGELOG.md` section (Chinese, matching that file's style).
-   Then run `packaging\check-versions.ps1`: it fails loudly on any of the fourteen
+   Then run `packaging\check-versions.ps1`: it fails loudly on any of the sixteen
    places disagreeing, which is how the Win11 manifest version sat at 0.4.0.0 for
    ten releases unnoticed.
 2. `cargo test --workspace` (all suites green) + `cargo clippy --workspace
@@ -123,9 +123,18 @@ UI that lived in `apps/zipnest` was removed in v0.4.22; it was never shipped.
    encoding".
 6. Portable: `Compress-Archive dist-portable\ZipNest` into
    `ZipNest_<ver>_x64_portable.zip` (installer + zip are gitignored).
-7. Update the machine: close any running instance first (the file is locked),
+7. **Update manifest**: generate `update.json` from the two artifacts, sign it to
+   `update.json.sig`, and re-verify against the key compiled into the app
+   (`cargo run -p zipnest-release -- manifest|sign|verify`). `ship.ps1` does all
+   three; a run without `-Publish` already produces and validates them. The
+   manifest is committed **after** the tag (`chore: update manifest for v<ver>`)
+   because it cannot exist before the artifacts are built, and both pushes carry
+   it. `update.json` is deliberately **not** in `check-versions.ps1`: at the start
+   of a release it still holds the previous version, so the check would fail
+   before the version could ever be bumped.
+8. Update the machine: close any running instance first (the file is locked),
    then copy the exe over `D:\ZipNest\zipnest.exe`.
-8. Release (title and body have a fixed shape — do not append the summary):
+9. Release (title and body have a fixed shape — do not append the summary):
    - Title is exactly `ZipNest v<ver>`. The "solved what" line does NOT belong
      here: the page shows the version, and the body below IS the changelog.
      Putting the summary in both places was the v0.4.0–v0.4.9 habit and it read
@@ -142,6 +151,57 @@ UI that lived in `apps/zipnest` was removed in v0.4.22; it was never shipped.
      `gh release delete <tag> --yes --cleanup-tag`, re-tag, re-create.
    - Local installers/portable zips are not kept: upload them and delete the
      copies (the maintainer does not want them on disk).
+
+## The update path (v0.5.0)
+
+Users in mainland China cannot reliably reach GitHub, so the update flow is
+built on the assumption that **every transport is untrusted and probably slow**:
+
+- `crates/zipnest-update` fetches a signed `update.json` from Gitee raw first,
+  then `gh-proxy` → jsDelivr → raw.githubusercontent. The manifest is a static
+  file in git, not `api.github.com`: the unauthenticated API budget is 60
+  requests/hour **per IP**, shared behind a Chinese carrier NAT (measured: 53
+  requests → 403 for 13 minutes). The raw file answered 15/15 in 0.34–0.61 s.
+- The manifest is Ed25519-signed; `verify::UPDATE_PUBKEY` is compiled into the
+  exe. An untrusted mirror can therefore only refuse to serve — it cannot
+  substitute a manifest or an installer (the installer's SHA-256 is in the signed
+  manifest, and both are checked before anything runs).
+- Downloads go to `%LOCALAPPDATA%\ZipNest\updates\<ver>\` as `.part` + sidecar,
+  resume via `Range`, and are tried in order Gitee → gh-proxy → ghfast → GitHub
+  REST asset endpoint. `Address Space`/mid-transfer truncation is real (one
+  measured attempt delivered 1,398,784 of 5,137,077 bytes with a **200**), which
+  is why size and hash are mandatory.
+- Installing is delegated: the app copies itself to
+  `%LOCALAPPDATA%\ZipNest\updater\`, starts that copy with `--apply-update`, and
+  quits. The copy waits for the app's PID, then `ShellExecuteExW("runas")` runs
+  the NSIS installer `/S /D=<install dir>`, reads the exit code (2 running,
+  3 files busy, 4 shell package only) and relaunches. **Never** `Command::spawn`
+  the installer: it fails with 740 and shows no UAC prompt — that, not a file
+  lock, is what broke the v0.2.x updater.
+- Portable copies are refused (`InstallMode::Portable`): installing over them
+  would leave a second copy in Program Files while the user keeps launching the
+  old portable exe.
+
+**Signing key**: `%USERPROFILE%\.zipnest\update-key.p8`, generated once with
+`cargo run -p zipnest-release -- keygen`. It is not in the repo and not in CI.
+Rotating it means shipping a release whose `UPDATE_PUBKEY` differs — there is no
+revocation path, so a leak means every installed copy must be walked forward by
+hand. The first release that carries verification cannot verify itself: that one
+still needs a manual install.
+
+**Gitee token**: `%USERPROFILE%\.zipnest\gitee-token` — or `gitee-token.txt`,
+because Notepad appends `.txt` when a file is saved without an extension, which
+is exactly how this one gets created. `ship.ps1` accepts either and strips a
+UTF-8 BOM (a BOM makes every API call 401 with no visible reason). It publishes
+the mirror release, then strips the token back out of `.git/config`. Missing file
+→ the Gitee leg is skipped with a warning and the release is GitHub-only:
+**check for that warning after every publish**, because a GitHub-only release is
+undownloadable for exactly the users this path exists for.
+
+The mirror repo `zipnest/zipnest` does not have to exist beforehand — `ship.ps1`
+probes it and creates it with the token on first publish. As of 2026-11-16 the
+token is in place and validated (`/user` → `login: zipnest`), and the repo is
+still a 404, so the first `-Publish` run creates it.
 
 ## Known open items / gotchas (as of v0.4.22)
 
@@ -278,12 +338,15 @@ UI that lived in `apps/zipnest` was removed in v0.4.22; it was never shipped.
   included, in `!ifdef MUI_FINISHPAGE_SHOWREADME`. The install section creates
   only the Start-menu shortcuts, so clearing the box really means "no desktop
   icon"; an upgrade never deletes a shortcut the user already had.
-- **Update checks are silent unless they have news** (v0.4.10).
-  `spawn_update_check(state, manual)`: the manual call sets `Checking` and
-  reports failures, the startup call touches no state while it runs and only
-  ever writes `Found`. Before this, `Checking` was set unconditionally, so every
-  launch flashed the "正在检查更新" window and an offline machine got an error
-  dialog.
+- **Update checks are silent unless they have news** (v0.4.10, and v0.5.0 kept
+  the rule while replacing the transport).
+  `spawn_update_check(update, manual, interval)`: the manual call sets `Checking`
+  and reports failures, the startup call touches no state while it runs and only
+  ever writes `Found` — and it now also skips a check that succeeded within the
+  last 6 hours, so an always-open machine costs at most four requests a day
+  against whatever quota the mirror has. Before v0.4.10, `Checking` was set
+  unconditionally, so every launch flashed the "正在检查更新" window and an
+  offline machine got an error dialog.
 
 - **Feedback entry** (v0.4.9): 设置 → 帮助与反馈. `zipnest_ipc::diagnostics`
   renders the report (version, OS build, exe path with the account name masked to

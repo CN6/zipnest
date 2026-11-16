@@ -1,0 +1,25 @@
+[package]
+name = "zipnest-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Update discovery, download and install for ZipNest — no UI framework."
+
+[dependencies]
+# The only HTTP client in the workspace. It lives here rather than in the UI
+# crate so the app itself no longer carries a TLS stack directly (it did until
+# v0.4.39, when `fetch_latest` was the single ureq call in main.rs).
+ureq = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Already compiled into every release build through ureq -> rustls -> ring, so
+# adding it as a direct dependency costs no new crates.io package, no second
+# crypto implementation, and no new build time. It provides BOTH pieces the
+# updater needs: `ring::digest::SHA256` for the payload hash and
+# `ring::signature::ED25519` for the manifest signature. Do not reach for
+# `sha2`: it is in Cargo.lock only as a dev-dependency of archive-core (via
+# `zip`), i.e. it is NOT in the shipped binary.
+ring = "0.17"
+
+[dev-dependencies]
+tempfile = "3"
