@@ -1,19 +1,19 @@
 {
   "assets": [
     {
-      "name": "ZipNest_0.5.0_x64-setup.exe",
-      "sha256": "60719507384a67adcbeaae3be4b2dc5612fcd38ee25c2a5a2c327cd8370b7aec",
-      "size": 5220446
+      "name": "ZipNest_0.5.1_x64-setup.exe",
+      "sha256": "08aa48643b91e4769d596ebae1fc39d447d9bde748233293d7bc7a562337770b",
+      "size": 5219012
     },
     {
-      "name": "ZipNest_0.5.0_x64_portable.zip",
-      "sha256": "8b1cc2bed997239dc4720728ec7e49e74d6619b856c3a1a86f70030085e455a1",
-      "size": 6395090
+      "name": "ZipNest_0.5.1_x64_portable.zip",
+      "sha256": "2369f4946f79f5083669ce7cc3219541700cc5e4f692873009f12746e85160d1",
+      "size": 6602883
     }
   ],
-  "date": "2026-11-16",
+  "date": "2026-11-17",
   "min_version": "0.4.0",
-  "notes_en": "更新可以自己在软件里下载并安装了，国内网络也能下得动",
-  "notes_zh": "更新可以自己在软件里下载并安装了，国内网络也能下得动",
-  "version": "0.5.0"
+  "notes_en": "点「检查更新」终于有回音了",
+  "notes_zh": "点「检查更新」终于有回音了",
+  "version": "0.5.1"
 }
