@@ -303,8 +303,27 @@ pub fn updater_dir() -> PathBuf {
 /// resume the downloader is built around — and worse, a relaunch while the
 /// detached watcher was still waiting on the installer could delete the setup
 /// exe out from under it.
+///
+/// A directory whose setup exe is named by [`read_ready`] is kept regardless:
+/// the user has already been told "the installer is downloaded and verified",
+/// and deleting it behind their back turns the next click into
+/// `update.error.install`. The version list above only covers *this* process's
+/// idea of what matters; the ready record covers what the user is looking at.
 pub fn clean_stale(keep: &[&str]) {
-    let updates = data_dir().join("updates");
+    let ready = read_ready();
+    clean_stale_in(&data_dir(), keep, ready.as_ref(), Duration::from_secs(3600));
+}
+
+/// [`clean_stale`] with the base directory, the "ready" record and the age gate
+/// passed in, so the decision can be tested without touching the real profile
+/// or waiting an hour.
+fn clean_stale_in(
+    data: &Path,
+    keep: &[&str],
+    ready: Option<&ReadyInstall>,
+    grace: Duration,
+) {
+    let updates = data.join("updates");
     let Ok(entries) = std::fs::read_dir(&updates) else {
         return;
     };
@@ -313,17 +332,22 @@ pub fn clean_stale(keep: &[&str]) {
         if keep.contains(&name.as_str()) {
             continue;
         }
-        // A directory touched in the last hour belongs to a download that is
-        // probably still running in *another* ZipNest process — the single
-        // instance mutex only covers the normal window, not a second user
-        // session or a portable copy launched elsewhere. Deleting it would
+        // A directory holding the installer we downloaded and verified is not
+        // stale, whatever its age: the user may still press 立即安装.
+        if ready.is_some_and(|r| r.dir_is(&name, &entry.path())) {
+            continue;
+        }
+        // A directory touched within the grace period belongs to a download
+        // that is probably still running in *another* ZipNest process — the
+        // single instance mutex only covers the normal window, not a second
+        // user session or a portable copy launched elsewhere. Deleting it would
         // remove a live `.part` (and, during an install, the setup exe the
         // elevated installer is reading). Stale by age instead of by name.
         let recently_used = std::fs::metadata(entry.path())
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age < Duration::from_secs(3600));
+            .is_some_and(|age| age < grace);
         if recently_used {
             continue;
         }
@@ -335,6 +359,107 @@ pub fn clean_stale(keep: &[&str]) {
         old.push(".old");
         let _ = std::fs::remove_file(PathBuf::from(old));
     }
+}
+
+/// Delete every installer **this app downloaded**, whatever its version or age.
+///
+/// Only `%LOCALAPPDATA%\ZipNest\updates\` is touched. A setup exe the user
+/// downloaded from GitHub or Gitee by hand lives somewhere else entirely
+/// (Downloads, Desktop, a USB stick) and is never opened, moved or removed by
+/// this function or by anything else in the update path.
+///
+/// Called after an install actually applied. `updates/<old target>` is by then
+/// spent: the running exe is the new version, so nothing will ever offer that
+/// file again, and keeping it would leave ~5 MB per release on disk. Unlike
+/// [`clean_stale`] this ignores the one-hour rule on purpose — the caller knows
+/// the install finished — but it still refuses to touch a `.part` from a
+/// download that is running right now in another process.
+pub fn purge_updates() {
+    let updates = data_dir().join("updates");
+    let Ok(entries) = std::fs::read_dir(&updates) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        // A directory with a live `.part` is a download in flight; its process
+        // will finish or fail, and the next launch cleans it.
+        let in_flight = std::fs::read_dir(&path).is_ok_and(|inner| {
+            inner.flatten().any(|f| {
+                f.file_name()
+                    .to_string_lossy()
+                    .ends_with(".part")
+            })
+        });
+        if in_flight {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+    // The parent goes too when it is empty, so a machine that has never
+    // downloaded an update does not keep an empty `updates\` directory around.
+    let _ = std::fs::remove_dir(&updates);
+}
+
+/// The installer that was downloaded and verified, waiting for the user to press
+/// 立即安装.
+///
+/// Written the moment [`crate::download::download`] hands back a file whose
+/// length and SHA-256 match the signed manifest, and read back on the next
+/// launch. Without it, "downloaded" only existed in a UI state and in memory:
+/// closing the window, or any cleanup that ran before the user pressed the
+/// button, left the app with no way back to the file it had already told the
+/// user was ready. Keeping the record is also what makes the *retry* cheap:
+/// [`crate::download::download`] returns an existing file whose hash still
+/// matches instead of fetching it again.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ReadyInstall {
+    /// Version the installer installs.
+    pub version: String,
+    /// File name inside `updates/<version>/`.
+    pub file_name: String,
+    /// SHA-256 from the signed manifest, re-checked before it is offered again.
+    pub sha256: String,
+}
+
+impl ReadyInstall {
+    /// Full path of the installer this record names.
+    pub fn path(&self) -> PathBuf {
+        updates_dir(&self.version).join(&self.file_name)
+    }
+
+    /// Whether `dir` (whose directory name is `name`) is the one this record
+    /// points into. Used by [`clean_stale`] to spare a verified installer.
+    fn dir_is(&self, name: &str, dir: &Path) -> bool {
+        name == self.version && dir.join(&self.file_name).is_file()
+    }
+}
+
+pub fn ready_path() -> PathBuf {
+    data_dir().join("update-ready.json")
+}
+
+pub fn write_ready(r: &ReadyInstall) -> std::io::Result<()> {
+    write_ready_to(&ready_path(), r)
+}
+
+fn write_ready_to(path: &Path, r: &ReadyInstall) -> std::io::Result<()> {
+    write_json_atomic(path, r)
+}
+
+pub fn read_ready() -> Option<ReadyInstall> {
+    read_ready_from(&ready_path())
+}
+
+fn read_ready_from(path: &Path) -> Option<ReadyInstall> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+pub fn clear_ready() {
+    let _ = std::fs::remove_file(ready_path());
 }
 
 /// Files the watcher and the app exchange to report the outcome of an install.
@@ -376,19 +501,30 @@ pub fn write_pending(p: &PendingInstall) -> std::io::Result<()> {
 /// truncated JSON that the next launch cannot parse, because a record it cannot
 /// read is indistinguishable from "no update was in progress".
 fn write_pending_to(path: &std::path::Path, p: &PendingInstall) -> std::io::Result<()> {
+    write_json_atomic(path, p)
+}
+
+/// Serialise `value` and replace `path` with it in one step.
+///
+/// The temp name is per-process so two instances (a second user session, a
+/// portable copy) cannot clobber each other's half-written file.
+fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_vec_pretty(p).map_err(std::io::Error::other)?;
+    let json = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
     std::fs::write(&tmp, json)?;
     if std::fs::rename(&tmp, path).is_err() {
         // Replacing an existing file can fail while something holds it open;
         // remove-then-rename is better than losing the record entirely.
         let _ = std::fs::remove_file(path);
-        std::fs::rename(&tmp, path)?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -835,6 +971,144 @@ mod tests {
         assert!(p.contains("/D=C:\\Program Files\\ZipNest"));
         assert!(!p.contains('"'), "quotes would break /D=: {p}");
         assert!(p.trim_end().ends_with("ZipNest"));
+    }
+
+    #[test]
+    fn the_ready_record_round_trips_and_names_the_installer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-ready.json");
+        assert!(read_ready_from(&path).is_none(), "nothing written yet");
+
+        let r = ReadyInstall {
+            version: "0.5.2".into(),
+            file_name: "ZipNest_0.5.2_x64-setup.exe".into(),
+            sha256: "ab".repeat(32),
+        };
+        write_ready_to(&path, &r).unwrap();
+        assert_eq!(read_ready_from(&path), Some(r.clone()));
+
+        // The record names a file inside updates/<version>/, which is what both
+        // the restore path and clean_stale rely on.
+        assert!(r.path().ends_with(
+            Path::new("updates").join("0.5.2").join("ZipNest_0.5.2_x64-setup.exe")
+        ));
+
+        // A second write replaces the first.
+        let r2 = ReadyInstall {
+            version: "0.5.3".into(),
+            file_name: "ZipNest_0.5.3_x64-setup.exe".into(),
+            sha256: "cd".repeat(32),
+        };
+        write_ready_to(&path, &r2).unwrap();
+        assert_eq!(read_ready_from(&path), Some(r2));
+
+        // No half-written temp file survives a write.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn a_verified_download_survives_a_launch_that_has_forgotten_it() {
+        // The regression behind "找不到已下载的安装包": the download is done and
+        // on disk, but the process that fetched it is gone (user closed the
+        // window). On the next launch only the record on disk knows the file
+        // matters, so cleanup must consult it — not just the version list this
+        // process happens to hold.
+        let data = tempfile::tempdir().unwrap();
+        let target = data.path().join("updates").join("0.5.2");
+        std::fs::create_dir_all(&target).unwrap();
+        let setup = target.join("ZipNest_0.5.2_x64-setup.exe");
+        std::fs::write(&setup, b"verified").unwrap();
+
+        // A different version is running; nothing in `keep` names 0.5.2.
+        let ready = ReadyInstall {
+            version: "0.5.2".into(),
+            file_name: "ZipNest_0.5.2_x64-setup.exe".into(),
+            sha256: "ab".repeat(32),
+        };
+        // Zero grace: an hour-old download is exactly the case that used to be
+        // deleted before the user could press 立即安装.
+        clean_stale_in(data.path(), &["0.5.1"], Some(&ready), Duration::ZERO);
+        assert!(setup.is_file(), "the verified installer was deleted");
+
+        // With the record gone (install applied, or the file was already
+        // useless) the same directory is fair game.
+        clean_stale_in(data.path(), &["0.5.1"], None, Duration::ZERO);
+        assert!(!target.exists(), "a spent download should be cleaned up");
+    }
+
+    #[test]
+    fn cleanup_never_reaches_outside_the_apps_own_cache() {
+        // The user's own downloads (GitHub, Gitee, Downloads folder, a USB
+        // stick) are outside `%LOCALAPPDATA%\ZipNest\updates` and must survive
+        // any cleanup, including a full purge.
+        let data = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let user_copy = elsewhere.path().join("ZipNest_0.5.2_x64-setup.exe");
+        std::fs::write(&user_copy, b"the user downloaded this by hand").unwrap();
+
+        let target = data.path().join("updates").join("0.5.2");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("ZipNest_0.5.2_x64-setup.exe"), b"ours").unwrap();
+
+        clean_stale_in(data.path(), &[], None, Duration::ZERO);
+        assert!(!target.exists(), "our own cache is cleaned");
+        assert!(
+            user_copy.is_file(),
+            "a hand-downloaded installer must never be touched"
+        );
+    }
+
+    #[test]
+    fn purging_spares_a_download_that_is_still_running() {
+        // The delete loop reads the real data dir, so the decision it makes is
+        // extracted here: a directory holding a `.part` belongs to a live
+        // download and must survive; anything else goes.
+        let dir = tempfile::tempdir().unwrap();
+        let done = dir.path().join("0.5.2");
+        let live = dir.path().join("0.5.3");
+        std::fs::create_dir_all(&done).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(done.join("ZipNest_0.5.2_x64-setup.exe"), b"done").unwrap();
+        std::fs::write(
+            live.join("ZipNest_0.5.3_x64-setup.exe.part"),
+            b"half",
+        )
+        .unwrap();
+
+        let has_part = |p: &Path| {
+            std::fs::read_dir(p).is_ok_and(|inner| {
+                inner
+                    .flatten()
+                    .any(|f| f.file_name().to_string_lossy().ends_with(".part"))
+            })
+        };
+        assert!(!has_part(&done), "a finished download has no .part");
+        assert!(has_part(&live), "an in-flight download does");
+    }
+
+    #[test]
+    fn a_ready_record_only_claims_its_own_version_directory() {        let dir = tempfile::tempdir().unwrap();
+        let version_dir = dir.path().join("0.5.2");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("setup.exe"), b"x").unwrap();
+
+        let r = ReadyInstall {
+            version: "0.5.2".into(),
+            file_name: "setup.exe".into(),
+            sha256: "00".repeat(32),
+        };
+        // Its own directory, holding the file: spared from cleanup.
+        assert!(r.dir_is("0.5.2", &version_dir));
+        // A different version's directory is not.
+        assert!(!r.dir_is("0.5.1", &version_dir));
+        // Same name, but the file is gone: nothing to protect any more.
+        std::fs::remove_file(version_dir.join("setup.exe")).unwrap();
+        assert!(!r.dir_is("0.5.2", &version_dir));
     }
 
     #[test]

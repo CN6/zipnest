@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "archive-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "archive-security",
  "zip",
@@ -205,11 +205,11 @@ dependencies = [
 
 [[package]]
 name = "archive-jobs"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "archive-security"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "arrayvec"
@@ -4787,7 +4787,7 @@ dependencies = [
 
 [[package]]
 name = "zipnest-ipc"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "archive-core",
  "archive-jobs",
@@ -4797,7 +4797,7 @@ dependencies = [
 
 [[package]]
 name = "zipnest-native"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "eframe",
  "egui",
@@ -4812,7 +4812,7 @@ dependencies = [
 
 [[package]]
 name = "zipnest-release"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ring",
  "serde_json",
@@ -4822,7 +4822,7 @@ dependencies = [
 
 [[package]]
 name = "zipnest-shell"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "windows",
  "windows-core",
@@ -4830,7 +4830,7 @@ dependencies = [
 
 [[package]]
 name = "zipnest-update"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ring",
  "serde",

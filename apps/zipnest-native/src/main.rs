@@ -214,10 +214,76 @@ struct UpdateShared {
     last_check: Option<std::time::Instant>,
     /// Identifies the check currently allowed to publish a result.
     check_generation: u64,
+    /// Set when a download finishes: the next frame installs without waiting
+    /// for a click. One-shot — every failure path clears it, so a refused UAC
+    /// prompt or a busy file never turns into an install loop.
+    auto_install: bool,
 }
 
 type UpdateHandle = Arc<Mutex<UpdateShared>>;
 
+
+/// Whether this frame should start the install without waiting for a click.
+///
+/// Consumes the flag on the way out, so the automated install happens exactly
+/// once per download: if the UAC prompt is declined or the files turn out to be
+/// busy, the user sees the failure and decides whether to try again. A retry
+/// loop nobody asked for is worse than one extra click.
+fn take_auto_install(shared: &mut UpdateShared, present: bool, busy: bool) -> bool {
+    if !shared.auto_install || !present || busy {
+        return false;
+    }
+    shared.auto_install = false;
+    true
+}
+
+/// Re-offer an installer that was downloaded and verified in an earlier session.
+///
+/// Returns `true` when `Ready` was restored, which suppresses the startup check:
+/// the newer release is already here.
+///
+/// Three things have to still hold, and each one is cheap to check: the record
+/// parses, the file it names exists, and that file still hashes to what the
+/// signed manifest said. A record that fails any of them is deleted — otherwise
+/// every launch would re-check a file that is not coming back, and the "ready"
+/// flag would keep a stale directory alive in [`clean_stale`].
+fn restore_ready_install(update: &UpdateHandle) -> bool {
+    let Some(record) = zipnest_update::install::read_ready() else {
+        return false;
+    };
+    // A pending-install notice owns the screen on this launch: it is the answer
+    // to "did the update actually work?" and must not be replaced by "ready to
+    // install" before the user has read it. The record survives, so the next
+    // launch offers the retry.
+    if !matches!(update.lock().unwrap().state, UpdateState::Idle) {
+        return false;
+    }
+    let path = record.path();
+    let intact = path.is_file()
+        && zipnest_update::verify::sha256_file(&path)
+            .map(|got| got.eq_ignore_ascii_case(&record.sha256))
+            .unwrap_or(false);
+    if !intact {
+        zipnest_update::install::clear_ready();
+        return false;
+    }
+    // An installer for a version that is no longer newer (the user updated by
+    // hand in the meantime) is spent; do not offer it again.
+    if !zipnest_update::version::is_newer(CURRENT_VERSION, &record.version) {
+        zipnest_update::install::clear_ready();
+        return false;
+    }
+    update.lock().unwrap().state = UpdateState::Ready {
+        path: path.to_string_lossy().to_string(),
+        version: record.version,
+        sha256: record.sha256,
+    };
+    // Deliberately *not* auto-installing here. A restored record can be the
+    // leftovers of an install that already failed (UAC declined, files busy);
+    // installing again on every launch would be a retry loop the user never
+    // asked for. The dialog offers 立即安装, one click.
+    true
+}
 
 /// Hand a URL (web page, or `mailto:`) to whatever Windows has registered for
 /// it. `start` needs the empty "" title argument before a quoted URL.
@@ -655,8 +721,58 @@ fn spawn_update_check(
 #[cfg(test)]
 mod update_check_tests {
     use super::{
-        can_publish_check, claim_update_check, no_update_state, UpdateShared, UpdateState,
+        can_publish_check, claim_update_check, no_update_state, take_auto_install, UpdateShared,
+        UpdateState,
     };
+
+    /// A finished download installs itself, once. This is the whole point of
+    /// the in-app path: download, verify, install — the only user action left
+    /// is Windows' own elevation prompt.
+    #[test]
+    fn a_verified_download_installs_itself_exactly_once() {
+        let mut shared = UpdateShared {
+            auto_install: true,
+            ..Default::default()
+        };
+        assert!(take_auto_install(&mut shared, true, false));
+        assert!(!shared.auto_install, "the intent is consumed");
+        // A second frame must not start a second install.
+        assert!(!take_auto_install(&mut shared, true, false));
+    }
+
+    /// Everything that can go wrong before the installer starts keeps the user
+    /// in control: a missing file, or a job that is still running, leaves the
+    /// dialog up with a button instead of installing behind their back.
+    #[test]
+    fn a_job_or_a_missing_file_stops_the_automation() {
+        let mut missing = UpdateShared {
+            auto_install: true,
+            ..Default::default()
+        };
+        assert!(!take_auto_install(&mut missing, false, false));
+        assert!(missing.auto_install, "the intent survives until it can fire");
+
+        let mut busy = UpdateShared {
+            auto_install: true,
+            ..Default::default()
+        };
+        assert!(!take_auto_install(&mut busy, true, true));
+        assert!(busy.auto_install);
+    }
+
+    /// Closing the update dialog must not leave a pending install behind that
+    /// fires later, unannounced.
+    #[test]
+    fn closing_a_download_cancels_the_automatic_install() {
+        let mut shared = UpdateShared {
+            auto_install: true,
+            ..Default::default()
+        };
+        // What the Downloading arm does on close.
+        shared.state = UpdateState::Idle;
+        shared.auto_install = false;
+        assert!(!take_auto_install(&mut shared, true, false));
+    }
 
     #[test]
     fn automatic_no_update_is_silent() {
@@ -787,13 +903,35 @@ fn spawn_update_download(update: UpdateHandle, version: String, repaint: egui::C
         let mut g = update.lock().unwrap();
         if matches!(g.state, UpdateState::Downloading { .. }) {
             g.state = match result {
-                Ok(path) => UpdateState::Ready {
-                    path: path.to_string_lossy().to_string(),
-                    version,
-                    sha256: asset.sha256.clone(),
-                },
+                Ok(path) => {
+                    // Record it before showing 立即安装, not when the button is
+                    // pressed: this is what lets a later launch — or a cleanup
+                    // that runs before the user gets to the button — find the
+                    // same file instead of reporting "找不到已下载的安装包".
+                    let record = zipnest_update::install::ReadyInstall {
+                        version: version.clone(),
+                        file_name: path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        sha256: asset.sha256.clone(),
+                    };
+                    if let Err(e) = zipnest_update::install::write_ready(&record) {
+                        eprintln!("ZipNest: update: could not record the verified installer: {e}");
+                    }
+                    UpdateState::Ready {
+                        path: path.to_string_lossy().to_string(),
+                        version,
+                        sha256: asset.sha256.clone(),
+                    }
+                }
                 Err(e) => UpdateState::Failed(e.message_key().to_string()),
             };
+            // A file that verified is installed without another click; the
+            // handoff handler in the Ready arm picks this up on the next frame.
+            // A failure clears the intent, so nothing retries behind the user's
+            // back.
+            g.auto_install = matches!(g.state, UpdateState::Ready { .. });
         }
         drop(g);
         repaint.request_repaint();
@@ -880,8 +1018,14 @@ fn start_install(
         // Undo the record: an install that never started must not be reported
         // as "the installer did not finish" on the next launch.
         zipnest_update::install::clear_pending();
+        // The file is still on disk and still verified, so the "ready" record
+        // stays: the retry is one click, not a re-download.
         "update.error.install".to_string()
     })?;
+    // The watcher decides the file's fate now: it re-checks the hash, elevates
+    // it, and clears the "ready" record itself once the install actually
+    // applied. Clearing it here would lose the retry after a failure such as
+    // "files busy" — the next launch would have to download 5 MB again.
     update.lock().unwrap().state = UpdateState::Installing;
     Ok(())
 }
@@ -941,6 +1085,28 @@ fn run_apply_update(args: &[String]) -> i32 {
         Err(e) => record.launch_error = Some(e),
     }
     let _ = zipnest_update::install::write_pending(&record);
+
+    // The installer, if it ran to a successful end, has replaced the old build:
+    // the downloaded setup and its "ready" record have done their job and must
+    // not be offered again by the new version. Every other outcome keeps both,
+    // so a retry — files busy, UAC declined, installer aborted — is one click
+    // instead of a re-download.
+    let applied = record
+        .exit_code
+        .map(zipnest_update::install::InstallResult::from_exit_code)
+        .is_some_and(|r| r.applied());
+    if applied {
+        // These two paths are the app's own download cache. A setup exe the
+        // user saved from the releases page by hand is elsewhere and is never
+        // touched.
+        let _ = std::fs::remove_file(&setup);
+        zipnest_update::install::clear_ready();
+        // Every other downloaded installer is spent too: the running exe is
+        // now the new version, so no code path will ever offer them again.
+        // Without this, a machine that updates a dozen times keeps ~5 MB per
+        // release under `%LOCALAPPDATA%\ZipNest\updates\`.
+        zipnest_update::install::purge_updates();
+    }
 
     // Start the app again either way. If the install failed, the old exe is
     // still what runs, and its own version check will offer the update again.
@@ -1632,15 +1798,25 @@ impl App {
         theme::apply_setting(&cc.egui_ctx, &settings.theme_mode);
         // Downloads live under %LOCALAPPDATA%\ZipNest\updates (not %TEMP%, which
         // Disk Cleanup empties under us and where a freshly downloaded exe is the
-        // most-scanned file on the system). Drop every version but this one, the
-        // previous run's watcher copy, and the v0.2.x leftover in TEMP.
-        // Keep *two* directories: the version running now, and the one the last
-        // attempt was downloading. Keeping only the former deleted every
-        // in-progress `.part` at each launch (defeating the resume) and could
-        // delete the setup exe a still-running watcher was about to elevate.
+        // most-scanned file on the system). Nothing is kept unconditionally:
+        // the version running now has no download worth keeping *because* it is
+        // running, and after an update `updates/<new version>` holds the setup
+        // that just ran.
+        //
+        // What must survive is decided by the two records:
+        //   * a pending install (a watcher may be about to elevate its setup),
+        //   * a verified, not-yet-installed download ("ready").
+        // `clean_stale` additionally spares anything touched in the last hour,
+        // which covers a download running in another process. Dropping the
+        // directory of the running version is what makes repeated updates not
+        // pile up ~5 MB per release.
         let pending_version = zipnest_update::install::read_pending().map(|p| p.version);
-        let mut keep: Vec<&str> = vec![CURRENT_VERSION];
+        let ready_version = zipnest_update::install::read_ready().map(|r| r.version);
+        let mut keep: Vec<&str> = Vec::new();
         if let Some(v) = pending_version.as_deref() {
+            keep.push(v);
+        }
+        if let Some(v) = ready_version.as_deref() {
             keep.push(v);
         }
         zipnest_update::install::clean_stale(&keep);
@@ -1726,7 +1902,14 @@ impl App {
         // Auto-check is user-controllable in Settings (on by default). It is
         // silent: no window, no spinner, no error dialog — only a real newer
         // release opens anything (see spawn_update_check).
-        if settings.auto_check_update {
+        //
+        // A verified installer from an earlier session takes precedence over a
+        // new check: the user was already told it is downloaded, so re-offering
+        // it is one click instead of a 5 MB re-download. A record whose file is
+        // missing (cleaned out behind our back) or no longer hashes correctly is
+        // dropped, and the normal check runs as usual.
+        let restored = restore_ready_install(&update);
+        if settings.auto_check_update && !restored {
             let check = Arc::clone(&update);
             // The result is written from a worker thread; egui sleeps while the
             // window is idle, so without this wake the "new version" dialog
@@ -4930,41 +5113,74 @@ impl App {
                 let update = Arc::clone(&self.update);
                 let mut open = true;
                 let mut install = false;
-                // A running extract/create job holds files open and the
-                // installer cannot replace a ZipNest that is in use — it would
-                // abort with exit code 2 and leave the user on the old version
-                // believing the update ran. Say so before the click instead of
-                // after it, and keep the downloaded file so the retry is a
-                // single click.
+                let mut redownload = false;
+                // The update is meant to be hands-off: download, verify, then
+                // install. Nothing is asked of the user except the one Windows
+                // elevation prompt the NSIS installer always raises — that
+                // prompt is the OS's, not ours, and cannot be skipped by any
+                // amount of code.
+                //
+                // The only reason to stop and ask is a job in flight: the
+                // installer force-closes ZipNest, which would destroy an
+                // extraction midway. Then the dialog explains it and offers the
+                // button for after the job ends.
                 let busy = self.job_running();
+                // The file can still disappear between download and click:
+                // Disk Cleanup, an antivirus quarantine, or another copy of
+                // ZipNest cleaning `updates/` from under us. Checking here means
+                // the user gets a button that actually works, not a one-way
+                // "找不到已下载的安装包".
+                let present = std::path::Path::new(path.as_str()).is_file();
+                if take_auto_install(&mut self.update.lock().unwrap(), present, busy) {
+                    install = true;
+                }
                 egui::Window::new(self.t("update.title"))
                     .collapsible(false)
                     .resizable(false)
                     .open(&mut open)
                     .show(ctx, |ui| {
-                        ui.label(self.t("update.ready"));
-                        ui.label(format!("v{version}"));
+                        ui.label(self.t(if present {
+                            "update.ready"
+                        } else {
+                            "update.error.install"
+                        }));
+                        if present {
+                            ui.label(format!("v{version}"));
+                        }
                         ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    !busy,
-                                    egui::Button::new(self.t("update.install")),
-                                )
-                                .clicked()
-                            {
-                                install = true;
+                            if present {
+                                if ui
+                                    .add_enabled(
+                                        !busy,
+                                        egui::Button::new(self.t("update.install")),
+                                    )
+                                    .clicked()
+                                {
+                                    install = true;
+                                }
+                            } else if ui.button(self.t("update.download_again")).clicked() {
+                                redownload = true;
                             }
                             if ui.button(self.t("extract.cancel")).clicked() {
                                 update.lock().unwrap().state = UpdateState::Idle;
                             }
                         });
-                        if busy {
+                        if present && busy {
                             ui.label(self.t("update.error.busy"));
                         }
                     });
                 // Belt and braces: the button is already disabled above, but a
                 // job that starts in this same frame must not slip through.
-                if install && self.job_running() {
+                if redownload {
+                    // The record is stale (that is why the label says so); drop
+                    // it and fetch the same version again into the same folder.
+                    zipnest_update::install::clear_ready();
+                    spawn_update_download(
+                        Arc::clone(&self.update),
+                        version.clone(),
+                        ctx.clone(),
+                    );
+                } else if install && self.job_running() {
                     self.update.lock().unwrap().state =
                         UpdateState::Failed("update.error.busy".to_string());
                 } else if install {
