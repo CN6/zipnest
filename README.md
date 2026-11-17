@@ -39,12 +39,12 @@
 
 ## 下载
 
-到 [Releases 页面](https://github.com/CN6/zipnest/releases/latest) 下载最新版（当前 **v0.5.0**）：
+到 [Releases 页面](https://github.com/CN6/zipnest/releases/latest) 下载最新版（当前 **v0.5.1**）：
 
 | 版本 | 文件 | 大小 | 说明 |
 | --- | --- | --- | --- |
-| **安装版（推荐）** | `ZipNest_0.5.0_x64-setup.exe` | 4.1 MB | 双击安装，注册右键菜单、**并自动设为压缩包默认打开程序**；装完可勾选是否创建桌面快捷方式 |
-| 便携版 | `ZipNest_0.5.0_x64_portable.zip` | 4.9 MB | 解压即用、免安装，放 U 盘带走也行（首次打开时自动设为默认） |
+| **安装版（推荐）** | `ZipNest_0.5.1_x64-setup.exe` | 5.0 MB | 双击安装，注册右键菜单、**并自动设为压缩包默认打开程序**；装完可勾选是否创建桌面快捷方式 |
+| 便携版 | `ZipNest_0.5.1_x64_portable.zip` | 6.3 MB | 解压即用、免安装，放 U 盘带走也行（首次打开时自动设为默认） |
 
 > 仅支持 **Windows 10 / 11（x64）**。完整改动记录见 [CHANGELOG](CHANGELOG.md)。
 
@@ -112,14 +112,14 @@ cargo run -p zipnest-native       # 开发运行（原生界面）
 cargo build -p zipnest-native --release
 ```
 
-常用脚本（`scripts\`）：
+常用脚本（`scripts\`，用 PowerShell 7 运行，即 `pwsh`；5.1 不支持）：
 
 ```powershell
-scripts\dev-run.ps1               # 编译 + 重启 + 等到窗口真正出现，返回窗口坐标
-scripts\dev-run.ps1 -Release      # 同上，用 release 构建
-scripts\ui-shot.ps1 -Out shot.png # 截当前窗口（egui 需要截图，UI 自动化读不到）
-scripts\ship.ps1                  # 发布流程跑到产物就停：测试、构建、打包、装到本机
-scripts\ship.ps1 -Publish         # 同上，并在最后打标签、推 GitHub、上传附件
+.\scripts\dev-run.ps1               # 编译 + 重启 + 等到窗口真正出现，返回窗口坐标
+.\scripts\dev-run.ps1 -Release      # 同上，用 release 构建
+.\scripts\ui-shot.ps1 -Out shot.png # 截当前窗口（egui 需要截图，UI 自动化读不到）
+.\scripts\ship.ps1                  # 发布流程跑到产物就停：测试、构建、打包、装到本机
+.\scripts\ship.ps1 -Publish         # 同上，并在最后打标签、推 GitHub、上传附件
 ```
 
 ## 许可

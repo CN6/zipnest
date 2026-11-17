@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Rebuild and relaunch zipnest-native in one call, returning once the window exists.
@@ -187,4 +187,4 @@ $r = New-Object W32DevRun+RECT
 [void][W32DevRun]::GetWindowRect($hwnd, [ref]$r)
 Write-Output ("pid={0} hwnd={1} rect={2},{3} {4}x{5}" -f `
     $proc.Id, $hwnd, $r.Left, $r.Top, ($r.Right - $r.Left), ($r.Bottom - $r.Top))
-Write-Output ("ready: powershell -File scripts\ui-shot.ps1 -ProcessId {0} -Out shot.png" -f $proc.Id)
+Write-Output ("ready: pwsh -File scripts\ui-shot.ps1 -ProcessId {0} -Out shot.png" -f $proc.Id)

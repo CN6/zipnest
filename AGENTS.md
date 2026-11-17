@@ -51,7 +51,14 @@ otherwise violate. Read it first, every session.
 
 ## Dev-loop gotchas
 
-- PowerShell 5.1 starts each shell plain: run `[Console]::OutputEncoding=[Text.Encoding]::UTF8` and prepend `$env:USERPROFILE\.cargo\bin` to `$env:Path` before cargo/pnpm.
+- **This project runs on PowerShell 7 (`pwsh`), not Windows PowerShell 5.1.** Every
+  command in this file, the `.ps1` scripts under `scripts\` and `packaging\`, and
+  anything a session types should invoke `pwsh`. The 5.1 notes further down are
+  history: they explain why certain guards exist, not the engine to use now.
+- `pwsh` starts each shell plain too: run `[Console]::OutputEncoding=[Text.UTF8Encoding]::new()`
+  and prepend `$env:USERPROFILE\.cargo\bin` to `$env:Path` before cargo/pnpm. Without
+  the first line, Chinese written by a script reaches the caller as GBK mojibake
+  even on 7 — its default pipe encoding is still the system code page.
 - The UI is egui/eframe, not Tauri: there is **no** hot reload for either Rust or
   UI code. Rebuild and relaunch (`cargo run -p zipnest-native`) to see a change;
   the window's state does not survive that restart.
@@ -60,8 +67,8 @@ otherwise violate. Read it first, every session.
 ## Scripts (use these instead of retyping the loop)
 
 Every step below used to be hand-typed on each iteration, which is where most of
-the wall-clock time in a session went. All four live in `scripts\` and are
-PowerShell 5.1-compatible:
+the wall-clock time in a session went. All four live in `scripts\` and run on
+PowerShell 7 (`pwsh`):
 
 - `scripts\dev-run.ps1 [-Release] [-NoBuild] [-ExtraArgs <path>]` — kills the
   running instance, rebuilds, relaunches and **waits for the real window**: it
@@ -208,10 +215,11 @@ still a 404, so the first `-Publish` run creates it.
 - **Scripts and JSON this agent writes**: the editor tool drops a leading `#`
   from the first line (`#Requires -Version 5.1` came out as
   `Requires -Version 5.1` and PowerShell refused to parse it) and strips a UTF-8
-  BOM. Both matter here: PowerShell 5.1 reads a BOM-less `.ps1` as ANSI, so
-  Chinese literals/regexes silently break, and `installer.nsi` needs its BOM or
+  BOM. Both mattered under 5.1: it read a BOM-less `.ps1` as ANSI, so Chinese
+  literals/regexes broke silently; under `pwsh` 7 the default is UTF-8 without a
+  BOM, so a BOM-less script is fine — but `installer.nsi` still needs its BOM or
   makensis aborts. After writing a script, check the first bytes and the first
-  line.
+  line anyway; a dropped leading `#` is still fatal.
 - **Never round-trip a repo file through PowerShell's text cmdlets**: `Get-Content`
   / `Set-Content` default to ANSI here (GBK), so `(Get-Content x -Raw) -replace …
   | Set-Content -Encoding UTF8 x` turned every em dash in `AGENTS.md` and
@@ -309,10 +317,12 @@ still a 404, so the first `-Publish` run creates it.
   (`%TEMP%\…`) — that is also why `--register-integration` prints nothing and
   exits 0 on a dev build.
 - **Packaging scripts must tolerate cargo's stderr**: `build-package.ps1` sets
-  `$ErrorActionPreference = 'Stop'`, and PowerShell 5.1 turns a native command's
-  stderr into a terminating error — so the benign LNK4104 linker warning on the
-  shell DLL's COM exports aborted the MSIX build and left the portable payload
-  incomplete. The cargo call is wrapped with a local `Continue` preference.
+  `$ErrorActionPreference = 'Stop'`, and Windows PowerShell 5.1 turns a native
+  command's stderr into a terminating error — so the benign LNK4104 linker
+  warning on the shell DLL's COM exports aborted the MSIX build and left the
+  portable payload incomplete. The cargo call is wrapped with a local `Continue`
+  preference. Under `pwsh` 7 stderr no longer terminates, but the guard is kept:
+  it is harmless and it still protects a hand-run with `powershell.exe`.
 - **Opening an archive pins it until it is closed** (v0.4.11). `Archive` frees
   its 7z handler, source file handle and password in `Drop`, and
   `ArchiveRegistry` had no removal path at all — a browsing session leaked one
@@ -386,7 +396,8 @@ still a 404, so the first `-Publish` run creates it.
   by default; before the fix the whole document failed to parse, the store fell
   back to defaults and the next save wrote those over every preference. Note
   this shell is **Windows PowerShell 5.1**: `Set-Content -Encoding UTF8` adds a
-  BOM, so use the `write` tool or `-Encoding utf8NoBOM` for JSON fixtures here.
+  BOM, so use the `write` tool, or (`pwsh` 7 only) `-Encoding utf8NoBOM` for JSON
+  fixtures here. `-Encoding UTF8` on 7 writes no BOM, unlike 5.1.
 - **Startup flash**: Windows applies the window size roughly 0.3 s after the
   window becomes visible, so a 16x16 square can be seen briefly on restore.
   Creating the window hidden (`with_visible(false)`) and showing it with

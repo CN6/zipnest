@@ -3,7 +3,7 @@ Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME "ZipNest"
-!define VERSION "0.5.0"
+!define VERSION "0.5.1"
 ; This installer is a 32-bit process, so plain $PROGRAMFILES would resolve to
 ; "C:\Program Files (x86)" on 64-bit Windows. ZipNest ships as x64, so force
 ; the 64-bit location. InstallDirRegKey below still reads HKCU\...\ZipNest's
@@ -77,7 +77,7 @@ Unicode True
 !macroend
 
 Name "${APPNAME}"
-OutFile "ZipNest_0.5.0_x64-setup.exe"
+OutFile "ZipNest_0.5.1_x64-setup.exe"
 InstallDir "${INSTDIR}"
 InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -86,7 +86,7 @@ SetCompressor /SOLID lzma
 ; The setup exe's own version resource. Without this, right-click → 属性 →
 ; 详细信息 on the downloaded installer shows no version at all, so two downloads
 ; from different releases look identical in Explorer.
-VIProductVersion "0.5.0.0"
+VIProductVersion "0.5.1.0"
 VIAddVersionKey "ProductName" "ZipNest"
 VIAddVersionKey "FileDescription" "ZipNest 安装程序"
 VIAddVersionKey "FileVersion" "${VERSION}"
@@ -463,12 +463,27 @@ Function RegisterWin11Shell
   ReadRegStr $0 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "CurrentBuildNumber"
   IntCmpU $0 22000 do_register skip_register do_register
 do_register:
+  ; PowerShell 7 only: resolve pwsh (preferring the non-Store install, so it
+  ; also appears in %PATH%; the Store/WindowsApps copy is protected). A machine
+  ; without 7 falls back to powershell.exe rather than to an empty command:
+  ; nsExec with a blank executable name starts nothing at all, which would
+  ; skip the context menu with no visible error.
+  ; $0 is free here: it held CurrentBuildNumber, which the IntCmpU above has
+  ; already consumed. $R0-$R3 are also untouched at this point.
+  StrCpy $0 'powershell.exe'
+  IfFileExists "$PROGRAMFILES64\PowerShell\7\pwsh.exe" 0 check_pwsh_store
+    StrCpy $0 '"$PROGRAMFILES64\PowerShell\7\pwsh.exe"'
+    Goto reg_exec
+check_pwsh_store:
+  IfFileExists "$LOCALAPPDATA\Microsoft\WindowsApps\pwsh.exe" 0 reg_exec
+    StrCpy $0 "pwsh"
+reg_exec:
   ; This one still waits for PowerShell (its exit code decides whether we warn),
   ; and `Add-AppxPackage` can stall on a broken AppX deployment store. The line
   ; below is deliberate: if a user ever reports a stuck install again, the
   ; Details pane must show whether it stalled here or in the step above.
   DetailPrint "注册 Windows 11 右键菜单…"
-  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Win11Shell\install.ps1" -InstallDir "$INSTDIR" -PackageDir "$INSTDIR\Win11Shell"'
+  nsExec::ExecToLog '$0 -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Win11Shell\install.ps1" -InstallDir "$INSTDIR" -PackageDir "$INSTDIR\Win11Shell"'
   Pop $0
   DetailPrint "Windows 11 右键菜单注册返回码：$0"
   ; Certificate import / Add-AppxPackage failures used to be swallowed, so the
@@ -488,7 +503,17 @@ Function un.UnregisterWin11Shell
   ReadRegStr $0 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "CurrentBuildNumber"
   IntCmpU $0 22000 do_unregister skip_unregister do_unregister
 do_unregister:
-  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Win11Shell\uninstall.ps1" -PackageDir "$INSTDIR\Win11Shell"'
+  ; Same pwsh resolution as RegisterWin11Shell, and the same powershell.exe
+  ; fallback: an empty first token makes nsExec start nothing.
+  StrCpy $0 'powershell.exe'
+  IfFileExists "$PROGRAMFILES64\PowerShell\7\pwsh.exe" 0 un_check_pwsh_store
+    StrCpy $0 '"$PROGRAMFILES64\PowerShell\7\pwsh.exe"'
+    Goto un_do_exec
+un_check_pwsh_store:
+  IfFileExists "$LOCALAPPDATA\Microsoft\WindowsApps\pwsh.exe" 0 un_do_exec
+    StrCpy $0 "pwsh"
+un_do_exec:
+  nsExec::ExecToLog '$0 -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Win11Shell\uninstall.ps1" -PackageDir "$INSTDIR\Win11Shell"'
   Pop $0
   ; Common on upgrades from an older release: uninstall.ps1 was never shipped,
   ; so the script cannot run. Files are still removed below, so just report it.

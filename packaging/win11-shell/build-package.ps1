@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Builds the ZipNest.Shell sparse MSIX package (Windows 11 modern context menu).
@@ -45,11 +45,13 @@ function Find-MakeAppx {
 Write-Host 'Building zipnest-shell (release)...'
 Push-Location $repo
 try {
-    # cargo writes progress and warnings to stderr, and PowerShell 5.1 turns a
-    # native command's stderr into a *terminating* error under the
+    # cargo writes progress and warnings to stderr, and Windows PowerShell 5.1
+    # turns a native command's stderr into a *terminating* error under the
     # `$ErrorActionPreference = 'Stop'` above -- so a single benign linker
     # warning (LNK4104 on the COM exports) aborted the whole packaging run and
-    # left the MSIX unbuilt. The exit code is what decides here.
+    # left the MSIX unbuilt. The exit code is what decides here. The guard is
+    # kept under pwsh 7 as well: it is harmless there, and this script may still
+    # be run by 5.1 if a user invokes it by hand with `powershell.exe`.
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {

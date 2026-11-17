@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     The whole Windows release for one already-bumped version, in one call.
@@ -128,7 +128,7 @@ if ($dirty) {
 
 # ------------------------------------------------------- 1. version agreement
 Step 'version strings agree (packaging\check-versions.ps1)'
-$cv = Invoke-Native powershell @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $repo 'packaging\check-versions.ps1'))
+$cv = Invoke-Native pwsh @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $repo 'packaging\check-versions.ps1'))
 $cv.Output | ForEach-Object { Write-Host "  $_" }
 if ($cv.Code -ne 0) { Fail 'check-versions.ps1 reported a mismatch; fix step 1 of AGENTS.md first' }
 
@@ -196,7 +196,7 @@ Step 'emit portable payload (packaging\emit-portable.ps1)'
 if ($SkipPayload) {
     Warn 'payload reused from dist-portable (-SkipPayload)'
 } else {
-    $ep = Invoke-Native powershell @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $repo 'packaging\emit-portable.ps1'))
+    $ep = Invoke-Native pwsh @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $repo 'packaging\emit-portable.ps1'))
     $ep.Output | ForEach-Object { Write-Host "  $_" }
     if ($ep.Code -ne 0) { Fail 'emit-portable.ps1 failed' }
 }

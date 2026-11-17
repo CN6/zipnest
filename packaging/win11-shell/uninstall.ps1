@@ -1,4 +1,7 @@
 #Requires -Version 5.1
+# Runs under whichever engine the caller provides: the installer prefers pwsh 7
+# and falls back to Windows PowerShell 5.1 on machines without it, so keep this
+# file 5.1-compatible unless that fallback is deliberately removed.
 <#
 .SYNOPSIS
     Removes the ZipNest Windows 11 context-menu integration for the current user.

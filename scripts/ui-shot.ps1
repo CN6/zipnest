@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Capture one window to a PNG, and print its rect so the numbers are usable.
@@ -32,10 +32,10 @@
     When several windows match, take the largest by area. Default behaviour.
 
 .EXAMPLE
-    powershell -File scripts\ui-shot.ps1 -Out shot.png
+    pwsh -File scripts\ui-shot.ps1 -Out shot.png
 
 .EXAMPLE
-    powershell -File scripts\ui-shot.ps1 -ClientOnly -Out client.png
+    pwsh -File scripts\ui-shot.ps1 -ClientOnly -Out client.png
 #>
 [CmdletBinding()]
 param(

@@ -212,6 +212,8 @@ struct UpdateShared {
     /// Last check attempt, for [`AUTO_CHECK_INTERVAL`]. Recorded even when the
     /// check failed, so an offline machine does not retry on every launch.
     last_check: Option<std::time::Instant>,
+    /// Identifies the check currently allowed to publish a result.
+    check_generation: u64,
 }
 
 type UpdateHandle = Arc<Mutex<UpdateShared>>;
@@ -513,7 +515,9 @@ fn release_default_formats(list: &[String]) -> Vec<String> {
 /// when there was nothing to report, and a failed check (no network) popped an
 /// error dialog nobody asked for. The background thread therefore leaves the
 /// state alone while it works, and only writes `Found`; "no update" and "the
-/// request failed" are both non-events on that path.
+/// request failed" are both non-events on that path. A manual check that finds
+/// no newer version instead writes a one-shot `Notice`, so the user gets the
+/// explicit "you're up to date" feedback they asked for.
 ///
 /// What changed in v0.5.0: the release is discovered from a **signed static
 /// manifest** rather than `api.github.com`, whose unauthenticated budget is 60
@@ -522,40 +526,76 @@ fn release_default_formats(list: &[String]) -> Vec<String> {
 /// have nothing to do with the firewall. See
 /// `crates/zipnest-update/src/manifest.rs`. The silent path is unchanged, and now
 /// also respects [`AUTO_CHECK_INTERVAL`].
+fn no_update_state(manual: bool, lang: &str) -> Option<UpdateState> {
+    manual.then(|| UpdateState::Notice(i18n::tr(lang, "update.latest")))
+}
+
+/// Reserve an update-check generation before starting its worker.
+fn claim_update_check(
+    shared: &mut UpdateShared,
+    manual: bool,
+    interval: Option<std::time::Duration>,
+) -> Option<u64> {
+    if !manual
+        && shared
+            .last_check
+            .is_some_and(|t| t.elapsed() < interval.unwrap_or(AUTO_CHECK_INTERVAL))
+    {
+        return None;
+    }
+    if !matches!(shared.state, UpdateState::Idle) {
+        return None;
+    }
+    shared.check_generation = shared.check_generation.wrapping_add(1);
+    if manual {
+        shared.state = UpdateState::Checking;
+    }
+    Some(shared.check_generation)
+}
+
+/// Whether a worker still owns the state it is allowed to publish into.
+fn can_publish_check(shared: &UpdateShared, generation: u64, manual: bool) -> bool {
+    shared.check_generation == generation
+        && if manual {
+            matches!(shared.state, UpdateState::Checking)
+        } else {
+            matches!(shared.state, UpdateState::Idle)
+        }
+}
+
+/// Spawn the background work for a manual or automatic update check.
 fn spawn_update_check(
     update: UpdateHandle,
     manual: bool,
     interval: Option<std::time::Duration>,
+    lang: String,
     repaint: egui::Context,
 ) {
+    let generation = {
+        let mut g = update.lock().unwrap();
+        // Claim the idle state before spawning so two quick clicks cannot start
+        // overlapping manual checks. Automatic checks remain visually silent,
+        // but they still own a generation so a manual result cannot be hidden
+        // by an older automatic worker.
+        let Some(generation) = claim_update_check(&mut g, manual, interval) else {
+            return;
+        };
+        generation
+    };
+    if manual {
+        // The guard must be released before waking the UI: the repaint handler
+        // runs on the UI thread and would block on this same mutex otherwise.
+        repaint.request_repaint();
+    }
     std::thread::spawn(move || {
-        {
-            let mut g = update.lock().unwrap();
-            // The automatic path skips a check that is still fresh, and never
-            // disturbs a state the user is looking at.
-            if !manual
-                && g.last_check
-                    .is_some_and(|t| t.elapsed() < interval.unwrap_or(AUTO_CHECK_INTERVAL))
-            {
-                return;
-            }
-            if !manual && !matches!(g.state, UpdateState::Idle) {
-                return;
-            }
-            if manual {
-                g.state = UpdateState::Checking;
-                drop(g);
-                // The guard must be released before waking the UI: the repaint
-                // handler runs on the UI thread and would block on this same
-                // mutex if it locked before we let go.
-                repaint.request_repaint();
-            }
-        }
         let agent = zipnest_update::manifest_agent();
-        let lang = i18n::os_language();
-        let result = zipnest_update::check(&agent, UPDATE_UA.as_str(), CURRENT_VERSION, lang);
+        let result = zipnest_update::check(&agent, UPDATE_UA.as_str(), CURRENT_VERSION, &lang);
         let mut g = update.lock().unwrap();
         g.last_check = Some(std::time::Instant::now());
+        // A worker may finish after its dialog was dismissed or after a newer
+        // check claimed the handle. Only the still-current worker may publish,
+        // and a manual result must still have its Checking dialog on screen.
+        let can_publish = can_publish_check(&g, generation, manual);
         let mut changed = false;
         match result {
             // An automatic check may write `Found` only if nothing has happened
@@ -563,8 +603,8 @@ fn spawn_update_check(
             // user may have run a manual check and started a download in the
             // meantime. Overwriting that with a stale `Found` hid the progress
             // dialog for up to STALL_TIMEOUT.
-            Ok(Some(offer)) if manual || matches!(g.state, UpdateState::Idle) => {
-                let notes = offer.notes(lang).to_string();
+            Ok(Some(offer)) if can_publish => {
+                let notes = offer.notes(&lang).to_string();
                 // A portable copy cannot be updated in place: installing would
                 // put a second copy in Program Files while the user keeps
                 // launching the old exe. `start_install` refuses too, but by
@@ -588,13 +628,15 @@ fn spawn_update_check(
             }
             Ok(Some(_)) => {}
             Ok(None) => {
-                if manual {
-                    g.state = UpdateState::Idle;
-                    changed = true;
+                if can_publish {
+                    if let Some(state) = no_update_state(manual, &lang) {
+                        g.state = state;
+                        changed = true;
+                    }
                 }
             }
             Err(e) => {
-                if manual {
+                if can_publish && manual {
                     g.state = UpdateState::Failed(e.message_key().to_string());
                     changed = true;
                 }
@@ -608,6 +650,53 @@ fn spawn_update_check(
             repaint.request_repaint();
         }
     });
+}
+
+#[cfg(test)]
+mod update_check_tests {
+    use super::{
+        can_publish_check, claim_update_check, no_update_state, UpdateShared, UpdateState,
+    };
+
+    #[test]
+    fn automatic_no_update_is_silent() {
+        assert!(no_update_state(false, "zh-CN").is_none());
+        assert!(no_update_state(false, "en-US").is_none());
+    }
+
+    #[test]
+    fn manual_no_update_shows_a_localized_notice() {
+        let Some(UpdateState::Notice(text)) = no_update_state(true, "zh-CN") else {
+            panic!("manual check should show a notice");
+        };
+        assert_eq!(text, "当前已是最新版本");
+
+        let Some(UpdateState::Notice(text)) = no_update_state(true, "en-US") else {
+            panic!("manual check should show a notice");
+        };
+        assert_eq!(text, "You're up to date");
+    }
+
+    #[test]
+    fn a_manual_check_claims_idle_once() {
+        let mut shared = UpdateShared::default();
+        let first = claim_update_check(&mut shared, true, None);
+        assert_eq!(first, Some(1));
+        assert!(matches!(shared.state, UpdateState::Checking));
+        assert_eq!(claim_update_check(&mut shared, true, None), None);
+    }
+
+    #[test]
+    fn stale_or_dismissed_checks_cannot_publish() {
+        let mut shared = UpdateShared::default();
+        let automatic = claim_update_check(&mut shared, false, None).unwrap();
+        let manual = claim_update_check(&mut shared, true, None).unwrap();
+        assert!(!can_publish_check(&shared, automatic, false));
+        assert!(can_publish_check(&shared, manual, true));
+
+        shared.state = UpdateState::Idle;
+        assert!(!can_publish_check(&shared, manual, true));
+    }
 }
 
 /// Download the installer for `version`, verify it, and report through `update`.
@@ -1643,9 +1732,10 @@ impl App {
             // window is idle, so without this wake the "new version" dialog
             // would not appear until the user happened to move the mouse.
             let wake = ctx.clone();
+            let check_lang = lang.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                spawn_update_check(check, false, None, wake);
+                spawn_update_check(check, false, None, check_lang, wake);
             });
         }
         // Wake the UI when a later launch leaves a request in the queue: egui
@@ -3261,6 +3351,7 @@ impl App {
                                 Arc::clone(&self.update),
                                 true,
                                 None,
+                                self.lang.clone(),
                                 ui.ctx().clone(),
                             );
                         }
@@ -4730,7 +4821,13 @@ impl App {
                         ui.label(self.t("update.checking"));
                     });
                 if !open {
-                    self.update.lock().unwrap().state = UpdateState::Idle;
+                    let mut g = self.update.lock().unwrap();
+                    // The worker may still be blocked in the network. Invalidate
+                    // its generation so a late response cannot reopen the dialog.
+                    if matches!(g.state, UpdateState::Checking) {
+                        g.check_generation = g.check_generation.wrapping_add(1);
+                        g.state = UpdateState::Idle;
+                    }
                 }
             }
             UpdateState::Found {

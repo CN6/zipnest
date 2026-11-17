@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+﻿#Requires -Version 7.0
 <#
 .SYNOPSIS
     Fails when a version number appears somewhere and disagrees with the rest.
@@ -21,7 +21,7 @@
       CHANGELOG.md                      newest "## v x.y.z" heading
 
 .EXAMPLE
-    powershell -File packaging\check-versions.ps1
+    pwsh -File packaging\check-versions.ps1
 #>
 [CmdletBinding()]
 param(

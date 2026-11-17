@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+﻿#Requires -Version 7.0
 <#
 .SYNOPSIS
     Builds dist-portable\ZipNest — the payload installer.nsi packages.
@@ -33,7 +33,7 @@
     abort the NSIS compile; this switch writes a short pointer file instead.
 
 .EXAMPLE
-    powershell -File packaging\emit-portable.ps1
+    pwsh -File packaging\emit-portable.ps1
 #>
 [CmdletBinding()]
 param(
