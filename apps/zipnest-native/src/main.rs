@@ -1683,6 +1683,18 @@ struct App {
     /// Row index the last plain or Ctrl click landed on, for Shift ranges. It
     /// indexes the *sorted* list, so sorting or navigating clears it.
     anchor: Option<usize>,
+    /// Keyboard cursor: the row the arrow keys last landed on. Separate from
+    /// [`Self::anchor`] on purpose — the anchor is where a Shift range started,
+    /// the cursor is where focus is now, and Explorer keeps them apart too.
+    /// `None` until the first key press, so mouse-only users never see a ring.
+    cursor: Option<usize>,
+    /// Draw the focus ring? True only while the keyboard is driving the list;
+    /// any mouse click in the list turns it off, which is the "keyboard ring
+    /// appears only after keyboard use" rule.
+    keyboard_nav: bool,
+    /// The row context menu that is on screen, if any. Rebuilt every frame so
+    /// it survives the row scrolling out of the visible range.
+    row_menu_click: Option<RowMenu>,
     error: Option<String>,
     notice: Option<String>,
     /// Backup path of a settings file that could not be parsed at startup, so
@@ -2001,6 +2013,9 @@ impl App {
             sort_key: SortKey::Name,
             sort_asc: true,
             anchor: None,
+            cursor: None,
+            keyboard_nav: false,
+            row_menu_click: None,
             error: None,
             notice: settings_backup
                 .as_ref()
@@ -3226,6 +3241,85 @@ impl App {
             // frame and let the painted badge stand in until a row's turn
             // comes, so a 10 000-entry directory cannot stall the UI thread.
             let mut icon_budget = Self::ICONS_PER_FRAME;
+            // Keyboard navigation runs before the rows are laid out, so the
+            // ring is drawn on the row it just moved to and `scroll_to_rect`
+            // sees the landing row this frame. The list is not an egui focus
+            // target (rows are `Sense::click()`), so egui's spatial navigation
+            // never competes for the arrow keys; a text field or dialog owning
+            // the keyboard turns the whole thing off instead.
+            let mut scroll_to_cursor = false;
+            // The rows are moved out of `self` below for the loop's duration,
+            // so keyboard navigation reads the list through a local copy of the
+            // length and the paths it needs; the selection it produces is
+            // assigned straight into `self`.
+            let nav_rows: Vec<String> = self.rows.iter().map(|e| e.path.clone()).collect();
+            let nav_is_dir: Vec<bool> = self.rows.iter().map(|e| e.is_dir).collect();
+            if !ui.ctx().egui_wants_keyboard_input()
+                && !self.show_extract
+                && !self.show_create
+                && !self.show_settings
+                && self.password_prompt.is_none()
+                && self.conflict_prompt.is_none()
+            {
+                // The shift state is read from `i.modifiers` (the live state
+                // for this frame), *not* from the event's own `modifiers`: the
+                // Shift key-down event itself arrives with `modifiers.shift`
+                // still false, and the arrow event that follows is the one that
+                // matters. Using the event's copy made Shift+Arrow behave like a
+                // plain move — the first version of this selected one row.
+                let (nav, shift, enter, space, mouse_moved) = ui.ctx().input(|i| {
+                    (
+                        i.events.iter().find_map(|e| match e {
+                            egui::Event::Key { key, pressed: true, .. } => {
+                                NavKey::from_key(*key)
+                            }
+                            _ => None,
+                        }),
+                        i.modifiers.shift,
+                        i.key_pressed(egui::Key::Enter),
+                        i.key_pressed(egui::Key::Space),
+                        i.pointer.any_pressed(),
+                    )
+                });
+                // A click anywhere takes the ring away: it is a keyboard
+                // affordance, and leaving it behind the pointer makes it read
+                // as a selection.
+                if mouse_moved {
+                    self.keyboard_nav = false;
+                }
+                let page = page_rows(ui.available_height(), Self::ROW_H);
+                if let Some(key) = nav {
+                    if let Some(target) = nav_target(self.cursor, key, nav_rows.len(), page) {
+                        let (cursor, anchor, sel) = apply_nav_selection(
+                            &nav_rows,
+                            self.cursor,
+                            self.anchor,
+                            target,
+                            shift,
+                        );
+                        self.cursor = Some(cursor);
+                        self.anchor = Some(anchor);
+                        self.selected = sel;
+                        self.keyboard_nav = true;
+                        scroll_to_cursor = true;
+                    }
+                } else if self.keyboard_nav && (enter || space) {
+                    if let Some(cur) = self.cursor.filter(|c| *c < nav_rows.len()) {
+                        let path = nav_rows[cur].clone();
+                        let is_dir = nav_is_dir[cur];
+                        if space {
+                            if !self.selected.remove(&path) {
+                                self.selected.insert(path.clone());
+                            }
+                            self.anchor = Some(cur);
+                        } else if is_dir {
+                            click_dir = Some(path);
+                        } else {
+                            dbl_file = Some(path);
+                        }
+                    }
+                }
+            }
             // The loop needs `&mut self` (icons) *and* the list that
             // `self.rows` owns. Copying the whole list every frame was the old
             // way out: a 10 000-entry directory cloned ~1 MB of paths and
@@ -3395,6 +3489,38 @@ impl App {
                             );
                         }
 
+                        // Secondary click: select the row it landed on (unless
+                        // it is already part of the selection, so a right-click
+                        // on one of five selected rows keeps all five) and open
+                        // the row menu there.
+                        if resp.secondary_clicked() {
+                            if !selected {
+                                self.selected.clear();
+                                self.selected.insert(e.path.clone());
+                                self.anchor = Some(i);
+                            }
+                            self.cursor = Some(i);
+                            self.keyboard_nav = false;
+                            self.row_menu_click = Some(RowMenu {
+                                at: resp
+                                    .interact_pointer_pos()
+                                    .unwrap_or_else(|| rect.left_bottom()),
+                                opened_at: ui.ctx().cumulative_frame_nr(),
+                                path: e.path.clone(),
+                                is_dir: e.is_dir,
+                                selection: self.selected.iter().cloned().collect(),
+                            });
+                        }
+                        // The keyboard focus ring: theme blue, 1px, only while
+                        // the keyboard is driving. Drawn over the row fill.
+                        if self.keyboard_nav && self.cursor == Some(i) {
+                            painter.rect_stroke(
+                                rect.shrink(1.0),
+                                egui::CornerRadius::same(4),
+                                egui::Stroke::new(1.0_f32, ui.visuals().hyperlink_color),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
                         if resp.double_clicked() && e.is_dir {
                             dbl = Some(e.path.clone());
                         } else if resp.double_clicked() {
@@ -3439,6 +3565,21 @@ impl App {
             // Put the list back before acting on a click: `navigate` replaces
             // `self.rows` itself, and selecting needs the field intact.
             self.rows = rows;
+            // The keyboard moved the cursor: bring its row into view. The
+            // scroll area's own `ui` is gone by now, so the request is queued on
+            // the context and applied on the next frame — invisible in practice,
+            // since a key press always repaints.
+            if scroll_to_cursor {
+                if let Some(cur) = self.cursor.filter(|c| *c < self.rows.len()) {
+                    let top = ui.cursor().top();
+                    let row_rect = egui::Rect::from_min_size(
+                        egui::pos2(ui.max_rect().left(), top + cur as f32 * Self::ROW_H),
+                        egui::vec2(ui.max_rect().width(), Self::ROW_H),
+                    );
+                    ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+                }
+            }
+            self.show_row_menu(ui.ctx());
             if let Some(d) = dbl.or(click_dir) {
                 self.navigate(&d);
             }
@@ -3446,6 +3587,82 @@ impl App {
                 self.open_entry(path);
             }
         });
+    }
+
+    /// One row's context menu: the actions a user reaches for without
+    /// double-clicking first.
+    ///
+    /// A persistent popup area, not `Response::context_menu`: the rows are laid
+    /// out by `ScrollArea::show_rows`, which only builds the visible range, so a
+    /// menu tied to one row's `Response` disappears the moment that row scrolls
+    /// out of the range. The popup is redrawn each frame from
+    /// [`Self::row_menu_click`] and closes on Escape, on a click outside it, or
+    /// when an item is chosen.
+    fn show_row_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.row_menu_click.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Area::new(egui::Id::unique("zipnest-row-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.at)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(200.0);
+                    let item = |ui: &mut egui::Ui, text: &str| -> bool {
+                        ui.add(
+                            egui::Button::new(text)
+                                .frame(false)
+                                .min_size(egui::vec2(190.0, 24.0)),
+                        )
+                        .clicked()
+                    };
+                    let open_label = self.t("rowmenu.open");
+                    if item(ui, &open_label) {
+                        if menu.is_dir {
+                            self.navigate(&menu.path);
+                        } else {
+                            self.open_entry(menu.path.clone());
+                        }
+                        open = false;
+                    }
+                    let extract_label = self.t("rowmenu.extract");
+                    if item(ui, &extract_label) {
+                        // The selection is already the scope the dialog reads.
+                        self.begin_extract_dialog();
+                        open = false;
+                    }
+                    let copy_label = if menu.selection.len() > 1 {
+                        self.t("rowmenu.copy_paths")
+                            .replace("{n}", &menu.selection.len().to_string())
+                    } else {
+                        self.t("rowmenu.copy_path")
+                    };
+                    if item(ui, &copy_label) {
+                        // Archive-internal paths — what the list shows — one per
+                        // line, so pasting into Explorer's address bar or a
+                        // shell gets the whole set.
+                        let mut paths: Vec<String> = menu.selection.to_vec();
+                        paths.sort();
+                        ui.ctx().copy_text(paths.join("\n"));
+                        self.notice = Some("rowmenu.copied".into());
+                        open = false;
+                    }
+                    // Clicking anywhere outside the popup dismisses it, the way
+                    // a real context menu behaves. The opening click itself is
+                    // skipped: it happened before this rect existed.
+                    let opening_frame = ui.ctx().cumulative_frame_nr() == menu.opened_at;
+                    if !opening_frame
+                        && ui.input(|i| i.pointer.any_click())
+                        && !ui.rect_contains_pointer(ui.max_rect())
+                    {
+                        open = false;
+                    }
+                });
+            });
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.row_menu_click = None;
+        }
     }
 
     /// Double-click on a file inside the archive: unpack just that entry into a
@@ -7547,5 +7764,216 @@ mod conflict_choice_tests {
             assert_ne!(i18n::tr("zh-CN", key), key, "zh-CN lacks {key}");
             assert_ne!(i18n::tr("en-US", key), key, "en-US lacks {key}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard navigation in the file list
+// ---------------------------------------------------------------------------
+
+/// The row context menu waiting to be drawn (or currently drawn).
+#[derive(Clone)]
+struct RowMenu {
+    at: egui::Pos2,
+    /// Frame the secondary click landed on. The click that opens the menu is
+    /// itself a pointer click *outside* the menu's rect (the rect did not exist
+    /// yet), so without this the popup closed on its own first frame.
+    opened_at: u64,
+    /// The row that was right-clicked.
+    path: String,
+    is_dir: bool,
+    /// Everything highlighted at the moment of the click.
+    selection: Vec<String>,
+}
+
+/// Which way a navigation key moves the cursor.
+///
+/// The mapping is plain data so the whole keyboard contract can be unit-tested
+/// without an egui context: the list itself owns the cursor (it is not an egui
+/// focus target), so the only thing worth pinning is where the key takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavKey {
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+}
+
+impl NavKey {
+    /// The key that produced this movement, if any. Space and Enter are not
+    /// movements and are handled by the caller.
+    fn from_key(key: egui::Key) -> Option<Self> {
+        match key {
+            egui::Key::ArrowUp => Some(NavKey::Up),
+            egui::Key::ArrowDown => Some(NavKey::Down),
+            egui::Key::Home => Some(NavKey::Home),
+            egui::Key::End => Some(NavKey::End),
+            egui::Key::PageUp => Some(NavKey::PageUp),
+            egui::Key::PageDown => Some(NavKey::PageDown),
+            _ => None,
+        }
+    }
+}
+
+/// Where a navigation key lands, given the current cursor, the list length and
+/// how many rows one page covers.
+///
+/// `?` in / `?` out: an empty list has no cursor, and the caller must not draw
+/// a focus ring over nothing. Every other case returns a row inside
+/// `0..len`; moving past either end stops at the end rather than wrapping,
+/// which is what Explorer and 7-Zip do (wrapping loses the user's place).
+fn nav_target(
+    current: Option<usize>,
+    key: NavKey,
+    len: usize,
+    page: usize,
+) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let last = len - 1;
+    let page = page.max(1);
+    let current = current.filter(|c| *c < len);
+    let next = match key {
+        NavKey::Up => current.map(|c| c.saturating_sub(1)).unwrap_or(0),
+        NavKey::Down => current.map(|c| (c + 1).min(last)).unwrap_or(0),
+        NavKey::Home => 0,
+        NavKey::End => last,
+        NavKey::PageUp => current.map(|c| c.saturating_sub(page)).unwrap_or(0),
+        NavKey::PageDown => current.map(|c| (c + page).min(last)).unwrap_or(last),
+    };
+    Some(next)
+}
+
+/// How many whole rows a page covers in a list `viewport_h` points tall.
+///
+/// At least one, so PgDn always makes progress even in a window squeezed below
+/// one row — a page key that does nothing looks broken.
+fn page_rows(viewport_h: f32, row_h: f32) -> usize {
+    if row_h <= 0.0 {
+        return 1;
+    }
+    ((viewport_h / row_h).floor() as usize).max(1)
+}
+
+/// Apply a cursor landing to the selection the way Explorer does: a plain
+/// move replaces the selection with the one row, a Shift move extends from the
+/// anchor (the row the selection started at) to the new one.
+///
+/// Returns the new `(cursor, anchor, selected paths)`; the caller assigns them.
+fn apply_nav_selection(
+    paths: &[String],
+    current: Option<usize>,
+    anchor: Option<usize>,
+    target: usize,
+    shift: bool,
+) -> (usize, usize, std::collections::HashSet<String>) {
+    let mut selected = std::collections::HashSet::new();
+    let (lo, hi, anchor_out) = if shift {
+        let start = anchor
+            .unwrap_or(current.unwrap_or(target))
+            .min(paths.len() - 1);
+        (start.min(target), start.max(target), start)
+    } else {
+        (target, target, target)
+    };
+    for path in &paths[lo..=hi] {
+        selected.insert(path.clone());
+    }
+    (target, anchor_out, selected)
+}
+
+#[cfg(test)]
+mod nav_tests {
+    use super::{apply_nav_selection, nav_target, page_rows, NavKey};
+
+    #[test]
+    fn arrows_move_one_row_and_stop_at_the_ends() {
+        assert_eq!(nav_target(None, NavKey::Down, 5, 3), Some(0));
+        assert_eq!(nav_target(Some(2), NavKey::Down, 5, 3), Some(3));
+        assert_eq!(nav_target(Some(4), NavKey::Down, 5, 3), Some(4), "no wrap");
+        assert_eq!(nav_target(Some(0), NavKey::Up, 5, 3), Some(0), "no wrap");
+        assert_eq!(nav_target(Some(3), NavKey::Up, 5, 3), Some(2));
+    }
+
+    #[test]
+    fn home_end_and_pages_are_clamped_and_never_wrap() {
+        assert_eq!(nav_target(Some(3), NavKey::Home, 10, 4), Some(0));
+        assert_eq!(nav_target(Some(3), NavKey::End, 10, 4), Some(9));
+        assert_eq!(nav_target(Some(5), NavKey::PageUp, 10, 4), Some(1));
+        assert_eq!(nav_target(Some(1), NavKey::PageUp, 10, 4), Some(0));
+        assert_eq!(nav_target(Some(5), NavKey::PageDown, 10, 4), Some(9));
+        assert_eq!(nav_target(Some(8), NavKey::PageDown, 10, 4), Some(9));
+        // From nothing, a page lands at the start / end respectively.
+        assert_eq!(nav_target(None, NavKey::PageUp, 10, 4), Some(0));
+        assert_eq!(nav_target(None, NavKey::PageDown, 10, 4), Some(9));
+        // A stale cursor past the end behaves like "no cursor".
+        assert_eq!(nav_target(Some(99), NavKey::Down, 5, 3), Some(0));
+    }
+
+    #[test]
+    fn an_empty_list_has_no_cursor() {
+        for key in [
+            NavKey::Up,
+            NavKey::Down,
+            NavKey::Home,
+            NavKey::End,
+            NavKey::PageUp,
+            NavKey::PageDown,
+        ] {
+            assert_eq!(nav_target(None, key, 0, 5), None);
+        }
+    }
+
+    #[test]
+    fn a_page_always_covers_at_least_one_row() {
+        assert_eq!(page_rows(260.0, 26.0), 10);
+        assert_eq!(page_rows(30.0, 26.0), 1);
+        assert_eq!(page_rows(10.0, 26.0), 1);
+        assert_eq!(page_rows(100.0, 0.0), 1, "a zero row height must not divide by zero");
+    }
+
+    fn row(name: &str) -> String {
+        name.to_string()
+    }
+
+    #[test]
+    fn a_plain_move_replaces_the_selection_with_the_landed_row() {
+        let rows: Vec<_> = ["a", "b", "c", "d"].iter().map(|n| row(n)).collect();
+        let (cursor, anchor, sel) = apply_nav_selection(&rows, Some(0), Some(0), 2, false);
+        assert_eq!(cursor, 2);
+        assert_eq!(anchor, 2);
+        assert_eq!(sel.len(), 1);
+        assert!(sel.contains("c"));
+    }
+
+    #[test]
+    fn a_shift_move_extends_from_the_anchor_in_both_directions() {
+        let rows: Vec<_> = ["a", "b", "c", "d", "e"].iter().map(|n| row(n)).collect();
+        // Anchor at 1, extend down to 3.
+        let (cursor, anchor, sel) = apply_nav_selection(&rows, Some(1), Some(1), 3, true);
+        assert_eq!((cursor, anchor), (3, 1));
+        let mut names: Vec<_> = sel.iter().cloned().collect();
+        names.sort();
+        assert_eq!(names, vec!["b", "c", "d"]);
+        // ... and back up from the same anchor to 0.
+        let (_, _, sel) = apply_nav_selection(&rows, Some(3), Some(1), 0, true);
+        let mut names: Vec<_> = sel.iter().cloned().collect();
+        names.sort();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_shift_move_with_nothing_selected_extends_from_the_landing_row() {
+        // No cursor and no anchor: the first keyboard action is a "from here"
+        // selection, so it selects exactly the row it lands on rather than
+        // dragging in everything above it.
+        let rows: Vec<_> = ["a", "b", "c"].iter().map(|n| row(n)).collect();
+        let (_, anchor, sel) = apply_nav_selection(&rows, None, None, 1, true);
+        assert_eq!(anchor, 1);
+        let names: Vec<_> = sel.iter().cloned().collect();
+        assert_eq!(names, vec!["b"]);
     }
 }
