@@ -4800,6 +4800,7 @@ dependencies = [
 name = "zipnest-native"
 version = "0.5.2"
 dependencies = [
+ "archive-core",
  "eframe",
  "egui",
  "embed-resource",

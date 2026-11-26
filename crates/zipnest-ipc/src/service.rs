@@ -1644,7 +1644,7 @@ mod tests {
                 ShellOptions {
                     associate: true,
                     context_menu: false,
-                    extensions: crate::shell::SUPPORTED_EXTENSIONS
+                    extensions: crate::shell::default_claim_extensions()
                         .iter()
                         .map(|e| (*e).to_string())
                         .collect(),

@@ -486,7 +486,7 @@ fn integration_plan(settings: &zipnest_ipc::Settings, force: bool) -> Option<She
         ShellOptions {
             associate: true,
             context_menu: true,
-            extensions: zipnest_ipc::shell::SUPPORTED_EXTENSIONS
+            extensions: zipnest_ipc::shell::default_claim_extensions()
                 .iter()
                 .map(|e| (*e).to_string())
                 .collect(),
@@ -529,7 +529,7 @@ fn apply_integration(
 fn claimed_extensions(list: &[String]) -> Vec<String> {
     let normalised = zipnest_ipc::shell::normalise_extensions(list);
     if normalised.is_empty() {
-        zipnest_ipc::shell::SUPPORTED_EXTENSIONS
+        zipnest_ipc::shell::default_claim_extensions()
             .iter()
             .map(|ext| (*ext).to_string())
             .collect()
@@ -5689,6 +5689,21 @@ impl App {
                                         ui.add_space(6.0);
                                         theme::hint(ui, &self.t("settings.shell.set_default.hint"));
                                     }
+                                    // B6: which formats ZipNest claims, one
+                                    // tick per extension. `assoc_extensions`
+                                    // existed in the settings model long before
+                                    // there was a way to see it; this is it.
+                                    // The open-with-only formats (.msi/.chm/.cab)
+                                    // are listed too, marked so, because a user
+                                    // who wonders "and .cab?" deserves an answer
+                                    // rather than a missing row.
+                                    theme::caption(ui, &self.t("settings.shell.formats"));
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("zipnest-assoc-grid")
+                                        .max_height(190.0)
+                                        .show(ui, |ui| {
+                                            self.assoc_grid(ui);
+                                        });
                                     ui.add_space(theme::FIELD_GAP);
                                     let menu_label = self.t("settings.shell.context_menu");
                                     ui.checkbox(&mut self.settings.context_menu, menu_label);
@@ -5763,6 +5778,94 @@ impl App {
                         );
                     });
             });
+    }
+
+    /// The per-format claim grid (B6).
+    ///
+    /// Ticking an extension writes it into `settings.assoc_extensions`, which is
+    /// what `save_settings` hands to `shell_register`: ticked → claimed as the
+    /// default handler, unticked → released. Open-with-only formats cannot be
+    /// ticked at all (their row says why): `.msi` must keep installing when
+    /// double-clicked, `.chm` must keep opening help.
+    fn assoc_grid(&mut self, ui: &mut egui::Ui) {
+        let open_with_only = archive_core::format::open_with_only();
+        let mut ticked: std::collections::HashSet<String> = self
+            .settings
+            .assoc_extensions
+            .iter()
+            .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
+            .collect();
+        // Empty means "everything a default claim may cover" (a fresh profile
+        // and the installer's own call); show it as such so a first-time user
+        // sees the real state rather than a wall of unticked boxes.
+        if ticked.is_empty() {
+            ticked = self
+                .settings
+                .assoc_extensions
+                .clone()
+                .into_iter()
+                .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
+                .collect();
+        }
+        let mut changed = false;
+        egui::Grid::new("zipnest-assoc-grid-layout")
+            .num_columns(4)
+            .spacing([18.0, 6.0])
+            .show(ui, |ui| {
+                for (i, row) in archive_core::FORMATS.iter().enumerate() {
+                    let ext = row.ext;
+                    if open_with_only.contains(&ext) {
+                        // Not a checkbox: an inert row with the reason, so the
+                        // absence is visible.
+                        ui.add_enabled(false, egui::Checkbox::new(&mut false, row.label));
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(".{ext}"))
+                                    .size(theme::TEXT_SMALL)
+                                    .color(theme::secondary(ui)),
+                            ),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(self.t("settings.shell.open_with_only"))
+                                    .size(theme::TEXT_TINY)
+                                    .color(theme::secondary(ui)),
+                            ),
+                        );
+                    } else {
+                        let mut on = ticked.contains(ext);
+                        let resp = ui.checkbox(&mut on, row.label);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(".{ext}"))
+                                    .size(theme::TEXT_SMALL)
+                                    .color(theme::secondary(ui)),
+                            ),
+                        );
+                        if resp.changed() {
+                            if on {
+                                ticked.insert(ext.to_string());
+                            } else {
+                                ticked.remove(ext);
+                            }
+                            changed = true;
+                        }
+                        ui.label("");
+                    }
+                    if i % 3 == 2 {
+                        ui.end_row();
+                    }
+                }
+            });
+        if changed {
+            // Stored as a sorted list in the canonical table order, which is
+            // what `normalise_extensions` produces anyway.
+            self.settings.assoc_extensions = archive_core::all_extensions()
+                .into_iter()
+                .filter(|e| ticked.contains(*e))
+                .map(str::to_string)
+                .collect();
+        }
     }
 
     /// The Settings page's header row: a Back button and the page title, drawn
@@ -5862,6 +5965,9 @@ impl App {
             Err(e) => self.notice = Some(e.key),
         }
         let _ = svc.settings_set(SettingsPatch {
+            assoc_extensions: Some(self.settings.assoc_extensions.clone()),
+            associate: Some(self.settings.associate),
+            context_menu: Some(self.settings.context_menu),
             language: Some(self.settings.language.clone()),
             default_extract_dir: Some(self.settings.default_extract_dir.clone()),
             preview_max_bytes: Some(self.settings.preview_max_bytes),
@@ -6474,32 +6580,20 @@ fn pretty_size(b: u64) -> String {
 
 /// Does this path name an archive ZipNest can open?
 ///
-/// A numeric suffix counts: the create wizard can split its output into
-/// numbered volumes, and the engine opens the set from any member. Recognising
-/// only the format extension meant dragging in a `.7z.001` the app had just
-/// produced offered to pack it into a new archive instead.
+/// The table lives in the engine (`archive_core::format`) so the drag-and-drop
+/// decision, the open dialog's filter and the registry claim cannot drift
+/// apart — three copies of this list is how `.zst` was unopenable while the
+/// engine supported it.
 fn looks_like_archive(path: &str) -> bool {
-    let p = std::path::Path::new(path);
-    let ext = p
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    if matches!(
-        ext.as_str(),
-        "zip" | "7z" | "rar" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "iso"
-    ) {
-        return true;
-    }
-    // `.001`, `.0001`, … — 7-Zip's Split handler needs at least two digits.
-    if ext.len() < 2 || !ext.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    // `<base>.<format>.001`: the part before the number has to be a format we
-    // know, otherwise `photo.001` (a raw photo sequence) would be swallowed.
-    p.file_stem()
-        .map(|s| s.to_string_lossy().to_lowercase())
-        .and_then(|s| s.rsplit('.').next().map(str::to_string))
-        .is_some_and(|inner| matches!(inner.as_str(), "zip" | "7z" | "rar" | "tar"))
+    archive_core::looks_like_archive(path)
+}
+
+/// The extension list the open dialog filters on: every format the engine can
+/// open, plus the numeric volume suffixes the create wizard can produce.
+fn open_dialog_extensions() -> Vec<&'static str> {
+    let mut v = archive_core::all_extensions();
+    v.extend(["001", "002", "003", "004", "005"]);
+    v
 }
 
 /// Color + short label used on the painted file icon, by extension.
@@ -7098,13 +7192,7 @@ impl eframe::App for App {
                 // `photos.7z.002`, and the engine opens the set from any
                 // member. Without these filters the app could not reopen what
                 // it had just written.
-                .add_filter(
-                    archives,
-                    &[
-                        "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "iso", "001", "002",
-                        "003",
-                    ],
-                )
+                .add_filter(archives, &open_dialog_extensions())
                 .pick_file()
             {
                 self.open_archive(path.to_str().unwrap_or(""));
@@ -8082,7 +8170,7 @@ mod integration_tests {
 
     /// Every extension we ship a handler for: what a fresh profile claims.
     fn all_exts() -> Vec<String> {
-        zipnest_ipc::shell::SUPPORTED_EXTENSIONS
+        zipnest_ipc::shell::default_claim_extensions()
             .iter()
             .map(|e| (*e).to_string())
             .collect()

@@ -7,11 +7,7 @@ use crate::com::propvariant::{
     KPID_ERROR_FLAGS, KPID_IS_DIR, KPID_MTIME, KPID_PATH, KPID_SIZE, VT_BOOL, VT_UI4, VT_UI8,
 };
 use crate::com::vtables::{InArchiveGetStreamVt, InArchiveVt, InStreamVt};
-use crate::com::{
-    CLSID_FORMAT_7Z, CLSID_FORMAT_BZIP2, CLSID_FORMAT_GZIP, CLSID_FORMAT_ISO, CLSID_FORMAT_RAR,
-    CLSID_FORMAT_RAR5, CLSID_FORMAT_SPLIT, CLSID_FORMAT_TAR, CLSID_FORMAT_XZ, CLSID_FORMAT_ZIP,
-    Guid, IID_IIN_ARCHIVE_GET_STREAM, S_OK,
-};
+use crate::com::{CLSID_FORMAT_SPLIT, CLSID_FORMAT_ZIP, Guid, IID_IIN_ARCHIVE_GET_STREAM, S_OK};
 use crate::dll;
 use crate::error::{hr_failed, ZipnestError};
 use crate::types::{ArchiveEntry, ArchiveOpenOptions, ExtractOptions, ExtractProgress, ExtractStats};
@@ -89,42 +85,22 @@ fn volume_base(path: &Path) -> Option<std::path::PathBuf> {
     Some(path.with_file_name(stem))
 }
 
-/// Candidate handler CLSIDs for a file path (first success wins). A trailing
-/// volume suffix is ignored so `<base>.7z.001` selects the 7z handler.
+/// Candidate handler CLSIDs for a file path (first success wins).
+///
+/// The extension proposes a handler; an unknown one proposes nothing, and the
+/// caller falls back to probing handlers against the *bytes* (see
+/// [`crate::format::signature_probe_order`]). A trailing volume suffix is
+/// ignored so `<base>.7z.001` selects the 7z handler.
 fn clsid_candidates(path: &Path) -> Vec<Guid> {
-    let name = path
+    let ext = path
         .file_name()
         .map(|n| {
             let lower = n.to_string_lossy().to_lowercase();
             strip_volume_suffix(&lower).unwrap_or(lower)
         })
+        .and_then(|name| name.rsplit('.').next().map(str::to_string))
         .unwrap_or_default();
-    if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".gz") {
-        return vec![CLSID_FORMAT_GZIP];
-    }
-    if name.ends_with(".7z") {
-        return vec![CLSID_FORMAT_7Z];
-    }
-    if name.ends_with(".rar") {
-        // RAR5 handler first; older RARs fall back to the legacy handler.
-        return vec![CLSID_FORMAT_RAR5, CLSID_FORMAT_RAR];
-    }
-    if name.ends_with(".tar") {
-        return vec![CLSID_FORMAT_TAR];
-    }
-    if name.ends_with(".zip") {
-        return vec![CLSID_FORMAT_ZIP];
-    }
-    if name.ends_with(".bz2") {
-        return vec![CLSID_FORMAT_BZIP2];
-    }
-    if name.ends_with(".xz") {
-        return vec![CLSID_FORMAT_XZ];
-    }
-    if name.ends_with(".iso") {
-        return vec![CLSID_FORMAT_ISO];
-    }
-    Vec::new()
+    crate::format::candidates_for(&ext)
 }
 
 impl Archive {
@@ -138,7 +114,20 @@ impl Archive {
         }
 
         let dll = dll::load()?;
-        let candidates = clsid_candidates(path);
+        let named = clsid_candidates(path);
+        // An extension the table does not know (or none at all) does not mean
+        // "not an archive": ask each handler whether the bytes are its own.
+        // This is what makes a `.docx` or an extensionless download open as
+        // what it really is. The signature order is *appended* after the
+        // extension's own candidate, never replacing it, so the common case
+        // costs one probe and a file whose extension lies still opens: the
+        // named handler rejects it, then the probe finds the real one.
+        let mut candidates = named.clone();
+        for c in crate::format::signature_probe_order() {
+            if !candidates.contains(&c) {
+                candidates.push(c);
+            }
+        }
         if candidates.is_empty() {
             return Err(ZipnestError::NotAnArchive);
         }
@@ -204,7 +193,19 @@ impl Archive {
                 (vt.release)(raw);
                 stream.release_own();
             }
-            last_err = map_open_error(hr, &state, error_flags);
+            let err = map_open_error(hr, &state, error_flags);
+            // A handler that recognised the file and asked for a password has
+            // answered the question. The signature probe that follows exists
+            // to find a handler for a file whose *extension* said nothing —
+            // letting an unrelated handler overwrite "password required" with
+            // "not an archive" would hide the only actionable answer.
+            if matches!(
+                err,
+                ZipnestError::PasswordRequired | ZipnestError::PasswordIncorrect
+            ) {
+                return Err(err);
+            }
+            last_err = err;
         }
         Err(last_err)
     }

@@ -9,7 +9,26 @@
 use serde::{Deserialize, Serialize};
 
 /// Archive extensions ZipNest can open, in the order the UI lists them.
-pub const SUPPORTED_EXTENSIONS: [&str; 9] =
+///
+/// Derived from the engine's format table, never typed here: the registry
+/// side and the open side answering "what can this app open" differently is
+/// exactly how `.zst`/`.cab` were unopenable while the engine supported them
+/// (A4). **The default claim excludes `.msi`/`.chm`/`.cab`**: double-clicking
+/// those means install / open help, so they only ever appear in ZipNest's
+/// 打开方式 list.
+pub fn supported_extensions() -> Vec<&'static str> {
+    archive_core::all_extensions()
+}
+
+/// Extensions that may be claimed as the default handler.
+pub fn default_claim_extensions() -> Vec<&'static str> {
+    archive_core::format::default_claim_extensions()
+}
+
+/// Extensions `assoc_ops_for`/`assoc_removals` manage: everything openable,
+/// including the open-with-only ones (their ProgIDs are written so Explorer's
+/// "open with" list names ZipNest). This is also the set a removal must clean.
+pub const SUPPORTED_EXTENSIONS_LEGACY: [&str; 9] =
     ["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "iso"];
 
 /// Which parts of the integration to (un)register.
@@ -88,14 +107,13 @@ fn prog_id(ext: &str) -> String {
 }
 
 /// Canonicalise a user-chosen extension list: lower case, only supported
-/// extensions, no duplicates, in [`SUPPORTED_EXTENSIONS`] order.
+/// extensions, no duplicates, in [`supported_extensions`] order.
 ///
 /// Used on the way in (settings) and on the way out (registry ops), so a
 /// hand-edited `settings.json` can never register something we do not ship a
 /// handler for.
 pub fn normalise_extensions(list: &[String]) -> Vec<String> {
-    SUPPORTED_EXTENSIONS
-        .iter()
+    supported_extensions().iter()
         .filter(|ext| {
             list.iter()
                 .any(|want| want.trim().trim_start_matches('.').eq_ignore_ascii_case(ext))
@@ -154,7 +172,8 @@ fn open_command(exe: &std::path::Path) -> String {
 ///   is the only place a user can hand it an extension whose `UserChoice`
 ///   already belongs to another program.
 pub fn assoc_ops(exe: &std::path::Path) -> Vec<RegOp> {
-    assoc_ops_for(exe, &SUPPORTED_EXTENSIONS)
+    // The default claim only, never the open-with-only formats.
+    assoc_ops_for(exe, &default_claim_extensions())
 }
 
 /// Same, for a chosen subset of extensions.
@@ -205,7 +224,7 @@ pub fn assoc_ops_for(exe: &std::path::Path, exts: &[&str]) -> Vec<RegOp> {
     // unticking a box really gives that extension back (only while the recorded
     // default is ours -- never someone else's value). ZipNest stays listed in
     // "打开方式" and in 默认应用 for them, which is how the user can come back.
-    for ext in SUPPORTED_EXTENSIONS {
+    for ext in supported_extensions() {
         if exts.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
             continue;
         }
@@ -233,7 +252,7 @@ pub fn assoc_ops_for(exe: &std::path::Path, exts: &[&str]) -> Vec<RegOp> {
         None,
         "ZipNest archive manager",
     ));
-    for ext in SUPPORTED_EXTENSIONS {
+    for ext in supported_extensions() {
         ops.push(RegOp::set(
             format!(r"{CAPABILITIES}\FileAssociations\.{ext}"),
             None,
@@ -260,7 +279,7 @@ pub fn assoc_ops_for(exe: &std::path::Path, exts: &[&str]) -> Vec<RegOp> {
 /// user's `UserChoice`).
 pub fn assoc_removals() -> Vec<RegOp> {
     let mut ops = Vec::new();
-    for ext in SUPPORTED_EXTENSIONS {
+    for ext in supported_extensions() {
         let pid = prog_id(ext);
         ops.push(RegOp::DeleteValueIfEquals {
             key: format!(r"{CLASSES}\.{ext}"),
@@ -298,7 +317,7 @@ pub fn assoc_removals() -> Vec<RegOp> {
 /// Returns `(ext, reason)` for the releases that failed, mirroring
 /// [`crate::user_choice::claim_all`] so callers report both the same way.
 pub fn release_defaults() -> Vec<(String, String)> {
-    release_defaults_for(SUPPORTED_EXTENSIONS)
+    release_defaults_for(supported_extensions())
 }
 
 /// [`release_defaults`] over an explicit extension list, for the Settings dialog
@@ -529,13 +548,12 @@ impl AssocState {
     }
 }
 
-/// The full per-extension picture, in [`SUPPORTED_EXTENSIONS`] order.
+/// The full per-extension picture, in [`supported_extensions`] order.
 ///
 /// This is what makes the Settings dialog honest: a tick in a checkbox means
 /// "asked for", while this says what Windows actually resolved.
 pub fn assoc_states(probe: &dyn AssocProbe) -> Vec<AssocState> {
-    SUPPORTED_EXTENSIONS
-        .iter()
+    supported_extensions().iter()
         .map(|ext| {
             let registered = probe
                 .classes_default(ext)
@@ -560,8 +578,7 @@ pub fn assoc_states(probe: &dyn AssocProbe) -> Vec<AssocState> {
 /// [`assoc_ops`] alone cannot take effect — [`crate::user_choice::claim_all`] is
 /// what actually takes them over.
 pub fn blocked_extensions(probe: &dyn AssocProbe) -> Vec<String> {
-    SUPPORTED_EXTENSIONS
-        .iter()
+    supported_extensions().iter()
         .filter(|ext| user_choice_blocks(ext, probe.user_choice_progid(ext).as_deref()))
         .map(|ext| (*ext).to_string())
         .collect()
@@ -918,7 +935,7 @@ mod tests {
     #[test]
     fn assoc_makes_zipnest_the_default_handler() {
         let ops = assoc_ops(exe());
-        for ext in SUPPORTED_EXTENSIONS {
+        for ext in default_claim_extensions() {
             let pid = prog_id(ext);
             // The extension's default value points at our ProgID, and the
             // ProgID's open command is quoted.
@@ -933,9 +950,9 @@ mod tests {
     }
 
     #[test]
-    fn assoc_covers_every_supported_extension() {
+    fn assoc_covers_every_default_claimed_extension() {
         let ops = assoc_ops(exe());
-        for ext in SUPPORTED_EXTENSIONS {
+        for ext in default_claim_extensions() {
             let key = format!(r"HKCU\Software\Classes\ZipNest.{ext}\shell\open\command");
             assert!(find_set(&ops, &key, None).is_some(), "missing {ext}");
         }
@@ -945,7 +962,13 @@ mod tests {
     fn assoc_removals_drop_the_same_progids() {
         let adds = assoc_ops(exe());
         let removals = assoc_removals();
-        for ext in SUPPORTED_EXTENSIONS {
+        for ext in supported_extensions() {
+            if !default_claim_extensions().contains(&ext) {
+                // Open-with-only formats have no default claim to remove, but
+                // their ProgID tree must still be cleaned: it is written by the
+                // per-extension path, not by `assoc_ops`.
+                continue;
+            }
             let pid = prog_id(ext);
             assert!(adds.iter().any(|o| matches!(o, RegOp::SetValue { key, .. } if key == &format!(r"HKCU\Software\Classes\{pid}"))));
             assert!(removals.iter().any(|o| matches!(o, RegOp::DeleteKey { key } if key == &format!(r"HKCU\Software\Classes\{pid}"))));
@@ -958,7 +981,7 @@ mod tests {
         // *conditionally*: whatever the user picks after enabling ZipNest has
         // to survive an unregister.
         let removals = assoc_removals();
-        for ext in SUPPORTED_EXTENSIONS {
+        for ext in supported_extensions() {
             let pid = prog_id(ext);
             let key = format!(r"HKCU\Software\Classes\.{ext}");
             let default_at = removals
@@ -1096,7 +1119,7 @@ mod tests {
             find_set(&ops, r"HKCU\Software\Classes\Applications\zipnest.exe\FriendlyAppName", None),
             Some("ZipNest")
         );
-        for ext in SUPPORTED_EXTENSIONS {
+        for ext in default_claim_extensions() {
             let key = format!(r"HKCU\Software\Classes\Applications\zipnest.exe\SupportedTypes\.{ext}");
             assert_eq!(find_set(&ops, &key, None), Some(""), "missing SupportedTypes for .{ext}");
         }
@@ -1120,7 +1143,7 @@ mod tests {
             find_set(&ops, r"HKCU\Software\ZipNest\Capabilities\ApplicationName", None),
             Some("ZipNest")
         );
-        for ext in SUPPORTED_EXTENSIONS {
+        for ext in supported_extensions() {
             let key = format!(r"HKCU\Software\ZipNest\Capabilities\FileAssociations\.{ext}");
             assert_eq!(
                 find_set(&ops, &key, None),
@@ -1188,7 +1211,7 @@ mod tests {
         // Registered everywhere; Windows has locked .zip and .rar to Bandizip.
         let probe = probe_with("Bandizip.zip", &["zip", "rar"]);
         let states = assoc_states(&probe);
-        assert_eq!(states.len(), SUPPORTED_EXTENSIONS.len(), "one row per extension");
+        assert_eq!(states.len(), supported_extensions().len(), "one row per extension");
         let zip = states.iter().find(|s| s.ext == "zip").unwrap();
         assert!(zip.registered, "our Classes value is still in place");
         assert!(!zip.ours(), "but Windows will not use it");
@@ -1231,7 +1254,7 @@ mod tests {
         );
         // ... while the capabilities list still mentions all nine, so the user
         // can find ZipNest in "默认应用" for any of them.
-        for ext in SUPPORTED_EXTENSIONS {
+        for ext in supported_extensions() {
             let key = format!(r"HKCU\Software\ZipNest\Capabilities\FileAssociations\.{ext}");
             assert!(ops.iter().any(|o| matches!(o, RegOp::SetValue { key: k, .. } if k == &key)));
         }
@@ -1279,7 +1302,7 @@ mod tests {
         // that the live probe and the pure classifier never disagree.
         let probe = WindowsRegistry;
         let blocked = blocked_extensions(&probe);
-        for ext in SUPPORTED_EXTENSIONS {
+        for ext in supported_extensions() {
             let got = probe.user_choice_progid(ext);
             assert_eq!(
                 blocked.contains(&ext.to_string()),

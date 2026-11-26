@@ -6,6 +6,10 @@ license.workspace = true
 description = "ZipNest native UI (egui) — no WebView2"
 
 [dependencies]
+# The format table (`archive_core::format`) is the single source for "what can
+# this app open": the drag-and-drop decision, the open dialog's filter and the
+# registry claim all read it, so they cannot drift apart.
+archive-core = { path = "../../crates/archive-core" }
 zipnest-ipc = { path = "../../crates/zipnest-ipc" }
 zipnest-update = { path = "../../crates/zipnest-update" }
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit", "links", "system_fonts", "x11", "wayland", "clipboard"] }

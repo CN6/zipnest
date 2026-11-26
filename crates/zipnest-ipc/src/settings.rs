@@ -100,11 +100,12 @@ impl Default for Settings {
             default_extract_dir: String::new(),
             associate: true,
             context_menu: true,
-            // Explicitly all nine rather than an empty "means everything" list:
-            // the Settings dialog has a "none" state too, and a missing field in
-            // an older settings.json has to keep the old behaviour (everything
-            // claimed) instead of releasing every association.
-            assoc_extensions: crate::shell::SUPPORTED_EXTENSIONS
+            // Explicit, not an empty "means everything" list: the Settings
+            // dialog has a "none" state too, and a fresh profile has to start
+            // with every format a user means by "archive" claimed. The
+            // open-with-only formats (.msi/.chm/.cab) are deliberately absent:
+            // claiming those would change what double-clicking them does.
+            assoc_extensions: crate::shell::default_claim_extensions()
                 .iter()
                 .map(|e| (*e).to_string())
                 .collect(),

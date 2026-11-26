@@ -86,6 +86,33 @@ pub const CLSID_FORMAT_ISO: Guid = handler_guid(0xE7);
 pub const CLSID_FORMAT_SPLIT: Guid = handler_guid(0xEA);
 pub const CLSID_FORMAT_TAR: Guid = handler_guid(0xEE);
 pub const CLSID_FORMAT_GZIP: Guid = handler_guid(0xEF);
+// Handlers that ship inside 7z.dll but which the app did not expose until
+// A4 (2026-11-27). Numbers from `vendor/7zip-sdk/Guid.txt`.
+pub const CLSID_FORMAT_ZSTD: Guid = handler_guid(0x0E);
+pub const CLSID_FORMAT_ARJ: Guid = handler_guid(0x04);
+pub const CLSID_FORMAT_Z: Guid = handler_guid(0x05);
+pub const CLSID_FORMAT_LZH: Guid = handler_guid(0x06);
+pub const CLSID_FORMAT_CAB: Guid = handler_guid(0x08);
+pub const CLSID_FORMAT_LZMA: Guid = handler_guid(0x0A);
+pub const CLSID_FORMAT_LZMA86: Guid = handler_guid(0x0B);
+pub const CLSID_FORMAT_NSIS: Guid = handler_guid(0x09);
+pub const CLSID_FORMAT_APFS: Guid = handler_guid(0xC3);
+pub const CLSID_FORMAT_VHDX: Guid = handler_guid(0xC4);
+pub const CLSID_FORMAT_EXT: Guid = handler_guid(0xC7);
+pub const CLSID_FORMAT_VMDK: Guid = handler_guid(0xC8);
+pub const CLSID_FORMAT_QCOW: Guid = handler_guid(0xCA);
+pub const CLSID_FORMAT_HXS: Guid = handler_guid(0xCE);
+pub const CLSID_FORMAT_SQUASHFS: Guid = handler_guid(0xD2);
+pub const CLSID_FORMAT_VHD: Guid = handler_guid(0xDC);
+pub const CLSID_FORMAT_UDF: Guid = handler_guid(0xE0);
+pub const CLSID_FORMAT_XAR: Guid = handler_guid(0xE1);
+pub const CLSID_FORMAT_DMG: Guid = handler_guid(0xE4);
+pub const CLSID_FORMAT_COMPOUND: Guid = handler_guid(0xE5);
+pub const CLSID_FORMAT_WIM: Guid = handler_guid(0xE6);
+pub const CLSID_FORMAT_CHM: Guid = handler_guid(0xE9);
+pub const CLSID_FORMAT_RPM: Guid = handler_guid(0xEB);
+pub const CLSID_FORMAT_DEB: Guid = handler_guid(0xEC);
+pub const CLSID_FORMAT_CPIO: Guid = handler_guid(0xED);
 
 /// Object header: every COM object we hand to the engine starts with a
 /// vtable pointer.
