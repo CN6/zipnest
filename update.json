@@ -1,19 +1,19 @@
 {
   "assets": [
     {
-      "name": "ZipNest_0.5.2_x64-setup.exe",
-      "sha256": "33093dd2eb236aff1aa420b121721dfa783b65fe2fbda11e59d7af560bf3419a",
-      "size": 5225465
+      "name": "ZipNest_0.5.3_x64-setup.exe",
+      "sha256": "43afad6779da9260165685850f4cdfeb489a42e466bea56db6c1cf3ad963b3c1",
+      "size": 5283367
     },
     {
-      "name": "ZipNest_0.5.2_x64_portable.zip",
-      "sha256": "ac4d2e5ecff7a41baa495ef74d4e79cb92f8a41358ed45225e527789079f66cb",
-      "size": 6611286
+      "name": "ZipNest_0.5.3_x64_portable.zip",
+      "sha256": "a86749f9a38cdf5e2233eb7147594b3d8a65303819e3d4bf461ecdb571f836c5",
+      "size": 6699777
     }
   ],
-  "date": "2026-11-18",
+  "date": "2026-11-27",
   "min_version": "0.4.0",
-  "notes_en": "软件内更新一键到底，装完自己清理",
-  "notes_zh": "软件内更新一键到底，装完自己清理",
-  "version": "0.5.2"
+  "notes_en": "解压前先验一遍、能改压缩包、更多格式",
+  "notes_zh": "解压前先验一遍、能改压缩包、更多格式",
+  "version": "0.5.3"
 }
