@@ -42,6 +42,12 @@ pub struct Archive {
     /// 7z 没有这类校验值，错密钥会直接漏成 2/3，两者无法区分。
     /// 实测见 `crates/archive-core/src/extract.rs` 的 `map_op_res`。
     key_verified: bool,
+    /// The handler CLSID that actually opened this file.
+    ///
+    /// `container_name` reads it: the extension can lie (a 7z named `.zip`, a
+    /// `.docx` that is a zip), and "can this be edited" must be answered from
+    /// what the engine decoded, not from the name on disk.
+    clsid: Option<Guid>,
     _not_send: *mut (),  // keep !Send/!Sync: IInArchive is not thread-safe
 }
 
@@ -184,6 +190,7 @@ impl Archive {
                     stream: stream.into_raw(),
                     entries: OnceLock::new(),
                     key_verified: key_verified_for(clsid),
+                    clsid: Some(*clsid),
                     _not_send: std::ptr::null_mut(),
                 });
             }
@@ -314,6 +321,7 @@ impl Archive {
                     stream: combined,
                     entries: OnceLock::new(),
                     key_verified: key_verified_for(clsid),
+                    clsid: Some(*clsid),
                     _not_send: std::ptr::null_mut(),
                 });
             }
@@ -467,6 +475,47 @@ impl Archive {
         progress: &mut dyn FnMut(&ExtractProgress) -> bool,
     ) -> Result<ExtractStats, ZipnestError> {
         crate::extract::extract_to_disk(self, opts, password, progress)
+    }
+
+    /// The container this handler is extracting (`zip`, `7z`, `rar`, …), from
+    /// the CLSID that actually opened the file.
+    ///
+    /// The handler itself does not report a name for the *container* on this
+    /// 7z.dll: a probe over every archive property id (2026-11-27) returned
+    /// only numbers, no format string. The CLSID is the authoritative answer
+    /// anyway — it is the handler that decoded the bytes, so a `.zip` that is
+    /// really a 7z or a `.docx` (a zip) is named by what it is, which is
+    /// exactly what "edit this archive" has to decide on.
+    ///
+    /// `None` for the multi-volume path, where the real handler is chosen per
+    /// attempt and not recorded; editing a split archive is out of scope.
+    pub fn container_name(&self) -> Option<String> {
+        let name = match self.clsid {
+            Some(c) if c == crate::com::CLSID_FORMAT_ZIP => "zip",
+            Some(c) if c == crate::com::CLSID_FORMAT_7Z => "7z",
+            Some(c) if c == crate::com::CLSID_FORMAT_TAR => "tar",
+            Some(c) if c == crate::com::CLSID_FORMAT_GZIP => "gz",
+            Some(c) if c == crate::com::CLSID_FORMAT_BZIP2 => "bz2",
+            Some(c) if c == crate::com::CLSID_FORMAT_XZ => "xz",
+            Some(c) if c == crate::com::CLSID_FORMAT_ISO => "iso",
+            Some(c) if c == crate::com::CLSID_FORMAT_RAR5 || c == crate::com::CLSID_FORMAT_RAR => {
+                "rar"
+            }
+            _ => return None,
+        };
+        Some(name.to_string())
+    }
+
+    /// Rewrite this archive's source file with `plan` applied (see
+    /// [`crate::update::update_archive`]).
+    pub fn update(
+        &self,
+        dest: &std::path::Path,
+        plan: &crate::update::UpdatePlan,
+        opts: &crate::update::UpdateOptions,
+        progress: &mut dyn FnMut(&crate::types::CreateProgress) -> bool,
+    ) -> Result<crate::types::ExtractedEditStats, ZipnestError> {
+        crate::update::update_archive(self, dest, plan, opts, progress)
     }
 
     pub(crate) fn raw(&self) -> *mut c_void {

@@ -63,7 +63,15 @@ pub struct EntryDto {
 pub struct OpenArchiveResult {
     pub id: u64,
     pub encrypted: bool,
+    /// The extension the file carries (display only — the toolbar's little
+    /// tag). What the engine actually opened is [`Self::container`].
     pub format: String,
+    /// The container the engine really decoded (`zip`, `7z`, `rar`, …).
+    ///
+    /// Taken from the handler, not from the extension: a `.zip` that is really
+    /// a 7z, or a `.docx` (a zip), must be edited as what it is. Empty when
+    /// the handler does not name itself.
+    pub container: String,
     pub entries: Vec<EntryDto>,
 }
 
@@ -632,6 +640,7 @@ impl IpcService {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
+        let container = archive.container_name().unwrap_or_default();
         let root = children_of(&entries, "");
         let (id, _) = self.registry.insert(
             archive,
@@ -639,7 +648,7 @@ impl IpcService {
             password,
             Arc::clone(&entries),
         );
-        Ok(OpenArchiveResult { id, encrypted, format, entries: root })
+        Ok(OpenArchiveResult { id, encrypted, format, container, entries: root })
     }
 
     /// Release an archive the UI has finished with.
@@ -1046,6 +1055,151 @@ impl IpcService {
                     return Err("error.archive_delete".into());
                 }
             }
+            Ok(())
+        }));
+        Ok(job_id)
+    }
+
+    /// Edit an open archive in place: add files, drop entries.
+    ///
+    /// Only ZIP and 7z are editable — `update_format_for` refuses the rest with
+    /// `error.update_unsupported` *before* a job is queued, because the reason
+    /// is a property of the format, not of this run.
+    ///
+    /// The job holds the archive's mutex for its whole duration (the engine
+    /// reads the kept entries through that same open archive). On success the
+    /// caller's view of the entry list is stale: the UI closes and re-opens the
+    /// archive, which is also what the `archive_updated` event tells it to do.
+    pub fn update_archive(
+        &self,
+        id: u64,
+        add: Vec<String>,
+        remove_paths: Vec<String>,
+    ) -> Result<u64, IpcError> {
+        if add.is_empty() && remove_paths.is_empty() {
+            return Err(IpcError::new("error.update_empty"));
+        }
+        let shared = self.lock_archive(id)?;
+        let path = self
+            .registry
+            .path(id)
+            .ok_or_else(|| IpcError::new("error.not_an_archive"))?;
+        let entries = self.cached_entries(id)?;
+        let password = self.registry.password(id);
+        let emit = Arc::clone(&self.emit);
+
+        // The container decides whether this is even possible. Done before the
+        // job so the UI gets the refusal synchronously and can explain it.
+        let format = {
+            let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .0
+                .container_name()
+                .and_then(|c| archive_core::update_format_for(&c))
+                .ok_or_else(|| IpcError::new("error.update_unsupported"))?
+        };
+
+        let job_id = self.jobs.submit("update", Box::new(move |ctx| {
+            let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+            // Which archive indices the requested paths mean. A directory
+            // path expands to its whole subtree, exactly like extraction; a
+            // path the archive does not hold is reported rather than ignored.
+            // A name the archive does not hold is the specific reason, so it is
+            // reported before the "selection expanded to nothing" fallback.
+            for p in &remove_paths {
+                let found = entries.iter().any(|e| normalized(&e.path) == normalized(p));
+                if !found {
+                    return Err("error.update_missing_entry".into());
+                }
+            }
+            // `select_entries` reads an empty list as "the whole archive" —
+            // right for extraction, catastrophic here: an "add files" request
+            // carries no removals, and expanding that to every entry would
+            // delete the archive's whole contents. An empty removal list means
+            // remove nothing.
+            let wanted = if remove_paths.is_empty() {
+                Vec::new()
+            } else {
+                select_entries(&entries, &remove_paths)
+            };
+            if !remove_paths.is_empty() && wanted.is_empty() {
+                return Err("error.update_nothing_to_remove".into());
+            }
+
+            // The adds keep their own basename inside the archive.
+            let mut sources = Vec::new();
+            for input in &add {
+                let base = std::path::Path::new(input)
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let part = archive_core::collect_sources_detailed(
+                    &[std::path::PathBuf::from(input)],
+                    &base,
+                )
+                .map_err(|e| e.error_key().to_string())?;
+                if !part.skipped_links.is_empty() {
+                    emit(
+                        "create_skipped",
+                        serde_json::json!({
+                            "count": part.skipped_links.len(),
+                            "entries": part.skipped_links
+                                .iter()
+                                .map(|l| serde_json::json!({
+                                    "path": l.path.to_string_lossy(),
+                                    "is_dir": l.is_dir,
+                                }))
+                                .collect::<Vec<_>>(),
+                        }),
+                    );
+                }
+                sources.extend(part.sources);
+            }
+            if sources.is_empty() && !add.is_empty() {
+                return Err("error.create_only_links".into());
+            }
+            if sources.is_empty() && wanted.is_empty() {
+                return Err("error.update_empty".into());
+            }
+
+            let plan = archive_core::UpdatePlan {
+                remove: wanted,
+                add: sources,
+            };
+            let opts = archive_core::UpdateOptions {
+                format,
+                level: None,
+                method: None,
+                password: password.clone(),
+            };
+            let mut throttle = ProgressThrottle::new(PROGRESS_MIN_INTERVAL);
+            let mut last_path = String::new();
+            let stats = guard
+                .0
+                .update(&path, &plan, &opts, &mut |p| {
+                    if ctx.cancelled() {
+                        return false;
+                    }
+                    if !p.current_path.is_empty() {
+                        last_path = p.current_path.clone();
+                        if throttle.due() {
+                            ctx.report(0, 0, p.done_bytes, p.total_bytes, &last_path);
+                        }
+                    }
+                    true
+                })
+                .map_err(|e| e.error_key().to_string())?;
+            drop(guard);
+            emit(
+                "archive_updated",
+                serde_json::json!({
+                    "archive_id": id,
+                    "kept": stats.kept,
+                    "added": stats.added,
+                    "removed": stats.removed,
+                }),
+            );
             Ok(())
         }));
         Ok(job_id)

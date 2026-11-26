@@ -1130,6 +1130,8 @@ enum JobKind {
     /// CRC verification: same progress window, different wording, and success
     /// means "checked, all intact" rather than "files are on disk".
     Test,
+    /// An in-place edit of the open archive (add files / remove entries).
+    Update,
 }
 
 #[derive(Default, Clone)]
@@ -1752,11 +1754,23 @@ struct App {
     /// The row context menu that is on screen, if any. Rebuilt every frame so
     /// it survives the row scrolling out of the visible range.
     row_menu_click: Option<RowMenu>,
+    /// An edit finished; reopen the archive on the next frame that has no job.
+    reopen_after_update_pending: bool,
     /// Paths a one-click verb still has to process, drained as each job ends.
     /// Explorer passes every selected file to one command line, and the UI can
     /// only hold one archive open at a time, so multi-select becomes a queue.
     quick_extract_queue: Vec<(String, QuickExtract)>,
     quick_add_queue: Vec<String>,
+    /// The "remove these entries?" confirmation, when it is on screen. Deleting
+    /// from an archive is destructive and irreversible (the rewritten file
+    /// replaces the original), so it always asks.
+    confirm_remove: bool,
+    /// The names the pending confirmation is about, captured when it opened so
+    /// the question and the deletion cannot disagree (the selection can change
+    /// under a repaint).
+    confirm_remove_names: Vec<String>,
+    /// The "files or folder?" chooser behind 添加文件… is on screen.
+    add_files_choice: Option<bool>,
     error: Option<String>,
     notice: Option<String>,
     /// When the current notice should disappear on its own. Only success
@@ -2094,8 +2108,12 @@ impl App {
             cursor: None,
             keyboard_nav: false,
             row_menu_click: None,
+            reopen_after_update_pending: false,
             quick_extract_queue: Vec::new(),
             quick_add_queue: Vec::new(),
+            confirm_remove: false,
+            confirm_remove_names: Vec::new(),
+            add_files_choice: None,
             error: None,
             notice_until: None,
             flash_taskbar: false,
@@ -2385,6 +2403,12 @@ impl App {
                     }
                     self.renamed_entries = pairs;
                 }
+                "archive_updated" => {
+                    // The rewritten file replaced the one the UI is showing, so
+                    // its listing is the old archive; reopen it once the job
+                    // lets go of the mutex (handled in `logic`).
+                    self.reopen_after_update_pending = true;
+                }
                 "extract_conflict_renamed" => {
                     // The destination already had these names; the files are
                     // on disk as `name (2).ext`. A one-click verb has no
@@ -2535,13 +2559,20 @@ impl App {
                             .as_ref()
                             .map(|j| j.conflict_renamed)
                             .unwrap_or(0);
+                        let is_update = self
+                            .job
+                            .as_ref()
+                            .map(|j| j.kind == JobKind::Update)
+                            .unwrap_or(false);
                         let is_test = self
                             .job
                             .as_ref()
                             .map(|j| j.kind == JobKind::Test)
                             .unwrap_or(false);
                         self.notice = Some(
-                            if is_test {
+                            if is_update {
+                                "job.update.ok"
+                            } else if is_test {
                                 // A test does not unpack anything, so none of
                                 // the extraction wordings fit: "done" here
                                 // means "every entry decoded and its CRC
@@ -2791,6 +2822,203 @@ impl App {
                 self.job = None;
                 self.error = Some(self.t(&e.key));
             }
+        }
+    }
+
+    /// 添加文件… — pick what to append to the open archive.
+    ///
+    /// The button opens a small chooser instead of two pickers back to back:
+    /// the first version called "pick files" and then *unconditionally* "pick
+    /// folder", so cancelling the files dialog opened a second one the user had
+    /// not asked for. One question, two answers.
+    fn add_files_to_archive(&mut self) {
+        if self.archive.is_none() || self.job_running() {
+            return;
+        }
+        self.add_files_choice = Some(true);
+    }
+
+    /// Run the picker the user chose in [`Self::add_files_to_archive`].
+    fn pick_and_add(&mut self, files: bool) {
+        let picked: Vec<String> = if files {
+            let all = self.t("pick.all");
+            rfd::FileDialog::new()
+                .add_filter(all, &["*"])
+                .pick_files()
+                .map(|v| {
+                    v.iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            rfd::FileDialog::new()
+                .pick_folder()
+                .map(|p| vec![p.to_string_lossy().into_owned()])
+                .unwrap_or_default()
+        };
+        if picked.is_empty() {
+            return;
+        }
+        let Some(id) = self.archive.as_ref().map(|a| a.id) else {
+            return;
+        };
+        self.begin_update(id, picked, Vec::new());
+    }
+
+    /// The little "files or folder?" chooser behind 添加文件….
+    fn add_files_choice_dialog(&mut self, ctx: &egui::Context) {
+        if self.add_files_choice.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut files = false;
+        let mut folder = false;
+        let title = self.t("edit.add_files.choice_title");
+        let center = ctx.content_rect().center() - egui::vec2(190.0, 60.0);
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .default_pos(center)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(self.t("edit.add_files.choice_body"));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if theme::primary_button(ui, &self.t("create.add_files")).clicked() {
+                        files = true;
+                    }
+                    if ui.button(self.t("create.add_folder")).clicked() {
+                        folder = true;
+                    }
+                    if ui.button(self.t("extract.cancel")).clicked() {
+                        self.add_files_choice = None;
+                    }
+                });
+            });
+        if files || folder {
+            self.add_files_choice = None;
+            self.pick_and_add(files);
+        } else if !open {
+            self.add_files_choice = None;
+        }
+    }
+
+    /// Start the in-place edit job.
+    fn begin_update(&mut self, id: u64, add: Vec<String>, remove: Vec<String>) {
+        self.job = Some(JobState {
+            job_id: 0,
+            kind: JobKind::Update,
+            title: self.t("edit.title"),
+            ..Default::default()
+        });
+        self.skipped_links.clear();
+        match self.svc.update_archive(id, add, remove) {
+            Ok(jid) => {
+                if let Some(job) = self.job.as_mut() {
+                    job.job_id = jid;
+                }
+            }
+            Err(e) => {
+                self.job = None;
+                self.error = Some(self.t(&e.key));
+            }
+        }
+    }
+
+    /// Reopen the archive after an edit: the listing on screen is the one the
+    /// edit replaced.
+    fn reopen_after_update(&mut self) {
+        if self.archive.is_none() {
+            return;
+        }
+        let path = self.archive_path.clone();
+        let password = self.archive_password.clone();
+        let cwd = self.cwd.clone();
+        self.open_archive_with_password(&path, password);
+        if !cwd.is_empty() && self.archive.is_some() {
+            self.navigate(&cwd);
+        }
+    }
+
+    /// The "remove entries?" confirmation. Deleting from an archive rewrites
+    /// the file and cannot be undone, so it always asks and lists what it is
+    /// about to remove.
+    fn remove_confirm_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_remove {
+            return;
+        }
+        let Some(id) = self.archive.as_ref().map(|a| a.id) else {
+            self.confirm_remove = false;
+            return;
+        };
+        let mut open = true;
+        let mut yes = false;
+        let mut no = false;
+        let names = self.confirm_remove_names.clone();
+        let mut body = self
+            .t("edit.remove.body")
+            .replace("{count}", &names.len().to_string());
+        let shown: Vec<String> = names.iter().take(10).cloned().collect();
+        for n in &shown {
+            body.push('\n');
+            body.push_str("  * ");
+            body.push_str(n);
+        }
+        if names.len() > shown.len() {
+            body.push('\n');
+            body.push_str(
+                &self
+                    .t("edit.remove.more")
+                    .replace("{count}", &(names.len() - shown.len()).to_string()),
+            );
+        }
+        let title = self.t("edit.remove.title");
+        let center = ctx.content_rect().center() - egui::vec2(220.0, 110.0);
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .default_pos(center)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add(egui::Label::new(body).wrap());
+                ui.add_space(14.0);
+                let clicked = ui
+                    .allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), theme::CONTROL_H),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.button(self.t("extract.cancel")).clicked() {
+                                no = true;
+                            }
+                            ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new(self.t("edit.remove.confirm"))
+                                        .color(theme::on_accent(ui)),
+                                )
+                                .fill(error_color(ui))
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .stroke(egui::Stroke::NONE),
+                            )
+                            .clicked()
+                        },
+                    )
+                    .inner;
+                yes = clicked;
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    no = true;
+                }
+            });
+        if yes {
+            self.confirm_remove = false;
+            self.begin_update(id, Vec::new(), names);
+            self.selected.clear();
+            self.anchor = None;
+            self.cursor = None;
+        } else if no || !open {
+            self.confirm_remove = false;
         }
     }
 
@@ -3168,6 +3396,40 @@ impl App {
                     .clicked()
                 {
                     self.begin_extract_dialog();
+                }
+                // Editing only exists for ZIP and 7z. The flag comes from the
+                // *container* the engine opened, not the extension: a `.zip`
+                // that is really a 7z is still a 7z.
+                let editable = self.archive.as_ref().is_some_and(|a| {
+                    matches!(a.container.as_str(), "zip" | "7z")
+                });
+                if editable {
+                    if theme::ghost_button(ui, &self.t("edit.add_files")).clicked() {
+                        self.add_files_to_archive();
+                    }
+                    let can_remove = !self.selected.is_empty()
+                        && !self.searching()
+                        && self.archive.is_some();
+                    if theme::ghost_button_enabled(
+                        ui,
+                        &self.t("edit.remove"),
+                        can_remove,
+                    )
+                    .on_hover_text(if self.selected.is_empty() {
+                        self.t("edit.remove.hint")
+                    } else {
+                        String::new()
+                    })
+                    .clicked()
+                    {
+                        // Capture what the question is about *now*: the
+                        // selection can change under a repaint, and a
+                        // confirmation that says "0 items" (or names a
+                        // different set than it deletes) is worse than none.
+                        self.confirm_remove_names =
+                            self.selected.iter().cloned().collect();
+                        self.confirm_remove = true;
+                    }
                 }
                 // Read-only check of the archive's CRC. Beside 开始解压 because
                 // it answers the same question ("are these files really
@@ -3911,6 +4173,14 @@ impl App {
                         self.begin_extract_dialog();
                         open = false;
                     }
+                    if self.arch_is_editable() {
+                        let remove_label = self.t("rowmenu.remove");
+                        if item(ui, &remove_label) {
+                            self.confirm_remove_names = menu.selection.clone();
+                            self.confirm_remove = true;
+                            open = false;
+                        }
+                    }
                     let copy_label = if menu.selection.len() > 1 {
                         self.t("rowmenu.copy_paths")
                             .replace("{n}", &menu.selection.len().to_string())
@@ -4468,6 +4738,13 @@ impl App {
             }
             Some(key) => self.error = Some(self.t(&key)),
         }
+    }
+
+    /// Is the open archive one the app can edit in place (ZIP / 7z)?
+    fn arch_is_editable(&self) -> bool {
+        self.archive
+            .as_ref()
+            .is_some_and(|a| matches!(a.container.as_str(), "zip" | "7z"))
     }
 
     /// Does the current selection contain an encrypted entry the archive was
@@ -6135,6 +6412,7 @@ impl App {
                     if !j.current_path.is_empty() {
                         let prefix = match j.kind {
                             JobKind::Create => self.t("job.current_create"),
+                            JobKind::Update => self.t("job.current_update"),
                             _ => self.t("job.current_extract"),
                         };
                         ui.add(
@@ -6679,6 +6957,12 @@ impl eframe::App for App {
                 self.apply_launch(request);
             }
         }
+        // An edit replaced the archive file: reopen it so the list shows what
+        // is really in there now.
+        if self.reopen_after_update_pending && !self.job_running() {
+            self.reopen_after_update_pending = false;
+            self.reopen_after_update();
+        }
         // One-click verbs that were queued behind a running job run now.
         if !self.job_running()
             && (!self.quick_extract_queue.is_empty() || !self.quick_add_queue.is_empty())
@@ -6835,6 +7119,8 @@ impl eframe::App for App {
         self.job_window(ctx);
         self.update_window(ctx);
         self.error_window(ctx);
+        self.remove_confirm_dialog(ctx);
+        self.add_files_choice_dialog(ctx);
     }
 }
 

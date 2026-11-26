@@ -178,7 +178,7 @@ fn wrapper_clsid(format: CreateFormat) -> Option<Guid> {
 
 /// Deletes a temporary file when dropped, so cleanup covers both the success
 /// and the error path of a two-pass create.
-struct TempCleanup(PathBuf);
+pub(crate) struct TempCleanup(pub(crate) PathBuf);
 
 impl Drop for TempCleanup {
     fn drop(&mut self) {
@@ -219,7 +219,7 @@ fn temp_tar_path(dest: &Path) -> PathBuf {
 /// 123). Mirrors the extract-side helper (extract.rs) so the temp stream and
 /// the final rename both survive a deep destination directory.
 #[cfg(windows)]
-fn os_path(p: &Path) -> PathBuf {
+pub(crate) fn os_path(p: &Path) -> PathBuf {
     const LIMIT: usize = 240;
     let s = p.as_os_str().to_string_lossy();
     if s.len() < LIMIT || !p.is_absolute() || s.starts_with(r"\\?\") {
@@ -241,7 +241,7 @@ fn os_path(p: &Path) -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn os_path(p: &Path) -> PathBuf {
+pub(crate) fn os_path(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
@@ -250,7 +250,7 @@ fn os_path(p: &Path) -> PathBuf {
 /// when the suffix would push the whole component past 255 bytes (a name may
 /// itself be 255 bytes long). The `.zipnest-part-` marker is what the tests
 /// look for to assert no leftover temp survives any path.
-fn temp_part_path(dest: &Path) -> PathBuf {
+pub(crate) fn temp_part_path(dest: &Path) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     const MAX_COMPONENT: usize = 255;
     let name = dest
@@ -402,7 +402,7 @@ fn stat_sources(sources: &[CreateSource]) -> Result<(Vec<SourceItem>, u64), Zipn
 
 /// Best-effort archive-level properties via `ISetProperties`. Handlers that
 /// don't implement the interface are simply left at their defaults.
-unsafe fn apply_properties(raw: *mut c_void, opts: &CreateOptions) {
+pub(crate) unsafe fn apply_properties(raw: *mut c_void, opts: &CreateOptions) {
     let mut sp: *mut c_void = std::ptr::null_mut();
     let oav = &**(raw as *const *const OutArchiveVt);
     if (oav.query_interface)(raw, &IID_ISET_PROPERTIES, &mut sp) != S_OK || sp.is_null() {

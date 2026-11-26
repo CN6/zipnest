@@ -11,6 +11,7 @@ pub mod dll;
 pub mod error;
 pub mod extract;
 pub mod types;
+pub mod update;
 
 /// COM FFI internals — exposed for tooling/probes, not a stable API.
 #[doc(hidden)]
@@ -20,8 +21,9 @@ pub use archive::Archive;
 pub use create::{collect_sources, collect_sources_detailed, create_archive, CollectedSources};
 pub use error::{map_hresult, ZipnestError};
 pub use extract::{conflicts_in, conflicts_on_disk};
+pub use update::{update_archive, update_format_for, UpdateFormat, UpdateOptions, UpdatePlan};
 pub use types::{
     ArchiveEntry, ArchiveOpenOptions, CompressionLevel, CompressionMethod, CreateFormat,
     CreateOptions, CreateProgress, CreateSource, CreateStats, ExtractOptions, ExtractProgress,
-    ExtractStats, OnConflict, SfxKind, SkippedLink,
+    ExtractStats, ExtractedEditStats, OnConflict, SfxKind, SkippedLink,
 };

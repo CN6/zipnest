@@ -8,6 +8,7 @@ pub mod instream;
 pub mod outcallback;
 pub mod outstream;
 pub mod propvariant;
+pub mod updatecallback;
 pub mod vtables;
 
 use std::os::raw::c_void;

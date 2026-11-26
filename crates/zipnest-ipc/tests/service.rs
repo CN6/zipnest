@@ -928,3 +928,109 @@ fn a_conflict_rename_is_announced_with_both_names() {
     svc.close_archive(r.id);
     let _ = std::fs::remove_dir_all(&dest);
 }
+
+// ---- update_archive: add / remove entries in place ----
+
+/// 追加文件：事件带上 kept/added/removed，重新打开能看到新条目。
+#[test]
+fn an_update_adds_a_file_and_reports_what_it_did() {
+    let (svc, events) = service();
+    let dir = std::env::temp_dir().join(format!("zipnest-upd-add-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let archive = dir.join("a.zip");
+    std::fs::copy(fx("plain.zip"), &archive).unwrap();
+    let added = dir.join("new.txt");
+    std::fs::write(&added, b"fresh").unwrap();
+
+    let r = svc.open_archive(archive.to_string_lossy().into(), None).unwrap();
+    let job = svc
+        .update_archive(r.id, vec![added.to_string_lossy().into()], Vec::new())
+        .unwrap();
+    wait_events(&events, 10_000, |v| {
+        v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job)
+    });
+    let v = events.lock().unwrap().clone();
+    let (_, fin) = v
+        .iter()
+        .find(|(n, e)| n == "job_finished" && e["job_id"] == job)
+        .unwrap();
+    assert_eq!(fin["ok"], true, "update failed: {fin}");
+    let (_, upd) = v
+        .iter()
+        .find(|(n, _)| n == "archive_updated")
+        .expect("the update must announce itself");
+    assert_eq!(upd["added"], 1);
+    // plain.zip holds four items (a.txt, c.txt, sub/, sub/b.txt); the add
+    // keeps every one of them.
+    assert_eq!(upd["kept"], 4, "got {upd}");
+
+    // Re-open: the new file is really there next to the old ones.
+    svc.close_archive(r.id);
+    let again = svc.open_archive(archive.to_string_lossy().into(), None).unwrap();
+    let names: Vec<String> = again.entries.iter().map(|e| e.name.clone()).collect();
+    assert!(names.iter().any(|n| n == "new.txt"), "got {names:?}");
+    assert!(names.iter().any(|n| n == "a.txt"));
+    svc.close_archive(again.id);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 删除：事件里的 removed 数正确，重新打开后条目没了。
+#[test]
+fn an_update_removes_the_named_entry() {
+    let (svc, events) = service();
+    let dir = std::env::temp_dir().join(format!("zipnest-upd-del-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let archive = dir.join("a.zip");
+    std::fs::copy(fx("plain.zip"), &archive).unwrap();
+    let r = svc.open_archive(archive.to_string_lossy().into(), None).unwrap();
+    let job = svc.update_archive(r.id, Vec::new(), vec!["c.txt".into()]).unwrap();
+    wait_events(&events, 10_000, |v| {
+        v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job)
+    });
+    let v = events.lock().unwrap().clone();
+    let (_, upd) = v.iter().find(|(n, _)| n == "archive_updated").expect("event");
+    assert_eq!(upd["removed"], 1);
+    svc.close_archive(r.id);
+    let again = svc.open_archive(archive.to_string_lossy().into(), None).unwrap();
+    let names: Vec<String> = again.entries.iter().map(|e| e.name.clone()).collect();
+    assert!(!names.iter().any(|n| n == "c.txt"), "c.txt must be gone: {names:?}");
+    assert!(names.iter().any(|n| n == "a.txt"));
+    svc.close_archive(again.id);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 不支持的格式与空请求在排任务之前就被拒，各带自己的 key。
+#[test]
+fn the_update_refuses_before_queueing_when_it_cannot_work() {
+    let (svc, _) = service();
+    let dir = std::env::temp_dir().join(format!("zipnest-upd-refuse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let archive = dir.join("a.zip");
+    std::fs::copy(fx("plain.zip"), &archive).unwrap();
+    let r = svc.open_archive(archive.to_string_lossy().into(), None).unwrap();
+    let err = svc.update_archive(r.id, Vec::new(), Vec::new()).unwrap_err();
+    assert_eq!(err.key, "error.update_empty");
+    // A path the archive does not hold: reported, not silently ignored. The
+    // refusal happens inside the job (the entry list is consulted there), so
+    // it arrives as a failed job rather than a synchronous error.
+    let (svc, events) = service();
+    let r = svc.open_archive(archive.to_string_lossy().into(), None).unwrap();
+    let job = svc
+        .update_archive(r.id, Vec::new(), vec!["no-such-entry.txt".into()])
+        .unwrap();
+    wait_events(&events, 10_000, |v| {
+        v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job)
+    });
+    let v = events.lock().unwrap().clone();
+    let (_, fin) = v
+        .iter()
+        .find(|(n, e)| n == "job_finished" && e["job_id"] == job)
+        .unwrap();
+    assert_eq!(fin["ok"], false, "a missing entry must fail the job");
+    assert_eq!(fin["error_key"], "error.update_missing_entry");
+    svc.close_archive(r.id);
+    let _ = std::fs::remove_dir_all(&dir);
+}

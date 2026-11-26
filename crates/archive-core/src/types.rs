@@ -153,6 +153,23 @@ pub struct ExtractStats {
     pub failed: Vec<EntryFailure>,
 }
 
+/// What an in-place edit of an existing archive changed.
+///
+/// Mirrors [`ExtractStats`]'s "say what happened" spirit: the caller reports
+/// these numbers so "added 3, removed 1" can be shown, instead of a bare
+/// "done" over a file whose contents the user has to open to verify.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExtractedEditStats {
+    /// Entries carried over from the old archive untouched.
+    pub kept: u32,
+    /// Entries that came from the filesystem.
+    pub added: u32,
+    /// Entries dropped as requested.
+    pub removed: u32,
+    /// Size of the rewritten archive on disk.
+    pub bytes_out: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Archive creation (Task 1 / M3).
 // ---------------------------------------------------------------------------
