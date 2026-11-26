@@ -721,6 +721,49 @@ fn open_encrypted_7z_wrong_password_reports_incorrect() {
 // ---- test_archive: CRC verify without writing ----
 
 /// 好包：`test_finished` 带上校验过的文件数，且磁盘上什么都没多出来。
+/// 进度事件必须带上当前条目路径（B3）：进度窗口靠它显示"正在解压 docs/x.txt"。
+#[test]
+fn progress_events_name_the_entry_being_written() {
+    let (svc, events) = service();
+    let r = svc
+        .open_archive(fx("plain.zip").to_string_lossy().into(), None)
+        .unwrap();
+    let dest = std::env::temp_dir().join(format!("zipnest-b3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    let job = svc
+        .extract(r.id, Vec::new(), dest.to_string_lossy().into(), Some("overwrite".into()), None)
+        .unwrap();
+    wait_events(&events, 10_000, |v| {
+        v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job)
+    });
+    let v = events.lock().unwrap().clone();
+    let progress: Vec<&serde_json::Value> = v
+        .iter()
+        .filter(|(n, e)| n == "job_progress" && e["job_id"] == job)
+        .map(|(_, e)| e)
+        .collect();
+    assert!(!progress.is_empty(), "the run must report progress");
+    // A plain.zip extract of three tiny files finishes inside one throttle
+    // window, so there may be a single report; what matters is that the field
+    // is *present* and holds the archive's own name for the entry, not that
+    // several distinct names were seen (this test asserted the latter first
+    // and failed for timing reasons, not for a missing field).
+    assert!(
+        progress.iter().all(|e| e.get("current_path").is_some()),
+        "every progress event must carry current_path: {progress:?}"
+    );
+    assert!(
+        progress.iter().any(|e| {
+            e["current_path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with(".txt") || p == "sub")
+        }),
+        "current_path must name an archive entry: {progress:?}"
+    );
+    svc.close_archive(r.id);
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
 #[test]
 fn test_archive_reports_verified_files_and_writes_nothing() {
     let (svc, events) = service();

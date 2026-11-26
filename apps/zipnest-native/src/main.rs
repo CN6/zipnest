@@ -1156,6 +1156,9 @@ struct JobState {
     /// Number of entries the last test run verified intact (`test_finished`).
     /// Only meaningful when `kind == JobKind::Test`.
     test_verified: u64,
+    /// The entry the engine is on right now, shown under the progress bar.
+    /// Empty until the first named report.
+    current_path: String,
     title: String,
     /// Where this job writes. Shown next to the result so the user does not
     /// have to guess the folder the app picked for them.
@@ -2266,6 +2269,11 @@ impl App {
                     j.total_bytes = payload["total_bytes"].as_u64().unwrap_or(0);
                     j.speed_bps = payload["speed_bps"].as_u64().unwrap_or(0);
                     j.eta_secs = payload["eta_secs"].as_u64().unwrap_or(0);
+                    if let Some(path) = payload["current_path"].as_str() {
+                        if !path.is_empty() {
+                            j.current_path = path.to_string();
+                        }
+                    }
                 }
                 "extract_skipped" => {
                     self.extract_skipped = payload["count"].as_u64().unwrap_or(0);
@@ -5827,6 +5835,24 @@ impl App {
                         format!("{} / {}", j.done_items, j.total_items)
                     };
                     ui.label(text);
+                    // Which file the engine is on. One line, ellipsised in the
+                    // middle so a deep path keeps both its root and the file
+                    // name; the tooltip has the whole thing.
+                    if !j.current_path.is_empty() {
+                        let prefix = match j.kind {
+                            JobKind::Create => self.t("job.current_create"),
+                            _ => self.t("job.current_extract"),
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("{prefix}{}", j.current_path))
+                                    .size(theme::TEXT_SMALL)
+                                    .color(theme::secondary(ui)),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&j.current_path);
+                    }
                     if let Some(eta) = j.eta_text(&self.lang) {
                         ui.label(
                             egui::RichText::new(eta)

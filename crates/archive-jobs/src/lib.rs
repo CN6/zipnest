@@ -22,6 +22,10 @@ pub enum JobEvent {
         total_bytes: u64,
         speed_bps: u64,
         eta_secs: u64,
+        /// The entry being processed right now, as the archive/disk names it.
+        /// Empty when the runner has nothing to report (the first tick of a
+        /// job, or a source that has no per-entry notion).
+        current_path: String,
     },
     Finished {
         job_id: u64,
@@ -209,7 +213,19 @@ impl JobContext {
 
     /// Throttled emit; bypasses the throttle when the job is complete
     /// (every item and every byte reported) so the final state always lands.
-    pub fn report(&self, done_items: u64, total_items: u64, done_bytes: u64, total_bytes: u64) {
+    ///
+    /// `current_path` is what the progress window shows under the bar. It is
+    /// kept out of the throttle decision on purpose: the same numbers several
+    /// times per second are noise, but a *different file* is the one thing a
+    /// user watching a long extraction wants to see.
+    pub fn report(
+        &self,
+        done_items: u64,
+        total_items: u64,
+        done_bytes: u64,
+        total_bytes: u64,
+        current_path: &str,
+    ) {
         let now = Instant::now();
         {
             // Check and stamp under one lock: the old code took the lock
@@ -242,6 +258,7 @@ impl JobContext {
             total_bytes,
             speed_bps,
             eta_secs,
+            current_path: current_path.to_string(),
         });
     }
 }
@@ -277,7 +294,7 @@ mod tests {
         let (log, sink) = recorder();
         let mgr = JobManager::new(sink);
         mgr.submit("t", Box::new(|ctx| {
-            ctx.report(1, 1, 10, 10);
+            ctx.report(1, 1, 10, 10, "a.txt");
             Ok(())
         }));
         wait_until(2000, || {
@@ -359,7 +376,7 @@ mod tests {
         let mgr = JobManager::with_throttle(sink, Duration::from_secs(60));
         mgr.submit("t", Box::new(|ctx| {
             for i in 0..100 {
-                ctx.report(i, 100, i, 100);
+                ctx.report(i, 100, i, 100, "f");
             }
             Ok(())
         }));
@@ -375,5 +392,44 @@ mod tests {
             .filter(|e| matches!(e, JobEvent::Progress { .. }))
             .count();
         assert!(prog <= 2, "expected <=2 progress events, got {prog}");
+    }
+}
+
+#[cfg(test)]
+mod current_path_tests {
+    use super::*;
+
+    /// 进度事件必须带上"正在处理哪个条目"：进度窗口在字节数下面显示它，
+    /// 长任务里这是用户唯一能判断"还在动"的东西。
+    #[test]
+    fn progress_events_carry_the_current_entry_path() {
+        let log: Arc<Mutex<Vec<JobEvent>>> = Arc::default();
+        let sink_log = Arc::clone(&log);
+        let mgr = JobManager::with_throttle(
+            Box::new(move |e| sink_log.lock().unwrap().push(e)),
+            Duration::ZERO,
+        );
+        mgr.submit("t", Box::new(|ctx| {
+            ctx.report(0, 1, 0, 10, "docs/a.txt");
+            ctx.report(1, 1, 10, 10, "docs/b.txt");
+            Ok(())
+        }));
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(2) {
+            if log.lock().unwrap().iter().any(|e| matches!(e, JobEvent::Finished { .. })) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let paths: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                JobEvent::Progress { current_path, .. } => Some(current_path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, vec!["docs/a.txt", "docs/b.txt"]);
     }
 }

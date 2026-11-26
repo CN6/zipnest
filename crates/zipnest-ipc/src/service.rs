@@ -469,6 +469,7 @@ impl IpcService {
                     total_bytes,
                     speed_bps,
                     eta_secs,
+                    current_path,
                 } => emit2(
                     "job_progress",
                     serde_json::json!({
@@ -479,6 +480,7 @@ impl IpcService {
                         "total_bytes": total_bytes,
                         "speed_bps": speed_bps,
                         "eta_secs": eta_secs,
+                        "current_path": current_path,
                     }),
                 ),
                 JobEvent::Finished { job_id, ok, error_key } => emit2(
@@ -889,12 +891,18 @@ impl IpcService {
                 // `ExtractProgress` has no item counter; count distinct
                 // paths observed as an approximation of files touched.
                 seen_paths.insert(d.current_path.clone());
-                if throttle.due() {
+                // The engine's own `SetTotal` tick arrives before it has named
+                // any entry. Reporting it gave the UI a "正在解压 " line with
+                // nothing after it — and, worse, it consumed the throttle
+                // window, so a run of small files then showed no entry name at
+                // all. Hold the report until there is a path to show.
+                if !d.current_path.is_empty() && throttle.due() {
                     ctx.report(
                         seen_paths.len() as u64,
                         total_items,
                         d.done_bytes,
                         total_bytes,
+                        &d.current_path,
                     );
                 }
                 true
@@ -1091,12 +1099,18 @@ impl IpcService {
                     return false;
                 }
                 seen_paths.insert(d.current_path.clone());
-                if throttle.due() {
+                // The engine's own `SetTotal` tick arrives before it has named
+                // any entry. Reporting it gave the UI a "正在解压 " line with
+                // nothing after it — and, worse, it consumed the throttle
+                // window, so a run of small files then showed no entry name at
+                // all. Hold the report until there is a path to show.
+                if !d.current_path.is_empty() && throttle.due() {
                     ctx.report(
                         seen_paths.len() as u64,
                         total_items,
                         d.done_bytes,
                         total_bytes,
+                        &d.current_path,
                     );
                 }
                 true
@@ -1210,8 +1224,18 @@ impl IpcService {
                         return false;
                     }
                     seen.insert(p.current_path.clone());
-                    if throttle.due() {
-                        ctx.report(seen.len() as u64, total_items, p.done_bytes, p.total_bytes);
+                    // Same rule as the extract runner: the engine's first
+                    // `SetTotal` arrives before any item has been named, and a
+                    // pathless report would blank the "packing …" line and eat
+                    // the throttle window.
+                    if !p.current_path.is_empty() && throttle.due() {
+                        ctx.report(
+                            seen.len() as u64,
+                            total_items,
+                            p.done_bytes,
+                            p.total_bytes,
+                            &p.current_path,
+                        );
                     }
                     true
                 })
