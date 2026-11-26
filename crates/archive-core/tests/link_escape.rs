@@ -34,6 +34,7 @@ fn a_symlink_entry_cannot_write_outside_the_destination() {
         entries: Vec::new(), // empty selection = the whole archive
         max_total_bytes: u64::MAX,
         on_conflict: archive_core::OnConflict::Overwrite,
+        test_mode: false,
     };
     let stats = archive
         .extract(&opts, None, &mut |_| true)

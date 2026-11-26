@@ -878,6 +878,7 @@ impl IpcService {
                 // Zip-bomb guard: writes are bounded by the user's limit.
                 max_total_bytes,
                 on_conflict,
+                test_mode: false,
             };
             let mut seen_paths = std::collections::HashSet::new();
             let mut throttle = ProgressThrottle::new(PROGRESS_MIN_INTERVAL);
@@ -1019,6 +1020,148 @@ impl IpcService {
                     return Err("error.archive_delete".into());
                 }
             }
+            Ok(())
+        }));
+        Ok(job_id)
+    }
+
+    /// Queue a test run (CRC verify, nothing written) and return its job id.
+    ///
+    /// Reuses the extraction job pipeline on purpose: the same selection
+    /// expansion, the same password rule, the same progress/cancel events and
+    /// the same `extract_failed` entry list. The only differences are
+    /// `ExtractOptions::test_mode` (the engine decodes every entry and writes
+    /// nothing) and a `test_finished` event on success, which carries the
+    /// number of verified files so the result window can say "N files checked,
+    /// all intact" instead of "extraction complete".
+    pub fn test_archive(
+        &self,
+        id: u64,
+        paths: Vec<String>,
+        password: Option<String>,
+    ) -> Result<u64, IpcError> {
+        let shared = self.lock_archive(id)?;
+        let password = password.or_else(|| self.registry.password(id));
+        let emit = Arc::clone(&self.emit);
+        let max_total_bytes = match self.settings.lock() {
+            Ok(s) => s.get().max_extract_bytes,
+            Err(p) => p.into_inner().get().max_extract_bytes,
+        };
+
+        let job_id = self.jobs.submit("test", Box::new(move |ctx| {
+            let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let entries = guard.0.entries_arc().map_err(|e| e.error_key().to_string())?;
+            let wanted = select_entries(&entries, &paths);
+            if wanted.is_empty() {
+                return Err("error.not_an_archive".into());
+            }
+            let wanted_set: std::collections::HashSet<u32> = wanted.iter().copied().collect();
+            let needs_password = entries
+                .iter()
+                .any(|e| wanted_set.contains(&e.index) && e.encrypted);
+            if needs_password && password.is_none() {
+                emit(
+                    "password_required",
+                    serde_json::json!({ "archive_id": id }),
+                );
+                return Err("error.password_required".into());
+            }
+            let total_items = wanted.len() as u64;
+            let total_bytes: u64 = entries
+                .iter()
+                .filter(|e| wanted_set.contains(&e.index))
+                .map(|e| e.size)
+                .sum();
+
+            // `dest` is never touched in test mode; the field has to hold
+            // something, and the process temp dir is a value no code path
+            // reads. Keeping it out of the caller's ABI means the UI command
+            // has no destination argument to get wrong.
+            let opts = archive_core::ExtractOptions {
+                dest: std::env::temp_dir(),
+                entries: wanted,
+                max_total_bytes,
+                on_conflict: archive_core::OnConflict::Rename,
+                test_mode: true,
+            };
+            let mut seen_paths = std::collections::HashSet::new();
+            let mut throttle = ProgressThrottle::new(PROGRESS_MIN_INTERVAL);
+            let result = guard.0.extract(&opts, password.as_deref(), &mut |d| {
+                if ctx.cancelled() {
+                    return false;
+                }
+                seen_paths.insert(d.current_path.clone());
+                if throttle.due() {
+                    ctx.report(
+                        seen_paths.len() as u64,
+                        total_items,
+                        d.done_bytes,
+                        total_bytes,
+                    );
+                }
+                true
+            });
+            drop(guard);
+            let stats = result.map_err(|e| {
+                let key = e.error_key().to_string();
+                if key == "error.password_required" {
+                    emit(
+                        "password_required",
+                        serde_json::json!({ "archive_id": id }),
+                    );
+                }
+                if let archive_core::ZipnestError::Corrupt(entries) = &e {
+                    if !entries.is_empty() {
+                        emit(
+                            "extract_failed",
+                            serde_json::json!({
+                                "count": entries.len(),
+                                "detail": serde_json::Value::Null,
+                                "entries": entries
+                                    .iter()
+                                    .map(|f| {
+                                        serde_json::json!({
+                                            "path": f.path,
+                                            "reason": f.reason,
+                                            "detail": f.detail,
+                                        })
+                                    })
+                                    .collect::<Vec<_>>(),
+                            }),
+                        );
+                    }
+                }
+                key
+            })?;
+            // A bad entry is a failed test, never a "checked, all good" — the
+            // same "Nothing is ever lost" rule an extraction follows.
+            if !stats.failed.is_empty() {
+                emit(
+                    "extract_failed",
+                    serde_json::json!({
+                        "count": stats.failed.len(),
+                        "detail": serde_json::Value::Null,
+                        "entries": stats.failed
+                            .iter()
+                            .map(|f| {
+                                serde_json::json!({
+                                    "path": f.path,
+                                    "reason": f.reason,
+                                    "detail": f.detail,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+                return Err("error.entries_failed".into());
+            }
+            emit(
+                "test_finished",
+                serde_json::json!({
+                    "verified": stats.files,
+                    "bytes": stats.bytes,
+                }),
+            );
             Ok(())
         }));
         Ok(job_id)

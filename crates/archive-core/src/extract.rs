@@ -36,6 +36,11 @@ const OP_CRC_ERROR: i32 = 3;
 const OP_WRONG_PASSWORD: i32 = 9;
 /// `NExtract::NAskMode::kExtract`.
 const ASK_EXTRACT: i32 = 0;
+/// `NExtract::NAskMode::kTest` — what the handler asks for when `Extract` was
+/// called with `testMode != 0` (IArchive.h: "test files without writing to
+/// outStream"). It is still a real decode; handing it our sink keeps progress,
+/// cancellation and the zip-bomb quota identical to a real extraction.
+const ASK_TEST: i32 = 1;
 
 /// Blocked-reason codes in [`DiskState::blocked`].
 const BLOCK_NONE: u8 = 0;
@@ -406,6 +411,13 @@ fn call_progress(raw: *mut c_void, p: &ExtractProgress) -> bool {
 struct DiskState {
     dest: PathBuf,
     on_conflict: OnConflict,
+    /// Test mode: `GetStream` hands out a discarding sink and nothing touches
+    /// the destination (see [`test_get_stream`]).
+    test_mode: bool,
+    /// Test mode: the entry whose bytes the handler is decoding right now, so
+    /// the verdict in `SetOperationResult` can name it. The handler serializes
+    /// `GetStream`/`SetOperationResult`, so one slot is enough.
+    test_in_flight: Mutex<Option<(String, u64)>>,
     entries: Vec<EntryMeta>, // sorted by index
     quota: Mutex<ExtractQuota>,
     blocked: AtomicU8,    // BLOCK_*
@@ -896,6 +908,157 @@ fn commit_pending(pw: &PendingWrite) -> std::io::Result<u64> {
     Ok(len)
 }
 
+// ===========================================================================
+// Test mode: decode every selected entry, write nothing
+// ===========================================================================
+
+/// Output stream for test mode: charges the quota, counts the bytes, and
+/// discards them.
+///
+/// The point of handing the engine a real stream instead of letting it use its
+/// internal "no stream = just check" path is that the CRC/size checks and the
+/// progress numbers stay exactly the same as a real extraction — the engine
+/// decompresses the bytes either way. `io::sink` costs nothing, so the only
+/// cost versus `testMode = 1` is one memcpy per chunk.
+#[repr(C)]
+struct SinkOutStream {
+    vt: *const SeqOutStreamVt,
+    refs: AtomicU32,
+    state: Arc<DiskState>,
+}
+
+static SINK_OUT_VT: SeqOutStreamVt = SeqOutStreamVt {
+    query_interface: sinkout_qi,
+    add_ref: sinkout_add_ref,
+    release: sinkout_release,
+    write: sinkout_write,
+};
+
+unsafe extern "system" fn sinkout_qi(
+    this: *mut c_void,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> Hresult {
+    if riid.is_null() || ppv.is_null() {
+        return E_FAIL;
+    }
+    if qi_matches(&*riid, &[IID_IUNKNOWN, IID_ISEQ_OUT_STREAM]) {
+        *ppv = this;
+        sinkout_add_ref(this);
+        S_OK
+    } else {
+        *ppv = std::ptr::null_mut();
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn sinkout_add_ref(this: *mut c_void) -> u32 {
+    let this = this as *mut SinkOutStream;
+    (*this).refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn sinkout_release(this: *mut c_void) -> u32 {
+    let this = this as *mut SinkOutStream;
+    let left = (*this).refs.fetch_sub(1, Ordering::Release) - 1;
+    if left == 0 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        drop(Box::from_raw(this));
+    }
+    left
+}
+
+unsafe extern "system" fn sinkout_write(
+    this: *mut c_void,
+    data: *const RawCVoid,
+    size: u32,
+    processed: *mut u32,
+) -> Hresult {
+    if processed.is_null() {
+        return E_FAIL;
+    }
+    *processed = 0;
+    if size == 0 {
+        return S_OK;
+    }
+    if data.is_null() {
+        return E_FAIL;
+    }
+    let this = this as *mut SinkOutStream;
+    let st = &(*this).state;
+    if st.cancelled.load(Ordering::SeqCst) == 1 {
+        *processed = size;
+        return S_OK;
+    }
+    // Even though nothing is written, the bytes count against the zip-bomb
+    // quota: a test run must not sit decompressing a 100 GB bomb for an hour.
+    {
+        let mut quota = match st.quota.lock() {
+            Ok(q) => q,
+            Err(_) => return E_FAIL,
+        };
+        if quota.charge(size as u64).is_err() {
+            st.blocked.store(BLOCK_QUOTA, Ordering::SeqCst);
+            *processed = size;
+            return S_OK;
+        }
+    }
+    st.done_bytes.fetch_add(size as u64, Ordering::Relaxed);
+    *processed = size;
+    S_OK
+}
+
+/// The disk callback's `GetStream`, for test mode: no destination, no temp
+/// file, no conflict question — just a sink that counts and discards.
+unsafe fn test_get_stream(
+    cb: *mut DiskExtractCallback,
+    index: u32,
+    out_stream: *mut *mut c_void,
+    ask_extract_mode: i32,
+) -> Hresult {
+    let st = &(*cb).state;
+    if st.cancelled.load(Ordering::SeqCst) == 1 {
+        return E_ABORT;
+    }
+    if st.blocked.load(Ordering::SeqCst) != BLOCK_NONE {
+        return S_OK;
+    }
+    if ask_extract_mode != ASK_EXTRACT && ask_extract_mode != ASK_TEST {
+        return S_OK;
+    }
+    let meta = match st.entry(index) {
+        Some(m) => m,
+        None => return E_FAIL,
+    };
+    if meta.is_dir {
+        st.account_unwritten(meta);
+        return S_OK;
+    }
+    {
+        let mut cell = match st.progress.lock() {
+            Ok(c) => c,
+            Err(p) => p.into_inner(),
+        };
+        cell.last_path = meta.raw_path.clone();
+    }
+    if !st.tick() {
+        return E_ABORT;
+    }
+    {
+        let mut slot = match st.test_in_flight.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        *slot = Some((meta.raw_path.clone(), meta.size));
+    }
+    let stream = Box::into_raw(Box::new(SinkOutStream {
+        vt: &SINK_OUT_VT,
+        refs: AtomicU32::new(1),
+        state: Arc::clone(st),
+    }));
+    *out_stream = stream as *mut c_void;
+    S_OK
+}
+
 unsafe extern "system" fn disk_get_stream(
     this: *mut c_void,
     index: u32,
@@ -908,7 +1071,9 @@ unsafe extern "system" fn disk_get_stream(
     *out_stream = std::ptr::null_mut();
     let cb = this as *mut DiskExtractCallback;
     let st = &(*cb).state;
-
+    if st.test_mode {
+        return test_get_stream(cb, index, out_stream, ask_extract_mode);
+    }
     if st.cancelled.load(Ordering::SeqCst) == 1 {
         return E_ABORT;
     }
@@ -1039,6 +1204,41 @@ unsafe extern "system" fn disk_op_result(this: *mut c_void, op_res: i32) -> Hres
     let st = &(*cb).state;
     if op_res != OP_OK {
         let _ = st.first_op_res.compare_exchange(0, op_res, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    // Test mode: the handler serializes GetStream → SetOperationResult, so the
+    // entry recorded by `test_get_stream` is the one this verdict is about.
+    if st.test_mode {
+        let in_flight = match st.test_in_flight.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(p) => p.into_inner().take(),
+        };
+        if let Some((raw, size)) = in_flight {
+            let clean = st.cancelled.load(Ordering::SeqCst) == 0
+                && st.blocked.load(Ordering::SeqCst) == BLOCK_NONE;
+            if op_res == OP_OK {
+                // Verified: count it exactly like a written file, so a
+                // successful test reports "N files verified" through the same
+                // `files` field.
+                st.files_committed.fetch_add(1, Ordering::Relaxed);
+                st.bytes_committed.fetch_add(size, Ordering::Relaxed);
+            } else if clean {
+                // The engine decoded this entry to a bad CRC or a failed
+                // decode. That entry is the reason the run fails, and it must
+                // be named — "everything is fine" over corrupt data is the one
+                // thing a test must never say.
+                st.record_failure(&raw, "error.corrupt", None);
+            }
+        }
+        if !st.tick() {
+            return E_ABORT;
+        }
+        if st.cancelled.load(Ordering::SeqCst) == 1
+            || st.blocked.load(Ordering::SeqCst) != BLOCK_NONE
+        {
+            return E_ABORT;
+        }
+        return S_OK;
     }
 
     // Finalize the entry that was just written. A complete entry that was not
@@ -1280,6 +1480,8 @@ pub(crate) fn extract_to_disk(
     let state = Arc::new(DiskState {
         dest: opts.dest.clone(),
         on_conflict: opts.on_conflict,
+        test_mode: opts.test_mode,
+        test_in_flight: Mutex::new(None),
         entries,
         quota: Mutex::new(ExtractQuota::new(opts.max_total_bytes)),
         blocked: AtomicU8::new(BLOCK_NONE),
@@ -1315,7 +1517,12 @@ pub(crate) fn extract_to_disk(
             arc.raw(),
             indices.as_ptr(),
             indices.len() as u32,
-            0, // testMode=0: write to the streams we hand out
+            // Test mode uses the engine's own "just verify" flag. The sink
+            // still gets the bytes for the handlers that call `GetStream`
+            // either way — see `test_get_stream` — so quota, progress and the
+            // per-entry CRC failures behave the same as a real run; this flag
+            // additionally tells the handlers not to look for a destination.
+            i32::from(opts.test_mode),
             cb as *mut c_void,
         )
     };
@@ -1359,6 +1566,13 @@ pub(crate) fn extract_to_disk(
     let op_res = state.first_op_res.load(Ordering::SeqCst);
     if op_res != 0 {
         let mut err = map_op_res(op_res, password.is_some(), arc.key_verified());
+        // Test mode: no password is involved at all (an encrypted entry with
+        // no password is refused before the job starts), so a failed decode is
+        // the data being wrong — never a wrong key. Without this, CRC errors on
+        // an unencrypted archive surfaced as the generic `error.engine`.
+        if opts.test_mode && matches!(op_res, OP_DATA_ERROR | OP_CRC_ERROR) {
+            err = ZipnestError::Corrupt(Vec::new());
+        }
         // 条目名单一走致命路径就会丢：下面那些 `?` 之外没人再读 `state.failed`。
         // 「哪些条目没写出来」是用户唯一的线索，所以在这里把名单挂到错误上，
         // 让 UI 能像 `error.entries_failed` 那样逐条列出来。
@@ -1444,6 +1658,7 @@ mod tests {
             entries: Vec::new(),
             max_total_bytes: u64::MAX,
             on_conflict: OnConflict::Rename,
+            test_mode: false,
         }
     }
 

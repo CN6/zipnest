@@ -1117,9 +1117,23 @@ fn run_apply_update(args: &[String]) -> i32 {
     0
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    /// The default: an extract started from the archive view.
+    #[default]
+    Extract,
+    Create,
+    /// CRC verification: same progress window, different wording, and success
+    /// means "checked, all intact" rather than "files are on disk".
+    Test,
+}
+
 #[derive(Default, Clone)]
 struct JobState {
     job_id: u64,
+    /// What this job is; decides the success wording and whether a destination
+    /// is worth showing.
+    kind: JobKind,
     done_items: u64,
     total_items: u64,
     done_bytes: u64,
@@ -1139,6 +1153,9 @@ struct JobState {
     create_skipped: u64,
     /// This extract asked the IPC layer to remove its source on success.
     delete_archive: bool,
+    /// Number of entries the last test run verified intact (`test_finished`).
+    /// Only meaningful when `kind == JobKind::Test`.
+    test_verified: u64,
     title: String,
     /// Where this job writes. Shown next to the result so the user does not
     /// have to guess the folder the app picked for them.
@@ -1418,6 +1435,17 @@ enum PasswordThen {
     Open,
     /// Re-run an extract that was refused for lack of a password.
     Extract(ExtractRequest),
+    /// Re-run a CRC test that was refused for lack of a password.
+    Test(TestRequest),
+}
+
+/// One "test this archive" request, kept whole so a password refusal can replay
+/// it without keeping the user's hands on the keyboard.
+#[derive(Clone)]
+struct TestRequest {
+    archive_id: u64,
+    /// Empty for "the whole archive", the entry paths otherwise.
+    sources: Vec<String>,
 }
 
 /// One extract request, kept whole so it can be replayed.
@@ -2126,6 +2154,10 @@ impl App {
             let n = self.job.as_ref().map(|j| j.skipped).unwrap_or(0);
             text = text.replace("{count}", &n.to_string());
         }
+        if key == "job.test.ok" {
+            let n = self.job.as_ref().map(|j| j.test_verified).unwrap_or(0);
+            text = text.replace("{count}", &n.to_string());
+        }
         if key == "job.ok_renamed" {
             let n = self.job.as_ref().map(|j| j.renamed).unwrap_or(0);
             text = text.replace("{count}", &n.to_string());
@@ -2268,6 +2300,14 @@ impl App {
                     }
                     self.skipped_links = links;
                 }
+                "test_finished" => {
+                    // A clean test run. The count is what the result window
+                    // says instead of "extraction complete".
+                    let verified = payload["verified"].as_u64().unwrap_or(0);
+                    if let Some(j) = self.job.as_mut() {
+                        j.test_verified = verified;
+                    }
+                }
                 "extract_failed" => {
                     // Files are missing. Build the lines the error dialog shows:
                     // the OS's own words (when it had any) plus one line per
@@ -2353,8 +2393,19 @@ impl App {
                         let renamed = self.job.as_ref().map(|j| j.renamed).unwrap_or(0);
                         let skipped_links =
                             self.job.as_ref().map(|j| j.create_skipped).unwrap_or(0);
+                        let is_test = self
+                            .job
+                            .as_ref()
+                            .map(|j| j.kind == JobKind::Test)
+                            .unwrap_or(false);
                         self.notice = Some(
-                            if delete_archive {
+                            if is_test {
+                                // A test does not unpack anything, so none of
+                                // the extraction wordings fit: "done" here
+                                // means "every entry decoded and its CRC
+                                // matched".
+                                "job.test.ok"
+                            } else if delete_archive {
                                 "job.ok_deleted"
                             } else if skipped_links > 0 {
                                 // 创建成功，但包是「缺了一部分」的：链接没跟进。
@@ -2823,6 +2874,19 @@ impl App {
                     .clicked()
                 {
                     self.begin_extract_dialog();
+                }
+                // Read-only check of the archive's CRC. Beside 开始解压 because
+                // it answers the same question ("are these files really
+                // intact?") without writing anything.
+                if theme::ghost_button_enabled(ui, &self.t("test.start"), extract_enabled)
+                    .on_hover_text(if self.selected.is_empty() {
+                        self.t("test.all_hint")
+                    } else {
+                        String::new()
+                    })
+                    .clicked()
+                {
+                    self.start_test();
                 }
                 if self.archive.is_some() {
                     // Space only: `ui.separator()` in a horizontal row draws a
@@ -3823,6 +3887,96 @@ impl App {
         }
     }
 
+    /// Start a CRC test job and point the progress window at it.
+    ///
+    /// Returns the error key when the job was refused; a password refusal is
+    /// left to the caller, which re-arms the prompt with the request intact.
+    fn begin_test(&mut self, req: TestRequest, password: Option<String>) -> Option<String> {
+        self.job = Some(JobState {
+            job_id: 0,
+            kind: JobKind::Test,
+            title: self.t("test.title"),
+            ..Default::default()
+        });
+        // 上一次任务的名字改写 / 失败列表属于上一次任务。
+        self.renamed_entries.clear();
+        self.error_detail.clear();
+        self.skipped_links.clear();
+        match self.svc.test_archive(req.archive_id, req.sources, password) {
+            Ok(jid) => {
+                if let Some(job) = self.job.as_mut() {
+                    job.job_id = jid;
+                }
+                None
+            }
+            Err(e) => {
+                self.job = None;
+                Some(e.key)
+            }
+        }
+    }
+
+    /// Toolbar / context-menu entry for the test: start it, or ask for the
+    /// password first when the selection is encrypted and none is known.
+    fn start_test(&mut self) {
+        let Some(id) = self.archive.as_ref().map(|a| a.id) else {
+            return;
+        };
+        if self.job_running() {
+            return;
+        }
+        let req = TestRequest {
+            archive_id: id,
+            sources: if self.selected.is_empty() {
+                Vec::new()
+            } else {
+                self.selected.iter().cloned().collect()
+            },
+        };
+        // The selection decides whether a password is needed, and the service
+        // refuses *before* the job starts — same rule as extraction. Ask here
+        // so the prompt owns the keyboard instead of a job failing behind it.
+        let any_encrypted = self
+            .archive
+            .as_ref()
+            .map(|_| self.selection_needs_password())
+            .unwrap_or(false);
+        if any_encrypted && self.archive_password.is_none() {
+            self.password_prompt = Some(PasswordPrompt {
+                path: self.archive_path.clone(),
+                text: String::new(),
+                retry: false,
+                focus: true,
+                then: PasswordThen::Test(req),
+            });
+            return;
+        }
+        match self.begin_test(req.clone(), self.archive_password.clone()) {
+            None => {}
+            Some(key) if is_password_key(&key) => {
+                self.password_prompt = Some(PasswordPrompt {
+                    path: self.archive_path.clone(),
+                    text: String::new(),
+                    retry: key == "error.password_incorrect",
+                    focus: true,
+                    then: PasswordThen::Test(req),
+                });
+            }
+            Some(key) => self.error = Some(self.t(&key)),
+        }
+    }
+
+    /// Does the current selection contain an encrypted entry the archive was
+    /// not opened with a password for?
+    ///
+    /// The UI only holds the root listing (`archive.entries`), so the answer
+    /// has to come from the service's cached full list. The cheap honest answer
+    /// here is the archive-level flag: if the archive was opened without a
+    /// password and has any encrypted entry anywhere, the run will be refused.
+    fn selection_needs_password(&self) -> bool {
+        self.archive.as_ref().map(|a| a.encrypted).unwrap_or(false)
+    }
+
     /// The password prompt.
     ///
     /// Shown whenever the engine needs a password to open an archive or to
@@ -3915,6 +4069,21 @@ impl App {
                                 retry: true,
                                 focus: true,
                                 then: PasswordThen::Extract(req),
+                            });
+                        }
+                        Some(key) => self.error = Some(self.t(&key)),
+                    }
+                }
+                PasswordThen::Test(req) => {
+                    match self.begin_test(req.clone(), Some(password)) {
+                        None => {}
+                        Some(key) if is_password_key(&key) => {
+                            self.password_prompt = Some(PasswordPrompt {
+                                path: prompt.path.clone(),
+                                text: String::new(),
+                                retry: true,
+                                focus: true,
+                                then: PasswordThen::Test(req),
                             });
                         }
                         Some(key) => self.error = Some(self.t(&key)),
@@ -4500,6 +4669,7 @@ impl App {
                 };
                 self.job = Some(JobState {
                     job_id: 0,
+                    kind: JobKind::Create,
                     title: self.t("create.title"),
                     // The archive itself is the result, but the button next to
                     // it opens a folder, so remember the folder it lands in.
@@ -5376,7 +5546,8 @@ impl App {
                         );
                         // Where the files went. The app picks the folder, so it
                         // is the one thing the user cannot work out themselves.
-                        if !j.dest.is_empty() {
+                        // A test writes nothing, so there is nothing to show.
+                        if !j.dest.is_empty() && j.kind != JobKind::Test {
                             ui.add_space(2.0);
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
@@ -5411,7 +5582,14 @@ impl App {
                         }
                     } else {
                         let k = j.error_key.clone().unwrap_or_else(|| "error.engine".into());
-                        ui.colored_label(error_color(ui), self.t(&k));
+                        // 测试失败先说一句人话，再给引擎的具体原因（已损坏 /
+                        // 密码错误…）：只印 `error.corrupt` 读起来像解压失败。
+                        if j.kind == JobKind::Test && k != "error.cancelled" {
+                            ui.colored_label(error_color(ui), self.t("job.test.failed"));
+                            ui.colored_label(error_color(ui), self.t(&k));
+                        } else {
+                            ui.colored_label(error_color(ui), self.t(&k));
+                        }
                         // 「全是链接」这一类失败同样要说清是哪几条。
                         if !skipped_links.is_empty() {
                             self.skipped_links_list(ui, &skipped_links);

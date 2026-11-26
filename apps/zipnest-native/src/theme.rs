@@ -566,13 +566,38 @@ pub const PROGRESS_LABEL_ON_FILL: f32 = 0.15;
 /// The hover fill comes from the theme instead of being measured from the whole
 /// available rect, so hovering one button no longer lights up the whole row.
 pub fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ghost_button_enabled(ui, text, true)
+}
+
+/// [`ghost_button`] with an explicit enabled flag: a disabled one keeps its
+/// seat and its label but neither highlights nor reports a click.
+pub fn ghost_button_enabled(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
     ui.scope(|ui| {
+        let dim = if enabled {
+            None
+        } else {
+            Some(weak_text(ui))
+        };
         let visuals = ui.visuals_mut();
         visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
         visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-        ui.add(egui::Button::new(text).frame(false))
+        if let Some(dim) = dim {
+            visuals.widgets.inactive.fg_stroke.color = dim;
+        }
+        let sense = if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        ui.add(egui::Button::new(text).frame(false).sense(sense))
     })
     .inner
+}
+
+fn weak_text(ui: &egui::Ui) -> Color32 {
+    ui.visuals()
+        .weak_text_color
+        .unwrap_or_else(|| ui.visuals().text_color().gamma_multiply(0.6))
 }
 
 /// One option in a set of mutually exclusive choices — format, compression

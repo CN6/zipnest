@@ -27,6 +27,7 @@ fn every_weird_name_extracts_and_nothing_is_ever_lost() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     let stats = arc
         .extract(&opts, None, &mut |_p| true)
@@ -104,6 +105,7 @@ fn no_weird_name_escapes_the_destination() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     arc.extract(&opts, None, &mut |_p| true).expect("extract");
 
@@ -134,6 +136,7 @@ fn a_file_that_cannot_be_written_is_reported_as_failed() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     let stats = arc.extract(&opts, None, &mut |_p| true).expect("extract");
 
@@ -177,6 +180,7 @@ fn colliding_names_all_reach_the_disk() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     let stats = arc.extract(&opts, None, &mut |_p| true).expect("extract");
 

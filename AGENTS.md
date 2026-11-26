@@ -414,7 +414,11 @@ still a 404, so the first `-Publish` run creates it.
   elevated admin is refused). `AllFilesystemObjects\shell` stays writable and is
   the documented fallback; the Win11 MSIX menu is unaffected either way. Warning
   key: `error.shell.file_menu`.
-- **Speed**: ZIP's Deflate is single-threaded, so `mt=on` only helps 7z/LZMA2.
+- **Speed**: `mt=on` (already set) parallelizes *across files*, so a ZIP or 7z
+  of many files uses every core. What stays single-threaded is one entry's own
+  Deflate/LZMA2 stream: a ZIP holding one 100 MB file compresses at the same
+  speed with `-mmt=1` and `-mmt=8` (measured 2026-11-27: 200 files 0.5 s → 0.1 s,
+  one 100 MB file 3.6 s → 3.6 s, 131 MB text at `-mx=9` 358 s either way).
   Progress is throttled to one report per 50 ms because the engines report once
   per entry and every report wakes the UI thread.
 - **Verification habit**: inspect the *unfiltered* window state. A sampling

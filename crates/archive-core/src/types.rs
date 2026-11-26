@@ -71,6 +71,21 @@ pub struct ExtractOptions {
     pub entries: Vec<u32>,
     pub max_total_bytes: u64,
     pub on_conflict: OnConflict,
+    /// Test mode: decompress every selected entry and verify its CRC, without
+    /// writing anything to disk.
+    ///
+    /// `dest` is ignored, no directories are created, and the conflict policy
+    /// does not apply — there is nothing on disk to conflict with. The output
+    /// stream handed to the engine discards its bytes (see `extract.rs`), which
+    /// costs nothing (`io::sink`) and keeps the byte-accurate progress and the
+    /// zip-bomb quota working exactly as they do for a real extraction.
+    ///
+    /// A run that reports success has verified every selected entry; entries
+    /// the engine decodes to a wrong CRC land in `ExtractStats::failed`, which
+    /// makes the run a failure (the "Nothing is ever lost" rule applies here
+    /// too: "tested all, everything is fine" must never be said over a bad
+    /// entry).
+    pub test_mode: bool,
 }
 
 /// Progress snapshot handed to the extract callback.

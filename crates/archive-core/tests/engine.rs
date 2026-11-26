@@ -95,6 +95,7 @@ fn extracts_plain_zip_to_disk() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     let mut ticks = 0;
     let stats = arc
@@ -158,6 +159,7 @@ fn failed_extract_keeps_the_existing_file_intact() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: 4, // trips the zip-bomb guard on the first chunk
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     let err = arc.extract(&opts, None, &mut |_p| true).expect_err("quota must trip");
     assert_eq!(err.error_key(), "error.quota_exceeded");
@@ -183,6 +185,7 @@ fn cancel_leaves_no_temp_files_behind() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     // Cancel after the second tick so at least one entry has started.
     let mut ticks = 0;
@@ -212,6 +215,7 @@ fn skip_policy_keeps_the_existing_file_and_reports_it() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Skip,
+        test_mode: false,
     };
     let stats = arc.extract(&opts, None, &mut |_p| true).expect("extract");
     assert_eq!(
@@ -239,6 +243,7 @@ fn rename_policy_writes_beside_the_existing_file() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Rename,
+        test_mode: false,
     };
     arc.extract(&opts, None, &mut |_p| true).expect("extract");
     assert_eq!(
@@ -266,6 +271,7 @@ fn extracted_files_keep_their_archived_mtime() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     arc.extract(&opts, None, &mut |_p| true).expect("extract");
     let written = std::fs::metadata(dest.join("a.txt"))
@@ -295,6 +301,7 @@ fn extract_cancel_returns_cancelled() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     let err = arc.extract(&opts, None, &mut |_p| false).expect_err("must cancel");
     assert_eq!(err.error_key(), "error.cancelled");
@@ -310,6 +317,7 @@ fn extract_quota_enforced() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: 10,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     let err = arc.extract(&opts, None, &mut |_p| true).expect_err("quota must trip");
     assert_eq!(err.error_key(), "error.quota_exceeded");
@@ -337,6 +345,7 @@ fn zip_slip_entry_lands_inside_the_destination_instead_of_being_dropped() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     let stats = arc
         .extract(&opts, None, &mut |_p| true)
@@ -382,6 +391,7 @@ fn reserved_name_is_renamed_and_others_still_extract() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     let stats = arc
         .extract(&opts, None, &mut |_p| true)
@@ -436,6 +446,7 @@ fn encrypted_7z_with_password_opens_and_extracts() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     arc.extract(&opts, Some("secret"), &mut |_p| true)
         .expect("extract");
@@ -452,6 +463,7 @@ fn encrypted_zip_wrong_password_on_extract() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     let err = arc
         .extract(&opts, Some("wrong"), &mut |_p| true)
@@ -469,6 +481,7 @@ fn encrypted_zip_extract_with_password_succeeds() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     arc.extract(&opts, Some("secret"), &mut |_p| true)
         .expect("extract with correct pw");
@@ -503,6 +516,7 @@ fn encrypted_zip_with_correct_password_and_bad_data_is_reported_as_damaged() {
         entries: (0..arc.len()).collect(),
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
+        test_mode: false,
     };
     let err = arc
         .extract(&opts, Some("secret"), &mut |_p| true)
@@ -606,4 +620,122 @@ fn mtime_is_a_sane_date() {
         (1_577_836_800..1_893_456_000).contains(&secs),
         "mtime {secs} is not a plausible 2020s date"
     );
+}
+// ---- Test mode: verify every entry's CRC without writing anything ----
+
+/// Build a ZIP whose directory is readable but whose stored data is wrong: the
+/// CRC in the central directory says one thing, the bytes say another. That is
+/// exactly the "download interrupted / USB copy died" case the test feature
+/// exists for — and the archive opens fine, so the failure can only come from
+/// decoding the entry.
+fn zip_with_bad_data(dir: &std::path::Path) -> PathBuf {
+    use std::io::Write;
+    let path = dir.join("bad-data.zip");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let opts: zip::write::SimpleFileOptions = Default::default();
+    zip.start_file("honest.txt", opts).unwrap();
+    zip.write_all(b"this one is fine").unwrap();
+    zip.start_file("damaged.bin", opts).unwrap();
+    zip.write_all(&vec![0xABu8; 4096]).unwrap();
+    zip.finish().unwrap();
+
+    // Flip a byte in the stored payload of `damaged.bin`. Its name appears in
+    // the local header immediately before the data, so searching for the name
+    // finds the payload; the CRC in both headers is now stale.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let needle = b"damaged.bin";
+    let at = bytes
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("local header must carry the name")
+        + needle.len();
+    // Skip the extra-field length (2 bytes, zero here) before the payload.
+    let data_at = at + 2;
+    bytes[data_at] ^= 0xFF;
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn test_mode_verifies_a_good_archive_without_writing_anything() {
+    let arc = Archive::open(&fx("plain.zip"), ArchiveOpenOptions::default()).unwrap();
+    // A destination that does not exist: a real extraction would create it, a
+    // test run must not — that difference is the whole contract.
+    let dest = tmpdir("testmode-good");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        on_conflict: OnConflict::Rename,
+        test_mode: true,
+    };
+    let mut paths = Vec::new();
+    let stats = arc
+        .extract(&opts, None, &mut |p| {
+            paths.push(p.current_path.clone());
+            true
+        })
+        .expect("a good archive verifies cleanly");
+    assert_eq!(stats.files, 3, "a.txt, c.txt and sub/b.txt are the files");
+    assert!(stats.failed.is_empty(), "nothing may fail: {:?}", stats.failed);
+    assert!(
+        !dest.exists(),
+        "test mode must not create the destination folder"
+    );
+    // Progress still names the entries, so the UI can show what it is checking.
+    assert!(
+        paths.iter().any(|p| p.ends_with("a.txt")),
+        "progress must carry current paths: {paths:?}"
+    );
+}
+
+#[test]
+fn test_mode_reports_the_entry_whose_data_is_bad() {
+    let dir = tmpdir("testmode-bad");
+    std::fs::create_dir_all(&dir).unwrap();
+    let zip = zip_with_bad_data(&dir);
+    let arc = Archive::open(&zip, ArchiveOpenOptions::default()).expect("the directory reads fine");
+    let opts = ExtractOptions {
+        dest: dir.join("never-created"),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: u64::MAX,
+        on_conflict: OnConflict::Rename,
+        test_mode: true,
+    };
+    // A bad entry is a failed run, not a quiet "checked, all good": the caller
+    // maps this to `error.entries_failed` and lists the names.
+    let err = arc
+        .extract(&opts, None, &mut |_| true)
+        .expect_err("damaged data must fail the test run");
+    match err {
+        archive_core::ZipnestError::Corrupt(entries) => {
+            assert!(
+                entries.iter().any(|e| e.path == "damaged.bin"),
+                "the damaged entry must be named: {entries:?}"
+            );
+        }
+        other => panic!("expected a corrupt-data error, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_mode_still_counts_against_the_zip_bomb_quota() {
+    // Nothing is written, but the decompression still costs CPU; a test run on
+    // a bomb must stop at the same limit a real extraction would.
+    let arc = Archive::open(&fx("plain.zip"), ArchiveOpenOptions::default()).unwrap();
+    let dest = tmpdir("testmode-quota");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: (0..arc.len()).collect(),
+        max_total_bytes: 64, // far below the fixture's payload
+        on_conflict: OnConflict::Rename,
+        test_mode: true,
+    };
+    let err = arc
+        .extract(&opts, None, &mut |_| true)
+        .expect_err("the quota must stop a test run too");
+    assert_eq!(err.error_key(), "error.quota_exceeded");
+    assert!(!dest.exists());
 }

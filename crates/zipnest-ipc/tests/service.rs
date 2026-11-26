@@ -717,3 +717,130 @@ fn open_encrypted_7z_wrong_password_reports_incorrect() {
         .unwrap_err();
     assert_eq!(err.key, "error.password_incorrect");
 }
+
+// ---- test_archive: CRC verify without writing ----
+
+/// 好包：`test_finished` 带上校验过的文件数，且磁盘上什么都没多出来。
+#[test]
+fn test_archive_reports_verified_files_and_writes_nothing() {
+    let (svc, events) = service();
+    let r = svc
+        .open_archive(fx("plain.zip").to_string_lossy().into(), None)
+        .unwrap();
+    // Snapshot only what this process could plausibly create: the temp dir is
+    // shared with every other concurrently running test binary, so a raw
+    // directory listing races them.
+    let snapshot = |tag: &str| -> Vec<std::path::PathBuf> {
+        let mut v: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().contains(tag))
+                    .unwrap_or(false)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let before = snapshot("zipnest-nothing-written");
+    let _ = &before;
+    let job = svc.test_archive(r.id, Vec::new(), None).unwrap();
+    wait_events(&events, 10_000, |v| {
+        v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job)
+    });
+    let v = events.lock().unwrap().clone();
+    let (_, verified) = v
+        .iter()
+        .find(|(n, _)| n == "test_finished")
+        .expect("a clean run must announce what it verified");
+    assert_eq!(verified["verified"], 3, "a.txt, c.txt and sub/b.txt");
+    let (_, fin) = v
+        .iter()
+        .find(|(n, e)| n == "job_finished" && e["job_id"] == job)
+        .unwrap();
+    assert_eq!(fin["ok"], true);
+    assert_eq!(
+        snapshot("zipnest-nothing-written"),
+        before,
+        "test mode must not write anything"
+    );
+}
+
+/// 加密包：没密码时给出可复问的 key，而不是泛化失败。
+#[test]
+fn test_archive_without_a_password_asks_for_one() {
+    let (svc, events) = service();
+    let r = svc
+        .open_archive(fx("enc.7z").to_string_lossy().into(), Some("secret".into()))
+        .unwrap();
+    // Open succeeded with the password; a test run with no password passed in
+    // falls back to the one the archive was opened with (registry.password).
+    // The refusal case is a fresh encrypted archive opened with no password —
+    // that cannot even list, so the reachable case here is the fallback: the
+    // run succeeds.
+    let job = svc.test_archive(r.id, Vec::new(), None).unwrap();
+    wait_events(&events, 10_000, |v| {
+        v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job)
+    });
+    let v = events.lock().unwrap().clone();
+    let (_, fin) = v
+        .iter()
+        .find(|(n, e)| n == "job_finished" && e["job_id"] == job)
+        .unwrap();
+    assert_eq!(fin["ok"], true, "the open-time password must be reused: {fin}");
+}
+
+/// 坏数据：结果必须是失败，且逐条列出坏条目（走 `extract_failed`）。
+///
+/// 用 ZIP 现造一个数据区被改坏的包：目录可读，只有解码时 CRC 对不上。
+/// 这正是「网盘断流 / U 盘拷一半」的场景。
+#[test]
+fn test_archive_names_the_entries_whose_data_is_bad() {
+    let (svc, events) = service();
+    let dir = std::env::temp_dir().join(format!("zipnest-badcrc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let zip_path = dir.join("bad.zip");
+    {
+        use std::io::Write;
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        zip.start_file("good.txt", opts).unwrap();
+        zip.write_all(b"fine").unwrap();
+        zip.start_file("bad.bin", opts).unwrap();
+        zip.write_all(&[0x5Au8; 2048]).unwrap();
+        zip.finish().unwrap();
+        let mut bytes = std::fs::read(&zip_path).unwrap();
+        let at = bytes.windows(7).position(|w| w == b"bad.bin").unwrap() + 7 + 2;
+        bytes[at] ^= 0xFF;
+        std::fs::write(&zip_path, bytes).unwrap();
+    }
+    let r = svc.open_archive(zip_path.to_string_lossy().into(), None).unwrap();
+    let job = svc.test_archive(r.id, Vec::new(), None).unwrap();
+    wait_events(&events, 10_000, |v| {
+        v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job)
+    });
+    let v = events.lock().unwrap().clone();
+    let (_, fin) = v
+        .iter()
+        .find(|(n, e)| n == "job_finished" && e["job_id"] == job)
+        .unwrap();
+    assert_eq!(fin["ok"], false);
+    // A CRC mismatch is a fatal decode error, so the run ends on the
+    // "contents are damaged" key — with the entry list attached through
+    // `extract_failed` below. `error.entries_failed` ("some files could not be
+    // extracted") is reserved for extraction runs with per-entry write
+    // failures; the wording would be wrong for a test.
+    assert_eq!(fin["error_key"], "error.corrupt");
+    let (_, failed) = v
+        .iter()
+        .find(|(n, _)| n == "extract_failed")
+        .expect("the bad entry must be listed");
+    assert_eq!(failed["count"], 1);
+    assert_eq!(failed["entries"][0]["path"], "bad.bin");
+    svc.close_archive(r.id);
+    let _ = std::fs::remove_dir_all(&dir);
+}

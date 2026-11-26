@@ -4793,6 +4793,7 @@ dependencies = [
  "archive-jobs",
  "serde",
  "serde_json",
+ "zip",
 ]
 
 [[package]]
