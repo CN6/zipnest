@@ -739,3 +739,86 @@ fn test_mode_still_counts_against_the_zip_bomb_quota() {
     assert_eq!(err.error_key(), "error.quota_exceeded");
     assert!(!dest.exists());
 }
+
+/// 撞名后自动改名的条目必须出现在 `conflict_renamed` —— 而不是 `renamed`。
+///
+/// 这是 A2（右键免对话框动词）的前提：免对话框的解压固定用"自动重命名"，
+/// 用户看不到解压对话框，也就没有别的渠道知道某个文件改叫 `name (2).ext` 了。
+/// 从前这类改名什么都不记，结果窗口只会说"完成"，而磁盘上的文件名和包里不一样。
+#[test]
+fn a_conflict_rename_is_reported_apart_from_name_cleaning() {
+    let dir = tmpdir("conflict-report");
+    std::fs::create_dir_all(&dir).unwrap();
+    let zip = dir.join("a.zip");
+    {
+        use std::io::Write;
+        let file = std::fs::File::create(&zip).unwrap();
+        let mut z = zip::ZipWriter::new(file);
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        z.start_file("a.txt", opts).unwrap();
+        z.write_all(b"new content").unwrap();
+        z.finish().unwrap();
+    }
+    let dest = dir.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("a.txt"), b"old content").unwrap();
+
+    let arc = Archive::open(&zip, ArchiveOpenOptions::default()).unwrap();
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: Vec::new(),
+        max_total_bytes: u64::MAX,
+        on_conflict: OnConflict::Rename,
+        test_mode: false,
+    };
+    let stats = arc.extract(&opts, None, &mut |_| true).expect("extract");
+    assert_eq!(stats.conflict_renamed.len(), 1, "got {:?}", stats.conflict_renamed);
+    let r = &stats.conflict_renamed[0];
+    assert_eq!(r.from, "a.txt");
+    assert_eq!(r.to, "a (2).txt");
+    assert!(
+        stats.renamed.is_empty(),
+        "name cleaning did not happen here, so `renamed` must stay empty: {:?}",
+        stats.renamed
+    );
+    // Both files are on disk: the old one untouched, the new one beside it.
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"old content");
+    assert_eq!(std::fs::read(dest.join("a (2).txt")).unwrap(), b"new content");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 名字清洗（`CON` → `CON_`）只进 `renamed`，不混进 `conflict_renamed`：
+/// 两件事的原因不同，结果窗口的措辞也不同。
+#[test]
+fn name_cleaning_does_not_land_in_the_conflict_list() {
+    let dir = tmpdir("clean-not-conflict");
+    std::fs::create_dir_all(&dir).unwrap();
+    let zip = dir.join("h.zip");
+    {
+        use std::io::Write;
+        let file = std::fs::File::create(&zip).unwrap();
+        let mut z = zip::ZipWriter::new(file);
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        z.start_file("CON", opts).unwrap();
+        z.write_all(b"x").unwrap();
+        z.finish().unwrap();
+    }
+    let dest = dir.join("out");
+    let arc = Archive::open(&zip, ArchiveOpenOptions::default()).unwrap();
+    let opts = ExtractOptions {
+        dest,
+        entries: Vec::new(),
+        max_total_bytes: u64::MAX,
+        on_conflict: OnConflict::Rename,
+        test_mode: false,
+    };
+    let stats = arc.extract(&opts, None, &mut |_| true).expect("extract");
+    assert_eq!(stats.renamed.len(), 1);
+    assert_eq!(stats.renamed[0].to, "CON_");
+    assert!(
+        stats.conflict_renamed.is_empty(),
+        "nothing was in the destination, so no conflict rename: {:?}",
+        stats.conflict_renamed
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

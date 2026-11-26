@@ -381,10 +381,31 @@ pub fn menu_ops(target: MenuTarget, exe: &std::path::Path) -> Vec<RegOp> {
             // entry next to the new default one. Drop the whole subtree first:
             // the ops below rebuilds this key from scratch.
             ops.push(RegOp::DeleteKey { key: format!(r"{key}\shell") });
+            ops.push(RegOp::set(key.clone(), Some("MultiSelectModel"), "Player"));
             ops.push(RegOp::set(format!(r"{key}\command"), None, format!("{exe_q} --add {arg}")));
+            // "添加到 <文件夹名>.zip": one click, no wizard. The app refuses to
+            // overwrite an existing archive — it lands as `name (2).zip` and
+            // says so in the result window instead.
+            if target == MenuTarget::Directory {
+                ops.push(RegOp::set(
+                    format!(r"{key}\shell\add_here"),
+                    Some("MUIVerb"),
+                    "添加到 \u{300a}文件夹名\u{300b}.zip",
+                ));
+                ops.push(RegOp::set(
+                    format!(r"{key}\shell\add_here\command"),
+                    None,
+                    format!("{exe_q} --add-here {arg}"),
+                ));
+            }
         }
         MenuTarget::File => {
             ops.push(RegOp::set(format!(r"{key}\command"), None, format!("{exe_q} {arg}")));
+            // The verbs below accept several files at once: Explorer runs the
+            // command line once with every selected path appended, and
+            // `MultiSelectModel=Player` is what tells it this verb wants that
+            // instead of being launched once per file.
+            ops.push(RegOp::set(key.clone(), Some("MultiSelectModel"), "Player"));
             ops.push(RegOp::set(format!(r"{key}\shell\add"), Some("MUIVerb"), "添加到压缩包…"));
             ops.push(RegOp::set(
                 format!(r"{key}\shell\add\command"),
@@ -399,6 +420,32 @@ pub fn menu_ops(target: MenuTarget, exe: &std::path::Path) -> Vec<RegOp> {
                 format!(r"{key}\shell\extract\command"),
                 None,
                 format!("{exe_q} --extract {arg}"),
+            ));
+            // The two one-click unpacks, into the archive's own folder and into
+            // a subfolder named after it. No dialog: the point of these verbs is
+            // that they are the two most common actions on a downloaded archive.
+            // They still ask about existing files — the app checks the
+            // destination first and only opens the question when something is
+            // really in the way (v0.4.39's rule).
+            ops.push(RegOp::set(
+                format!(r"{key}\shell\extract_here"),
+                Some("MUIVerb"),
+                "解压到当前文件夹",
+            ));
+            ops.push(RegOp::set(
+                format!(r"{key}\shell\extract_here\command"),
+                None,
+                format!("{exe_q} --extract-here {arg}"),
+            ));
+            ops.push(RegOp::set(
+                format!(r"{key}\shell\extract_to_subdir"),
+                Some("MUIVerb"),
+                "解压到 \u{300a}包名\u{300b} 文件夹",
+            ));
+            ops.push(RegOp::set(
+                format!(r"{key}\shell\extract_to_subdir\command"),
+                None,
+                format!("{exe_q} --extract-to-subdir {arg}"),
             ));
         }
     }
@@ -1268,5 +1315,68 @@ mod tests {
         );
         crate::user_choice::release_default(ext, &prog).expect("release");
         assert!(crate::user_choice::recorded_handler(ext).is_none());
+    }
+}
+#[cfg(test)]
+mod one_click_verb_tests {
+    use super::*;
+
+    fn exe() -> &'static std::path::Path {
+        std::path::Path::new(r"C:\Program Files\ZipNest\ZipNest.exe")
+    }
+
+    fn find_set<'a>(ops: &'a [RegOp], key: &str, name: Option<&str>) -> Option<&'a str> {
+        ops.iter().find_map(|op| match op {
+            RegOp::SetValue { key: k, name: n, value, .. } if k == key && n.as_deref() == name => {
+                Some(value.as_str())
+            }
+            _ => None,
+        })
+    }
+
+    /// 两个免对话框解压动词各自带着自己的命令行开关；漏掉开关会退化成"打开
+    /// 对话框"，用户点一下却什么也没发生。
+    #[test]
+    fn the_file_menu_carries_the_one_click_unpack_verbs() {
+        let ops = file_menu_ops(exe());
+        let base = r"HKCU\Software\Classes\*\shell\ZipNest";
+        assert_eq!(
+            find_set(&ops, &format!(r"{base}\shell\extract_here\command"), None),
+            Some(r#""C:\Program Files\ZipNest\ZipNest.exe" --extract-here "%1""#)
+        );
+        assert_eq!(
+            find_set(&ops, &format!(r"{base}\shell\extract_here"), Some("MUIVerb")),
+            Some("解压到当前文件夹")
+        );
+        assert_eq!(
+            find_set(&ops, &format!(r"{base}\shell\extract_to_subdir\command"), None),
+            Some(r#""C:\Program Files\ZipNest\ZipNest.exe" --extract-to-subdir "%1""#)
+        );
+        // Every path-taking verb opts into multi-select, or Explorer launches
+        // one process per file and a ten-file selection opens ten windows.
+        assert_eq!(
+            find_set(&ops, base, Some("MultiSelectModel")),
+            Some("Player")
+        );
+    }
+
+    /// 文件夹的「添加到 <文件夹名>.zip」只出现在文件夹上，不出现桌面背景
+    /// （背景没有名字可用来命名输出文件）。
+    #[test]
+    fn the_folder_menu_offers_a_one_click_zip() {
+        let dir = directory_menu_ops(exe());
+        assert_eq!(
+            find_set(
+                &dir,
+                r"HKCU\Software\Classes\Directory\shell\ZipNest\shell\add_here\command",
+                None
+            ),
+            Some(r#""C:\Program Files\ZipNest\ZipNest.exe" --add-here "%1""#)
+        );
+        let bg = background_menu_ops(exe());
+        assert!(
+            !bg.iter().any(|o| matches!(o, RegOp::SetValue { key, .. } if key.contains("add_here"))),
+            "the desktop background has no folder name to pack into"
+        );
     }
 }

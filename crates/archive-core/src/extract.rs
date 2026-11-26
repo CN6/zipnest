@@ -423,6 +423,10 @@ struct DiskState {
     blocked: AtomicU8,    // BLOCK_*
     cancelled: AtomicU8,  // 1 when the user closure asked to stop
     skipped: Mutex<Vec<String>>,
+    /// Entries the destination already held and the run moved aside as
+    /// `name (n).ext` (conflict policy `rename`). Reported apart from
+    /// `renamed` (name cleaning); see `ExtractStats::conflict_renamed`.
+    conflict_renamed: Mutex<Vec<RenamedEntry>>,
     /// Entries that could not be written. Non-empty ⇒ the run failed; the
     /// caller reports a failure instead of pretending the extraction worked.
     failed: Mutex<Vec<EntryFailure>>,
@@ -1129,7 +1133,22 @@ unsafe extern "system" fn disk_get_stream(
                 return st.skip_entry(meta);
             }
             OnConflict::Rename => match unique_dest(&full) {
-                Some(free) => free,
+                Some(free) => {
+                    // The file the user will find under a different name. The
+                    // relative path is what the result window shows, next to
+                    // the archive's own name for the entry.
+                    let to = free
+                        .strip_prefix(&st.dest)
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|_| free.to_string_lossy().into_owned());
+                    if let Ok(mut list) = st.conflict_renamed.lock() {
+                        list.push(RenamedEntry {
+                            from: meta.raw_path.clone(),
+                            to,
+                        });
+                    }
+                    free
+                }
                 // Every `name (n).ext` up to 9999 exists. The policy promises
                 // never to overwrite, so this entry cannot be written — which is
                 // a failure to report, not something to hide behind "done".
@@ -1487,6 +1506,7 @@ pub(crate) fn extract_to_disk(
         blocked: AtomicU8::new(BLOCK_NONE),
         cancelled: AtomicU8::new(0),
         skipped: Mutex::new(Vec::new()),
+        conflict_renamed: Mutex::new(Vec::new()),
         failed: Mutex::new(Vec::new()),
         io_error: Mutex::new(None),
         first_op_res: AtomicI32::new(0),
@@ -1592,6 +1612,11 @@ pub(crate) fn extract_to_disk(
         .lock()
         .map(|mut s| std::mem::take(&mut *s))
         .unwrap_or_default();
+    let conflict_renamed = state
+        .conflict_renamed
+        .lock()
+        .map(|mut s| std::mem::take(&mut *s))
+        .unwrap_or_default();
     let failed = state
         .failed
         .lock()
@@ -1607,6 +1632,7 @@ pub(crate) fn extract_to_disk(
             .into_iter()
             .filter(|r| r.from != r.to && r.from.replace('\\', "/") != r.to)
             .collect(),
+        conflict_renamed,
         failed,
     })
 }

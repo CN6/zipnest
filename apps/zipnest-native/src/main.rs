@@ -1152,6 +1152,9 @@ struct JobState {
     skipped: u64,
     /// Entries written under a rewritten name. All of them are on disk.
     renamed: u64,
+    /// Entries moved aside as `name (2).ext` because the destination already
+    /// held the name. Also on disk; the *name* is the news.
+    conflict_renamed: u64,
     /// 创建时被跳过、没有进包的链接数（符号链接 / 目录联接）。非 0 表示这个
     /// 压缩包不完整 —— 内容仍然可用，但用户必须看见少了什么。
     create_skipped: u64,
@@ -1272,6 +1275,11 @@ fn main() -> Result<(), eframe::Error> {
     // Set by the "解压到…" context-menu verb: open the archive and bring the
     // extract dialog up with it, so the destination can be picked immediately.
     let mut launch_extract = false;
+    // The three one-click verbs (A2). Each takes every path Explorer appends,
+    // so the fields collect instead of keeping only the first.
+    let mut launch_extract_here: Vec<String> = Vec::new();
+    let mut launch_extract_subdir: Vec<String> = Vec::new();
+    let mut launch_add_here: Vec<String> = Vec::new();
     // `--register-integration` is what the installer runs after copying the
     // files: it claims the archive extensions and the context menus, so a
     // machine where the app is never opened still has them. No UI starts.
@@ -1294,25 +1302,57 @@ fn main() -> Result<(), eframe::Error> {
         };
     }
     {
-        let mut add_mode = false;
+        // Which flag the following paths belong to. `Open` is the default: a
+        // bare path (double-click, "打开方式") shows the archive.
+        #[derive(PartialEq, Clone, Copy)]
+        enum Mode {
+            Open,
+            Add,
+            ExtractHere,
+            ExtractSubdir,
+            AddHere,
+        }
+        let mut mode = Mode::Open;
         for a in args.iter().skip(1) {
-            if a == "--add" {
-                add_mode = true;
-                continue;
-            }
-            if a == "--extract" {
-                launch_extract = true;
-                continue;
+            match a.as_str() {
+                "--add" => {
+                    mode = Mode::Add;
+                    continue;
+                }
+                "--extract" => {
+                    launch_extract = true;
+                    continue;
+                }
+                "--extract-here" => {
+                    mode = Mode::ExtractHere;
+                    continue;
+                }
+                "--extract-to-subdir" => {
+                    mode = Mode::ExtractSubdir;
+                    continue;
+                }
+                "--add-here" => {
+                    mode = Mode::AddHere;
+                    continue;
+                }
+                _ => {}
             }
             if a.starts_with('-') {
                 continue;
             }
-            if add_mode {
-                if std::path::Path::new(a).exists() {
-                    launch_add.push(a.clone());
+            if !std::path::Path::new(a).exists() {
+                continue;
+            }
+            match mode {
+                Mode::Add => launch_add.push(a.clone()),
+                Mode::ExtractHere => launch_extract_here.push(a.clone()),
+                Mode::ExtractSubdir => launch_extract_subdir.push(a.clone()),
+                Mode::AddHere => launch_add_here.push(a.clone()),
+                Mode::Open => {
+                    if launch_open.is_none() && std::path::Path::new(a).is_file() {
+                        launch_open = Some(a.clone());
+                    }
                 }
-            } else if launch_open.is_none() && std::path::Path::new(a).is_file() {
-                launch_open = Some(a.clone());
             }
         }
     }
@@ -1324,7 +1364,17 @@ fn main() -> Result<(), eframe::Error> {
     // extracting, a new request opens its own window instead of queueing behind
     // the job, so both can make progress. `--new-instance` opts out entirely.
     let force_new_instance = args.iter().any(|a| a == "--new-instance");
-    let request = if let Some(path) = launch_open.clone() {
+    let request = if !launch_extract_here.is_empty() {
+        Some(single_instance::LaunchRequest::ExtractHere(
+            launch_extract_here.clone(),
+        ))
+    } else if !launch_extract_subdir.is_empty() {
+        Some(single_instance::LaunchRequest::ExtractToSubdir(
+            launch_extract_subdir.clone(),
+        ))
+    } else if !launch_add_here.is_empty() {
+        Some(single_instance::LaunchRequest::AddHere(launch_add_here.clone()))
+    } else if let Some(path) = launch_open.clone() {
         Some(if launch_extract {
             single_instance::LaunchRequest::Extract(path)
         } else {
@@ -1702,6 +1752,11 @@ struct App {
     /// The row context menu that is on screen, if any. Rebuilt every frame so
     /// it survives the row scrolling out of the visible range.
     row_menu_click: Option<RowMenu>,
+    /// Paths a one-click verb still has to process, drained as each job ends.
+    /// Explorer passes every selected file to one command line, and the UI can
+    /// only hold one archive open at a time, so multi-select becomes a queue.
+    quick_extract_queue: Vec<(String, QuickExtract)>,
+    quick_add_queue: Vec<String>,
     error: Option<String>,
     notice: Option<String>,
     /// When the current notice should disappear on its own. Only success
@@ -1729,6 +1784,11 @@ struct App {
     /// `(name in the archive, name on disk)` for entries the last extraction
     /// had to rewrite so they could be written at all.
     renamed_entries: Vec<(String, String)>,
+    /// `(name in the archive, name on disk)` for entries the run moved aside as
+    /// `name (2).ext` because the destination already held the name. Separate
+    /// from `renamed_entries` on purpose — the reason differs, and so does the
+    /// sentence the user needs.
+    conflict_renamed_entries: Vec<(String, String)>,
     /// 上一次创建时因为是指向别处的链接而没有进包的条目：`(路径, 是否目录)`。
     /// 由 `create_skipped` 事件填，与 `renamed_entries` 一样属于「那一次任务」，
     /// 新任务开始时清空。
@@ -2034,6 +2094,8 @@ impl App {
             cursor: None,
             keyboard_nav: false,
             row_menu_click: None,
+            quick_extract_queue: Vec::new(),
+            quick_add_queue: Vec::new(),
             error: None,
             notice_until: None,
             flash_taskbar: false,
@@ -2051,6 +2113,7 @@ impl App {
             extract_dest: String::new(),
             extract_skipped: 0,
             renamed_entries: Vec::new(),
+            conflict_renamed_entries: Vec::new(),
             skipped_links: Vec::new(),
             error_detail: Vec::new(),
             delete_source: false,
@@ -2194,6 +2257,10 @@ impl App {
             let n = self.job.as_ref().map(|j| j.test_verified).unwrap_or(0);
             text = text.replace("{count}", &n.to_string());
         }
+        if key == "job.ok_conflict_renamed" {
+            let n = self.job.as_ref().map(|j| j.conflict_renamed).unwrap_or(0);
+            text = text.replace("{count}", &n.to_string());
+        }
         if key == "job.ok_renamed" {
             let n = self.job.as_ref().map(|j| j.renamed).unwrap_or(0);
             text = text.replace("{count}", &n.to_string());
@@ -2318,6 +2385,30 @@ impl App {
                     }
                     self.renamed_entries = pairs;
                 }
+                "extract_conflict_renamed" => {
+                    // The destination already had these names; the files are
+                    // on disk as `name (2).ext`. A one-click verb has no
+                    // dialog to show that afterwards, so the result window
+                    // must list them or the rename happened invisibly.
+                    let pairs: Vec<(String, String)> = payload["entries"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(|e| {
+                                    (
+                                        e["from"].as_str().unwrap_or_default().to_string(),
+                                        e["to"].as_str().unwrap_or_default().to_string(),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let count = payload["count"].as_u64().unwrap_or(0);
+                    if let Some(j) = self.job.as_mut() {
+                        j.conflict_renamed = count;
+                    }
+                    self.conflict_renamed_entries = pairs;
+                }
                 "create_skipped" => {
                     // 符号链接 / 目录联接没有进包。和 `extract_renamed` 同一套
                     // 写法：整份列表留在这里，结果窗口逐条列出，条数另记一份供
@@ -2439,6 +2530,11 @@ impl App {
                         let renamed = self.job.as_ref().map(|j| j.renamed).unwrap_or(0);
                         let skipped_links =
                             self.job.as_ref().map(|j| j.create_skipped).unwrap_or(0);
+                        let conflict_renamed = self
+                            .job
+                            .as_ref()
+                            .map(|j| j.conflict_renamed)
+                            .unwrap_or(0);
                         let is_test = self
                             .job
                             .as_ref()
@@ -2459,6 +2555,8 @@ impl App {
                                 "job.ok_create_skipped"
                             } else if renamed > 0 {
                                 "job.ok_renamed"
+                            } else if conflict_renamed > 0 {
+                                "job.ok_conflict_renamed"
                             } else if skipped > 0 {
                                 "job.ok_skipped"
                             } else {
@@ -2565,6 +2663,150 @@ impl App {
                 self.show_create = true;
                 self.refresh_default_dest();
             }
+            single_instance::LaunchRequest::ExtractHere(paths) => {
+                self.quick_extract(paths, QuickExtract::Here);
+            }
+            single_instance::LaunchRequest::ExtractToSubdir(paths) => {
+                self.quick_extract(paths, QuickExtract::Subdir);
+            }
+            single_instance::LaunchRequest::AddHere(paths) => {
+                self.quick_add(paths);
+            }
+        }
+    }
+
+    /// 解压到当前文件夹 / 解压到 <包名> 文件夹 — the two one-click verbs.
+    ///
+    /// Each archive in the request is opened in turn and unpacked with the
+    /// destination decided here. Multiple paths are handled by opening the
+    /// first and queueing the rest in [`Self::quick_extract_queue`], because the
+    /// UI only ever holds one archive open; the queue drains as each job ends.
+    ///
+    /// Existing files still get the v0.4.39 question: [`Self::request_extract`]
+    /// counts what is really in the destination and only asks when something is
+    /// there — never a silent overwrite, and never a question about an empty
+    /// folder.
+    fn quick_extract(&mut self, mut paths: Vec<String>, how: QuickExtract) {
+        if paths.is_empty() {
+            return;
+        }
+        let first = paths.remove(0);
+        self.quick_extract_queue
+            .extend(paths.into_iter().map(|p| (p, how)));
+        self.quick_extract_one(&first, how);
+    }
+
+    fn quick_extract_one(&mut self, path: &str, how: QuickExtract) {
+        if self.job_running() {
+            // One job at a time is the app's own rule; wait for it and then
+            // run this request like any other queued one.
+            self.quick_extract_queue.push((path.to_string(), how));
+            return;
+        }
+        self.open_archive(path);
+        let Some(id) = self.archive.as_ref().map(|a| a.id) else {
+            return;
+        };
+        // The directory the one-click verbs unpack into, from the archive's
+        // own location. `default_extract_dest` is the dialog's default and
+        // honours the user's configured root; these verbs deliberately do not
+        // ("当前文件夹" means the folder the archive is in).
+        let parent = self.current_archive_dir();
+        let dest = match how {
+            QuickExtract::Here => parent,
+            QuickExtract::Subdir => {
+                let stem = std::path::Path::new(path)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if parent.is_empty() {
+                    stem
+                } else {
+                    format!("{parent}/{stem}")
+                }
+            }
+        };
+        if dest.trim().is_empty() || !std::path::Path::new(&dest).is_absolute() {
+            self.error = Some(self.t("error.io"));
+            return;
+        }
+        self.request_extract(ExtractRequest {
+            archive_id: id,
+            sources: Vec::new(), // the whole archive
+            dest,
+            on_conflict: String::new(), // decided by request_extract
+            delete_archive: false,
+            silent: false,
+        });
+    }
+
+    /// 添加到 <名>.zip — pack each path into a zip beside it, no wizard.
+    ///
+    /// Never overwrites: an existing `<name>.zip` moves the output to
+    /// `<name> (2).zip`, and the result window says which name it used. That
+    /// is the difference between this verb and the create wizard's explicit
+    /// overwrite confirmation — a one-click action must not be able to destroy
+    /// an archive the user never named.
+    fn quick_add(&mut self, paths: Vec<String>) {
+        if paths.is_empty() {
+            return;
+        }
+        if self.job_running() {
+            self.quick_add_queue.extend(paths);
+            return;
+        }
+        let first = paths[0].clone();
+        self.quick_add_queue.extend(paths.into_iter().skip(1));
+        let Some(dest) = free_zip_beside(&first) else {
+            self.error = Some(self.t("error.io"));
+            return;
+        };
+        self.job = Some(JobState {
+            job_id: 0,
+            kind: JobKind::Create,
+            title: self.t("create.title"),
+            dest: std::path::Path::new(&dest)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            ..Default::default()
+        });
+        self.skipped_links.clear();
+        let req = CreateRequest {
+            format: "zip".into(),
+            level: "normal".into(),
+            method: "auto".into(),
+            password: None,
+            encrypt_names: None,
+            volume_bytes: None,
+            sfx: None,
+        };
+        match self.svc.create_archive(vec![first], dest, req) {
+            Ok(jid) => {
+                if let Some(job) = self.job.as_mut() {
+                    job.job_id = jid;
+                }
+            }
+            Err(e) => {
+                self.job = None;
+                self.error = Some(self.t(&e.key));
+            }
+        }
+    }
+
+    /// After a quick-extract / quick-add job ends: run the next queued path.
+    fn drain_quick_queues(&mut self) {
+        if self.job_running() {
+            return;
+        }
+        if let Some((path, how)) = self.quick_extract_queue.first().cloned() {
+            self.quick_extract_queue.remove(0);
+            self.quick_extract_one(&path, how);
+            return;
+        }
+        if !self.quick_add_queue.is_empty() {
+            let next = std::mem::take(&mut self.quick_add_queue);
+            self.quick_add(next);
         }
     }
 
@@ -4123,6 +4365,7 @@ impl App {
         });
         // Last job's rename/failure lists belong to the last job.
         self.renamed_entries.clear();
+        self.conflict_renamed_entries.clear();
         self.error_detail.clear();
         // 跳过链接的列表是创建任务的产物；解压窗口不该把它当成自己的。
         self.skipped_links.clear();
@@ -4160,6 +4403,7 @@ impl App {
         });
         // 上一次任务的名字改写 / 失败列表属于上一次任务。
         self.renamed_entries.clear();
+        self.conflict_renamed_entries.clear();
         self.error_detail.clear();
         self.skipped_links.clear();
         match self.svc.test_archive(req.archive_id, req.sources, password) {
@@ -5825,6 +6069,21 @@ impl App {
                         if !skipped_links.is_empty() {
                             self.skipped_links_list(ui, &skipped_links);
                         }
+                        // Entries moved aside because the folder already held
+                        // their name. Same shape as the cleaned-name list
+                        // below, different header.
+                        if !self.conflict_renamed_entries.is_empty() {
+                            ui.separator();
+                            ui.label(self.t("job.conflict_renamed.header"));
+                            egui::ScrollArea::vertical()
+                                .id_salt("zipnest-conflict-renamed-list")
+                                .max_height(140.0)
+                                .show(ui, |ui| {
+                                    for (from, to) in &self.conflict_renamed_entries {
+                                        ui.label(format!("{from}  ->  {to}"));
+                                    }
+                                });
+                        }
                         // Entries whose archived name could not be stored as-is.
                         // They *are* on disk — under the name on the right — so
                         // this is information, not a warning.
@@ -6419,6 +6678,12 @@ impl eframe::App for App {
             for request in single_instance::take_queue() {
                 self.apply_launch(request);
             }
+        }
+        // One-click verbs that were queued behind a running job run now.
+        if !self.job_running()
+            && (!self.quick_extract_queue.is_empty() || !self.quick_add_queue.is_empty())
+        {
+            self.drain_quick_queues();
         }
         // A request that arrived while a job was running waits for it.
         if !self.job_running() {
@@ -7860,6 +8125,42 @@ mod conflict_choice_tests {
 // Keyboard navigation in the file list
 // ---------------------------------------------------------------------------
 
+/// Which folder a one-click unpack writes into.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuickExtract {
+    /// The archive's own folder ("解压到当前文件夹").
+    Here,
+    /// A sibling folder named after the archive ("解压到 <包名> 文件夹").
+    Subdir,
+}
+
+/// `<name>.zip` beside `path`, with a free ` (n)` suffix when the plain name is
+/// already taken. `None` only when there is no usable parent directory.
+///
+/// One-click "added to a zip" must never replace an existing archive: the
+/// create path's temp-file rename would silently destroy it, and nobody named
+/// that file in this run.
+fn free_zip_beside(path: &str) -> Option<String> {
+    let p = std::path::Path::new(path);
+    let parent = p.parent().filter(|d| !d.as_os_str().is_empty())?;
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "archive".to_string());
+    for n in 1..10_000u32 {
+        let name = if n == 1 {
+            format!("{stem}.zip")
+        } else {
+            format!("{stem} ({n}).zip")
+        };
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
 /// The row context menu waiting to be drawn (or currently drawn).
 #[derive(Clone)]
 struct RowMenu {
@@ -8093,5 +8394,51 @@ mod notice_ttl_tests {
     #[test]
     fn the_toast_lives_for_three_seconds() {
         assert_eq!(NOTICE_TTL, std::time::Duration::from_secs(3));
+    }
+}
+
+#[cfg(test)]
+mod quick_verb_tests {
+    use super::free_zip_beside;
+    use std::path::PathBuf;
+
+    fn dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("zn-quick-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 一次点击的"添加到 zip"绝不能覆盖已有的包：同名的存在就退到 `(2)`，
+    /// 与解压侧 `unique_dest` 的命名规则一致（用户看到的两种"自动改名"是
+    /// 同一个形状）。
+    #[test]
+    fn a_one_click_zip_never_replaces_an_existing_archive() {
+        let d = dir("replace");
+        let src = d.join("photos");
+        std::fs::create_dir_all(&src).unwrap();
+        assert_eq!(
+            PathBuf::from(free_zip_beside(&src.to_string_lossy()).unwrap()),
+            d.join("photos.zip")
+        );
+        std::fs::write(d.join("photos.zip"), b"old").unwrap();
+        assert_eq!(
+            PathBuf::from(free_zip_beside(&src.to_string_lossy()).unwrap()),
+            d.join("photos (2).zip")
+        );
+        std::fs::write(d.join("photos (2).zip"), b"old").unwrap();
+        assert_eq!(
+            PathBuf::from(free_zip_beside(&src.to_string_lossy()).unwrap()),
+            d.join("photos (3).zip")
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 没有父目录就报错而不是往当前目录里写 —— 和创建向导的"必须是完整路径"
+    /// 同一条规则。
+    #[test]
+    fn a_bare_name_has_no_place_to_land() {
+        assert!(free_zip_beside("photos").is_none());
+        assert!(free_zip_beside("").is_none());
     }
 }

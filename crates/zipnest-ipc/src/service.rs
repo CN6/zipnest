@@ -970,6 +970,24 @@ impl IpcService {
                     }),
                 );
             }
+            if !stats.conflict_renamed.is_empty() {
+                // The destination already held these names, so the run moved
+                // the files aside as `name (2).ext`. The user picked "rename"
+                // in the conflict question (or a context-menu verb ran without
+                // a question, which also uses rename) — either way the new
+                // *name* is something they have not seen yet, and a bare
+                // "完成" over renamed files is how content goes missing.
+                emit(
+                    "extract_conflict_renamed",
+                    serde_json::json!({
+                        "count": stats.conflict_renamed.len(),
+                        "entries": stats.conflict_renamed
+                            .iter()
+                            .map(|r| serde_json::json!({ "from": r.from, "to": r.to }))
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+            }
             if !stats.skipped.is_empty() {
                 // Entries the user's own conflict policy left alone (an
                 // existing file under "skip"). Deliberate, so this is not a

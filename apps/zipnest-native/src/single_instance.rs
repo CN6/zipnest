@@ -34,6 +34,14 @@ pub enum LaunchRequest {
     Add(Vec<String>),
     /// Open this archive with the extract dialog already up ("解压到…").
     Extract(String),
+    /// Unpack into the archive's own folder, no dialog ("解压到当前文件夹").
+    ExtractHere(Vec<String>),
+    /// Unpack into a sibling `<archive name>\` folder, no dialog
+    /// ("解压到 <包名> 文件夹").
+    ExtractToSubdir(Vec<String>),
+    /// Pack each argument into a zip beside it, no wizard
+    /// ("添加到 <名>.zip").
+    AddHere(Vec<String>),
 }
 
 /// One JSON object per line, in the app data dir (the same folder the
@@ -47,10 +55,21 @@ fn encode(req: &LaunchRequest) -> String {
         LaunchRequest::Open(path) => serde_json::json!({ "open": path }),
         LaunchRequest::Extract(path) => serde_json::json!({ "extract": path }),
         LaunchRequest::Add(paths) => serde_json::json!({ "add": paths }),
+        LaunchRequest::ExtractHere(paths) => serde_json::json!({ "extract_here": paths }),
+        LaunchRequest::ExtractToSubdir(paths) => serde_json::json!({ "extract_to_subdir": paths }),
+        LaunchRequest::AddHere(paths) => serde_json::json!({ "add_here": paths }),
     };
     let mut line = value.to_string();
     line.push('\n');
     line
+}
+
+/// The string entries of a JSON array, dropping anything else.
+fn string_list(values: &[serde_json::Value]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(|p| p.as_str().map(str::to_string))
+        .collect()
 }
 
 /// Parse whatever the queue holds. A half-written or unknown line is dropped
@@ -67,12 +86,24 @@ pub fn parse_queue(text: &str) -> Vec<LaunchRequest> {
         } else if let Some(path) = value.get("extract").and_then(|p| p.as_str()) {
             out.push(LaunchRequest::Extract(path.to_string()));
         } else if let Some(paths) = value.get("add").and_then(|p| p.as_array()) {
-            let paths: Vec<String> = paths
-                .iter()
-                .filter_map(|p| p.as_str().map(str::to_string))
-                .collect();
+            let paths = string_list(paths);
             if !paths.is_empty() {
                 out.push(LaunchRequest::Add(paths));
+            }
+        } else if let Some(paths) = value.get("extract_here").and_then(|p| p.as_array()) {
+            let paths = string_list(paths);
+            if !paths.is_empty() {
+                out.push(LaunchRequest::ExtractHere(paths));
+            }
+        } else if let Some(paths) = value.get("extract_to_subdir").and_then(|p| p.as_array()) {
+            let paths = string_list(paths);
+            if !paths.is_empty() {
+                out.push(LaunchRequest::ExtractToSubdir(paths));
+            }
+        } else if let Some(paths) = value.get("add_here").and_then(|p| p.as_array()) {
+            let paths = string_list(paths);
+            if !paths.is_empty() {
+                out.push(LaunchRequest::AddHere(paths));
             }
         }
     }
@@ -238,10 +269,19 @@ mod tests {
         let open = LaunchRequest::Open(r"D:\some folder\a b.zip".into());
         let extract = LaunchRequest::Extract(r"D:\photos.7z".into());
         let add = LaunchRequest::Add(vec![r"D:\x".into(), r"D:\y.txt".into()]);
+        let here = LaunchRequest::ExtractHere(vec![r"D:\a.zip".into(), r"D:\b.7z".into()]);
+        let sub = LaunchRequest::ExtractToSubdir(vec![r"D:\c.zip".into()]);
+        let add_here = LaunchRequest::AddHere(vec![r"D:\folder".into()]);
         let mut text = encode(&open);
         text.push_str(&encode(&extract));
         text.push_str(&encode(&add));
-        assert_eq!(parse_queue(&text), vec![open, extract, add]);
+        text.push_str(&encode(&here));
+        text.push_str(&encode(&sub));
+        text.push_str(&encode(&add_here));
+        assert_eq!(
+            parse_queue(&text),
+            vec![open, extract, add, here, sub, add_here]
+        );
     }
 
     #[test]

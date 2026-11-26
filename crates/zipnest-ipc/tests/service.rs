@@ -887,3 +887,44 @@ fn test_archive_names_the_entries_whose_data_is_bad() {
     svc.close_archive(r.id);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 撞名后自动改名的事件必须逐条列出"包里的名字 → 磁盘上的名字"。
+///
+/// 这是 A2 免对话框解压的核心承诺：用户看不到解压对话框时，结果窗口是唯一
+/// 得知文件改了名的地方；`renamed`（名字清洗）不能混进来。
+#[test]
+fn a_conflict_rename_is_announced_with_both_names() {
+    let (svc, events) = service();
+    let r = svc
+        .open_archive(fx("plain.zip").to_string_lossy().into(), None)
+        .unwrap();
+    let dest = std::env::temp_dir().join(format!("zipnest-conflict-ev-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::create_dir_all(&dest).unwrap();
+    // a.txt already there: a "rename" run must move the archive's copy aside.
+    std::fs::write(dest.join("a.txt"), b"already here").unwrap();
+    let job = svc
+        .extract(
+            r.id,
+            vec!["a.txt".into()],
+            dest.to_string_lossy().into(),
+            Some("rename".into()),
+            None,
+        )
+        .unwrap();
+    wait_events(&events, 10_000, |v| {
+        v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job)
+    });
+    let v = events.lock().unwrap().clone();
+    let (_, renamed) = v
+        .iter()
+        .find(|(n, _)| n == "extract_conflict_renamed")
+        .expect("the moved-aside file must be announced");
+    assert_eq!(renamed["count"], 1);
+    assert_eq!(renamed["entries"][0]["from"], "a.txt");
+    assert_eq!(renamed["entries"][0]["to"], "a (2).txt");
+    assert!(!std::fs::read(dest.join("a (2).txt")).unwrap().is_empty());
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"already here");
+    svc.close_archive(r.id);
+    let _ = std::fs::remove_dir_all(&dest);
+}

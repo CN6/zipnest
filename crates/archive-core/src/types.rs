@@ -132,7 +132,23 @@ pub struct ExtractStats {
     pub skipped: Vec<String>,
     /// Entries that were written under a changed name. Everything in here is on
     /// disk with complete content.
+    ///
+    /// This is the *name-cleaning* list only (device names, illegal
+    /// characters, over-long components, collisions inside the archive). A file
+    /// moved aside because the destination already held its name lands in
+    /// [`Self::conflict_renamed`] instead; before that field existed those
+    /// renames were invisible to the user, which violated "Nothing is ever
+    /// lost" — the file was on disk under a name nobody had seen on screen.
     pub renamed: Vec<RenamedEntry>,
+    /// Entries written as `name (2).ext` because the destination already had
+    /// the original name and the run's conflict policy was "rename".
+    ///
+    /// Separate from [`Self::renamed`] because the two answer different
+    /// questions: `renamed` says "the archive's name was not usable", this one
+    /// says "your folder already had that name". A build of the app that hands
+    /// a conflict-rename to the user as `renamed` mixes the two up; the tests
+    /// in `extract.rs` pin the split.
+    pub conflict_renamed: Vec<RenamedEntry>,
     /// Entries that are *not* on disk. Non-empty ⇒ the run failed.
     pub failed: Vec<EntryFailure>,
 }
