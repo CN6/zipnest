@@ -24,6 +24,10 @@ const DESIGN_WIDTH: f32 = 900.0;
 const MIN_WIDTH: f32 = 720.0;
 const MIN_HEIGHT: f32 = 420.0;
 
+/// 任务成功后状态栏那行提示停留多久。三秒够读完一句"完成"，又不会一直
+/// 占着状态栏。失败仍然走错误对话框，用户自己关。
+const NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// 结果窗口里逐条列出的行数上限（没进包的链接）。再多就一行「还有 N 项」，
 /// 因为一个装满 junction 的目录能有上万条，全画出来只会让窗口卡住。
 const SKIPPED_LIST_MAX: usize = 200;
@@ -1700,6 +1704,13 @@ struct App {
     row_menu_click: Option<RowMenu>,
     error: Option<String>,
     notice: Option<String>,
+    /// When the current notice should disappear on its own. Only success
+    /// notices get one: an error lives in a dialog the user dismisses, while a
+    /// "done" line that never leaves stops being information after a moment.
+    notice_until: Option<std::time::Instant>,
+    /// A finished job asked for a taskbar flash. Set by `poll_jobs` (a worker
+    /// thread's event), sent as a viewport command by `logic` on the UI thread.
+    flash_taskbar: bool,
     /// Backup path of a settings file that could not be parsed at startup, so
     /// the `settings.corrupt` notice can name it. `None` on a normal start.
     settings_backup: Option<String>,
@@ -2024,6 +2035,8 @@ impl App {
             keyboard_nav: false,
             row_menu_click: None,
             error: None,
+            notice_until: None,
+            flash_taskbar: false,
             notice: settings_backup
                 .as_ref()
                 .map(|_| "settings.corrupt".to_string())
@@ -2418,6 +2431,11 @@ impl App {
                     }
                     self.open_after_extract = None;
                     if ok {
+                        // A finished job the user is not watching deserves a
+                        // taskbar flash; that is the whole point (a long
+                        // extract whose window is behind another app). The
+                        // focus test and the command itself happen in `logic`.
+                        self.flash_taskbar = true;
                         let renamed = self.job.as_ref().map(|j| j.renamed).unwrap_or(0);
                         let skipped_links =
                             self.job.as_ref().map(|j| j.create_skipped).unwrap_or(0);
@@ -2448,6 +2466,12 @@ impl App {
                             }
                             .into(),
                         );
+                        // Three seconds, then the line goes away. The result
+                        // window (still open, if the user has not closed it)
+                        // holds the same words plus the destination, so
+                        // nothing is lost when the strip clears.
+                        self.notice_until =
+                            Some(std::time::Instant::now() + NOTICE_TTL);
                     } else if cancelled {
                         // The user pressed 取消. Reporting it through the error
                         // dialog told them the app had hit a problem when it had
@@ -6235,6 +6259,34 @@ impl eframe::App for App {
     // keeps running while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs();
+        // The job finished while the window was not in front: flash the
+        // taskbar. `Informational`, not `Critical` — this is news, not an
+        // alarm, and Critical keeps flashing until the user clicks it.
+        if std::mem::take(&mut self.flash_taskbar) {
+            // `input(|i| i.focused)` reports the OS focus of *this* viewport.
+            // Flashing a window the user is already looking at is noise.
+            if !ctx.input(|i| i.focused) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Informational,
+                ));
+                // egui sleeps while idle; wake once more so the clear below
+                // runs even if nothing else happens.
+                ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            }
+        }
+        // A success notice is a toast: three seconds and it is gone.
+        if self
+            .notice_until
+            .is_some_and(|at| std::time::Instant::now() >= at)
+        {
+            self.notice_until = None;
+            self.notice = None;
+            // One more frame to repaint the strip without the line.
+            ctx.request_repaint();
+        } else if self.notice_until.is_some() {
+            // Keep frames coming so the expiry actually fires on time.
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         // 防抖到期的那一帧在这里补跑一次搜索：输入时的 `run_search` 只会返回，
         // 真正过滤由这一行完成。`run_search` 自己会把 `search_typed_at` 清掉，
         // 所以每个字最多只补一次。
@@ -8012,5 +8064,34 @@ mod nav_tests {
         assert_eq!(anchor, 1);
         let names: Vec<_> = sel.iter().cloned().collect();
         assert_eq!(names, vec!["b"]);
+    }
+}
+
+#[cfg(test)]
+mod notice_ttl_tests {
+    use super::NOTICE_TTL;
+
+    /// 状态栏的成功提示是"非模态 toast"：出现时记一个到期时刻，到点自己消失。
+    /// 这条测试钉住的是过期判定的语义（`now >= at` 就清），而不是去等三秒。
+    #[test]
+    fn a_notice_expires_at_its_deadline_and_not_before() {
+        let at = std::time::Instant::now() + NOTICE_TTL;
+        let just_before = at - std::time::Duration::from_millis(1);
+        assert!(just_before < at, "still showing one millisecond before");
+        assert!(
+            std::time::Instant::now() + NOTICE_TTL >= at,
+            "a later deadline is the same instant"
+        );
+        // The exact predicate `logic` uses.
+        let expired = |now: std::time::Instant, deadline: std::time::Instant| now >= deadline;
+        assert!(!expired(std::time::Instant::now(), at));
+        assert!(expired(at, at));
+        assert!(expired(at + NOTICE_TTL, at));
+    }
+
+    /// 三秒是用户能读完一句"完成"的时长；改成别的值应该是有意的决定。
+    #[test]
+    fn the_toast_lives_for_three_seconds() {
+        assert_eq!(NOTICE_TTL, std::time::Duration::from_secs(3));
     }
 }
