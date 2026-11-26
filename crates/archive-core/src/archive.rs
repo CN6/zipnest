@@ -38,6 +38,10 @@ pub struct Archive {
     /// 7z 没有这类校验值，错密钥会直接漏成 2/3，两者无法区分。
     /// 实测见 `crates/archive-core/src/extract.rs` 的 `map_op_res`。
     key_verified: bool,
+    /// The file this archive was opened from, for callers that need to look at
+    /// it rather than its contents (the web mark, A5, lives on the source file's
+    /// own ADS).
+    source: std::path::PathBuf,
     /// The handler CLSID that actually opened this file.
     ///
     /// `container_name` reads it: the extension can lie (a 7z named `.zip`, a
@@ -179,6 +183,7 @@ impl Archive {
                     stream: stream.into_raw(),
                     entries: OnceLock::new(),
                     key_verified: key_verified_for(clsid),
+                    source: path.to_path_buf(),
                     clsid: Some(*clsid),
                     _not_send: std::ptr::null_mut(),
                 });
@@ -322,6 +327,7 @@ impl Archive {
                     stream: combined,
                     entries: OnceLock::new(),
                     key_verified: key_verified_for(clsid),
+                    source: path.to_path_buf(),
                     clsid: Some(*clsid),
                     _not_send: std::ptr::null_mut(),
                 });
@@ -517,6 +523,11 @@ impl Archive {
         progress: &mut dyn FnMut(&crate::types::CreateProgress) -> bool,
     ) -> Result<crate::types::ExtractedEditStats, ZipnestError> {
         crate::update::update_archive(self, dest, plan, opts, progress)
+    }
+
+    /// The file this archive was opened from.
+    pub fn source_path(&self) -> &std::path::Path {
+        &self.source
     }
 
     pub(crate) fn raw(&self) -> *mut c_void {

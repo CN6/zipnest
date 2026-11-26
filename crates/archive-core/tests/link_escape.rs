@@ -35,6 +35,7 @@ fn a_symlink_entry_cannot_write_outside_the_destination() {
         max_total_bytes: u64::MAX,
         on_conflict: archive_core::OnConflict::Overwrite,
         test_mode: false,
+        preserve_motw: false,
     };
     let stats = archive
         .extract(&opts, None, &mut |_| true)

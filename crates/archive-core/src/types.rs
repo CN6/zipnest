@@ -86,6 +86,21 @@ pub struct ExtractOptions {
     /// too: "tested all, everything is fine" must never be said over a bad
     /// entry).
     pub test_mode: bool,
+    /// Copy the archive's "mark of the web" (`Zone.Identifier`) onto every file
+    /// this run writes (A5). See [`crate::motw`] for why a missing mark is a
+    /// silent security downgrade; the caller counts files a filesystem refused.
+    pub preserve_motw: bool,
+}
+
+/// What a run did with the web mark (A5).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MotwStats {
+    /// Files the archive's mark was copied onto.
+    pub marked: u32,
+    /// Files the filesystem refused to hold a mark for (FAT32, exFAT, a share).
+    /// The files are on disk; only the mark is missing, so this is reported,
+    /// never an error.
+    pub unmarked: u32,
 }
 
 /// Progress snapshot handed to the extract callback.
@@ -151,6 +166,9 @@ pub struct ExtractStats {
     pub conflict_renamed: Vec<RenamedEntry>,
     /// Entries that are *not* on disk. Non-empty ⇒ the run failed.
     pub failed: Vec<EntryFailure>,
+    /// What happened to the archive's web mark, when the run was asked to
+    /// propagate one. `None` when nothing was asked or the archive had none.
+    pub motw: Option<MotwStats>,
 }
 
 /// What an in-place edit of an existing archive changed.

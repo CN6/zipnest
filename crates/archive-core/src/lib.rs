@@ -10,6 +10,7 @@ pub mod create;
 pub mod dll;
 pub mod error;
 pub mod format;
+pub mod motw;
 pub mod extract;
 pub mod types;
 pub mod update;
@@ -27,5 +28,5 @@ pub use update::{update_archive, update_format_for, UpdateFormat, UpdateOptions,
 pub use types::{
     ArchiveEntry, ArchiveOpenOptions, CompressionLevel, CompressionMethod, CreateFormat,
     CreateOptions, CreateProgress, CreateSource, CreateStats, ExtractOptions, ExtractProgress,
-    ExtractStats, ExtractedEditStats, OnConflict, SfxKind, SkippedLink,
+    ExtractStats, ExtractedEditStats, MotwStats, OnConflict, SfxKind, SkippedLink,
 };

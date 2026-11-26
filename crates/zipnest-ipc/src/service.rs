@@ -841,9 +841,12 @@ impl IpcService {
         let password = password.or_else(|| self.registry.password(id));
         let emit = Arc::clone(&self.emit);
         let registry = Arc::clone(&self.registry);
-        let max_total_bytes = match self.settings.lock() {
-            Ok(s) => s.get().max_extract_bytes,
-            Err(p) => p.into_inner().get().max_extract_bytes,
+        let (max_total_bytes, preserve_motw) = match self.settings.lock() {
+            Ok(s) => (s.get().max_extract_bytes, s.get().preserve_motw),
+            Err(p) => {
+                let g = p.into_inner();
+                (g.get().max_extract_bytes, g.get().preserve_motw)
+            }
         };
         let on_conflict = archive_core::OnConflict::from_policy(on_conflict.as_deref());
 
@@ -890,6 +893,7 @@ impl IpcService {
                 max_total_bytes,
                 on_conflict,
                 test_mode: false,
+                preserve_motw,
             };
             let mut seen_paths = std::collections::HashSet::new();
             let mut throttle = ProgressThrottle::new(PROGRESS_MIN_INTERVAL);
@@ -996,6 +1000,17 @@ impl IpcService {
                             .collect::<Vec<_>>(),
                     }),
                 );
+            }
+            if let Some(motw) = stats.motw {
+                if motw.unmarked > 0 {
+                    // The files are on disk; only the "came from the internet"
+                    // mark could not be written (FAT32/exFAT/share). Saying so
+                    // keeps the security behaviour explainable.
+                    emit(
+                        "extract_motw_unmarked",
+                        serde_json::json!({ "count": motw.unmarked }),
+                    );
+                }
             }
             if !stats.skipped.is_empty() {
                 // Entries the user's own conflict policy left alone (an
@@ -1263,6 +1278,7 @@ impl IpcService {
                 max_total_bytes,
                 on_conflict: archive_core::OnConflict::Rename,
                 test_mode: true,
+                preserve_motw: false,
             };
             let mut seen_paths = std::collections::HashSet::new();
             let mut throttle = ProgressThrottle::new(PROGRESS_MIN_INTERVAL);

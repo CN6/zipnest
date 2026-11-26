@@ -82,6 +82,12 @@ pub struct Settings {
     pub auto_check_update: bool,
     /// Total uncompressed bytes allowed for a single extract (zip-bomb guard).
     pub max_extract_bytes: u64,
+    /// Copy the archive's "mark of the web" onto every extracted file (A5).
+    ///
+    /// On by default: dropping it is a silent security downgrade (SmartScreen
+    /// and Office stop treating redownloaded content as untrusted). Users who
+    /// distribute green-software zips and hate the warning can turn it off.
+    pub preserve_motw: bool,
     /// `"system" | "light" | "dark"`.
     pub theme_mode: String,
     /// Last window size in logical points; `None` on the first run.
@@ -115,6 +121,7 @@ impl Default for Settings {
             ui_zoom: 100,
             auto_check_update: true,
             max_extract_bytes: DEFAULT_MAX_EXTRACT_BYTES,
+            preserve_motw: true,
             theme_mode: "system".into(),
             window_width: None,
             window_height: None,
@@ -139,6 +146,7 @@ pub struct SettingsPatch {
     pub ui_zoom: Option<u32>,
     pub auto_check_update: Option<bool>,
     pub max_extract_bytes: Option<u64>,
+    pub preserve_motw: Option<bool>,
     pub theme_mode: Option<String>,
 
     pub window_width: Option<u32>,
@@ -192,6 +200,9 @@ impl Settings {
         }
         if let Some(v) = patch.max_extract_bytes {
             self.max_extract_bytes = v.clamp(EXTRACT_MAX_BYTES.0, EXTRACT_MAX_BYTES.1);
+        }
+        if let Some(v) = patch.preserve_motw {
+            self.preserve_motw = v;
         }
         if let Some(v) = patch.theme_mode {
             if !THEMES.contains(&v.as_str()) {

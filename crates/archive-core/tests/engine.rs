@@ -96,6 +96,7 @@ fn extracts_plain_zip_to_disk() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
         test_mode: false,
+        preserve_motw: false,
     };
     let mut ticks = 0;
     let stats = arc
@@ -160,6 +161,7 @@ fn failed_extract_keeps_the_existing_file_intact() {
         max_total_bytes: 4, // trips the zip-bomb guard on the first chunk
         on_conflict: OnConflict::Overwrite,
         test_mode: false,
+        preserve_motw: false,
     };
     let err = arc.extract(&opts, None, &mut |_p| true).expect_err("quota must trip");
     assert_eq!(err.error_key(), "error.quota_exceeded");
@@ -186,6 +188,7 @@ fn cancel_leaves_no_temp_files_behind() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
         test_mode: false,
+        preserve_motw: false,
     };
     // Cancel after the second tick so at least one entry has started.
     let mut ticks = 0;
@@ -216,6 +219,7 @@ fn skip_policy_keeps_the_existing_file_and_reports_it() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Skip,
         test_mode: false,
+        preserve_motw: false,
     };
     let stats = arc.extract(&opts, None, &mut |_p| true).expect("extract");
     assert_eq!(
@@ -244,6 +248,7 @@ fn rename_policy_writes_beside_the_existing_file() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Rename,
         test_mode: false,
+        preserve_motw: false,
     };
     arc.extract(&opts, None, &mut |_p| true).expect("extract");
     assert_eq!(
@@ -272,6 +277,7 @@ fn extracted_files_keep_their_archived_mtime() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
         test_mode: false,
+        preserve_motw: false,
     };
     arc.extract(&opts, None, &mut |_p| true).expect("extract");
     let written = std::fs::metadata(dest.join("a.txt"))
@@ -302,6 +308,7 @@ fn extract_cancel_returns_cancelled() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
         test_mode: false,
+        preserve_motw: false,
     };
     let err = arc.extract(&opts, None, &mut |_p| false).expect_err("must cancel");
     assert_eq!(err.error_key(), "error.cancelled");
@@ -318,6 +325,7 @@ fn extract_quota_enforced() {
         max_total_bytes: 10,
         on_conflict: OnConflict::Overwrite,
         test_mode: false,
+        preserve_motw: false,
     };
     let err = arc.extract(&opts, None, &mut |_p| true).expect_err("quota must trip");
     assert_eq!(err.error_key(), "error.quota_exceeded");
@@ -346,6 +354,7 @@ fn zip_slip_entry_lands_inside_the_destination_instead_of_being_dropped() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
         test_mode: false,
+        preserve_motw: false,
     };
     let stats = arc
         .extract(&opts, None, &mut |_p| true)
@@ -392,6 +401,7 @@ fn reserved_name_is_renamed_and_others_still_extract() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
         test_mode: false,
+        preserve_motw: false,
     };
     let stats = arc
         .extract(&opts, None, &mut |_p| true)
@@ -447,6 +457,7 @@ fn encrypted_7z_with_password_opens_and_extracts() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
         test_mode: false,
+        preserve_motw: false,
     };
     arc.extract(&opts, Some("secret"), &mut |_p| true)
         .expect("extract");
@@ -464,6 +475,7 @@ fn encrypted_zip_wrong_password_on_extract() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
         test_mode: false,
+        preserve_motw: false,
     };
     let err = arc
         .extract(&opts, Some("wrong"), &mut |_p| true)
@@ -482,6 +494,7 @@ fn encrypted_zip_extract_with_password_succeeds() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
         test_mode: false,
+        preserve_motw: false,
     };
     arc.extract(&opts, Some("secret"), &mut |_p| true)
         .expect("extract with correct pw");
@@ -517,6 +530,7 @@ fn encrypted_zip_with_correct_password_and_bad_data_is_reported_as_damaged() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Overwrite,
         test_mode: false,
+        preserve_motw: false,
     };
     let err = arc
         .extract(&opts, Some("secret"), &mut |_p| true)
@@ -669,6 +683,7 @@ fn test_mode_verifies_a_good_archive_without_writing_anything() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Rename,
         test_mode: true,
+        preserve_motw: false,
     };
     let mut paths = Vec::new();
     let stats = arc
@@ -702,6 +717,7 @@ fn test_mode_reports_the_entry_whose_data_is_bad() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Rename,
         test_mode: true,
+        preserve_motw: false,
     };
     // A bad entry is a failed run, not a quiet "checked, all good": the caller
     // maps this to `error.entries_failed` and lists the names.
@@ -732,6 +748,7 @@ fn test_mode_still_counts_against_the_zip_bomb_quota() {
         max_total_bytes: 64, // far below the fixture's payload
         on_conflict: OnConflict::Rename,
         test_mode: true,
+        preserve_motw: false,
     };
     let err = arc
         .extract(&opts, None, &mut |_| true)
@@ -770,6 +787,7 @@ fn a_conflict_rename_is_reported_apart_from_name_cleaning() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Rename,
         test_mode: false,
+        preserve_motw: false,
     };
     let stats = arc.extract(&opts, None, &mut |_| true).expect("extract");
     assert_eq!(stats.conflict_renamed.len(), 1, "got {:?}", stats.conflict_renamed);
@@ -811,6 +829,7 @@ fn name_cleaning_does_not_land_in_the_conflict_list() {
         max_total_bytes: u64::MAX,
         on_conflict: OnConflict::Rename,
         test_mode: false,
+        preserve_motw: false,
     };
     let stats = arc.extract(&opts, None, &mut |_| true).expect("extract");
     assert_eq!(stats.renamed.len(), 1);
@@ -820,5 +839,116 @@ fn name_cleaning_does_not_land_in_the_conflict_list() {
         "nothing was in the destination, so no conflict rename: {:?}",
         stats.conflict_renamed
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- A5: the web mark travels from the archive to what comes out of it ----
+
+/// 压缩包带 `Zone.Identifier` 时，解出来的每个文件都要带上同一段标记。
+///
+/// 这是 SmartScreen / Office 受保护视图赖以判断"这文件来自网络"的唯一依据；
+/// 浏览器给下载的 zip 打了标记，解压器不往下传，解出来的 exe 就成了"本地文件"。
+#[test]
+fn the_web_mark_is_copied_onto_every_extracted_file() {
+    let dir = tmpdir("motw-propagate");
+    std::fs::create_dir_all(&dir).unwrap();
+    let zip = dir.join("marked.zip");
+    {
+        use std::io::Write;
+        let file = std::fs::File::create(&zip).unwrap();
+        let mut z = zip::ZipWriter::new(file);
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        for name in ["one.txt", "two.txt"] {
+            z.start_file(name, opts).unwrap();
+            z.write_all(b"content").unwrap();
+        }
+        z.finish().unwrap();
+    }
+    const MARK: &[u8] = b"[ZoneTransfer]\r\nZoneId=3\r\n";
+    assert!(
+        archive_core::motw::write_to(&zip, MARK),
+        "this filesystem must accept the archive's mark"
+    );
+    assert_eq!(archive_core::motw::read_from(&zip).as_deref(), Some(MARK));
+
+    let arc = Archive::open(&zip, ArchiveOpenOptions::default()).unwrap();
+    let dest = dir.join("out");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: Vec::new(),
+        max_total_bytes: u64::MAX,
+        on_conflict: OnConflict::Overwrite,
+        test_mode: false,
+        preserve_motw: true,
+    };
+    let stats = arc.extract(&opts, None, &mut |_| true).expect("extract");
+    let motw = stats.motw.expect("the run was asked to propagate a mark");
+    assert_eq!(motw.marked, 2, "both files must be marked: {motw:?}");
+    assert_eq!(motw.unmarked, 0);
+    for name in ["one.txt", "two.txt"] {
+        assert_eq!(
+            archive_core::motw::read_from(&dest.join(name)).as_deref(),
+            Some(MARK),
+            "{name} must carry the archive's mark"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 没要求保留时（设置关掉），标记不得出现；压缩包本身没标记时也不记统计。
+#[test]
+fn no_mark_is_written_when_the_setting_is_off_or_the_archive_has_none() {
+    let dir = tmpdir("motw-off");
+    std::fs::create_dir_all(&dir).unwrap();
+    let zip = dir.join("plain.zip");
+    {
+        use std::io::Write;
+        let file = std::fs::File::create(&zip).unwrap();
+        let mut z = zip::ZipWriter::new(file);
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        z.start_file("a.txt", opts).unwrap();
+        z.write_all(b"x").unwrap();
+        z.finish().unwrap();
+    }
+    const MARK: &[u8] = b"[ZoneTransfer]\r\nZoneId=3\r\n";
+
+    // (a) Setting off, archive marked: nothing is written, no stats either.
+    archive_core::motw::write_to(&zip, MARK);
+    let arc = Archive::open(&zip, ArchiveOpenOptions::default()).unwrap();
+    let dest = dir.join("off");
+    let opts = ExtractOptions {
+        dest: dest.clone(),
+        entries: Vec::new(),
+        max_total_bytes: u64::MAX,
+        on_conflict: OnConflict::Overwrite,
+        test_mode: false,
+        preserve_motw: false,
+    };
+    let stats = arc.extract(&opts, None, &mut |_| true).unwrap();
+    assert!(stats.motw.is_none(), "off means nothing to report");
+    assert_eq!(archive_core::motw::read_from(&dest.join("a.txt")), None);
+
+    // (b) Setting on, archive unmarked: nothing to propagate, no stats.
+    let plain = dir.join("unmarked.zip");
+    std::fs::copy(&zip, &plain).unwrap();
+    // The copy above brings the stream along on NTFS; make a genuinely unmarked
+    // one by removing it, then re-checking.
+    let _ = std::fs::remove_file(format!("{}:Zone.Identifier", plain.display()));
+    let arc = Archive::open(&plain, ArchiveOpenOptions::default()).unwrap();
+    let dest2 = dir.join("on");
+    let opts2 = ExtractOptions {
+        dest: dest2.clone(),
+        entries: Vec::new(),
+        max_total_bytes: u64::MAX,
+        on_conflict: OnConflict::Overwrite,
+        test_mode: false,
+        preserve_motw: true,
+    };
+    let stats = arc.extract(&opts2, None, &mut |_| true).unwrap();
+    assert!(
+        stats.motw.is_none(),
+        "an unmarked archive leaves nothing to report"
+    );
+    assert_eq!(archive_core::motw::read_from(&dest2.join("a.txt")), None);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -25,7 +25,7 @@ use crate::types::{
 use archive_security::{plan_entry_paths, EntryPathFix, ExtractQuota};
 use std::ffi::c_void;
 use std::os::raw::c_void as RawCVoid;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -414,6 +414,13 @@ struct DiskState {
     /// Test mode: `GetStream` hands out a discarding sink and nothing touches
     /// the destination (see [`test_get_stream`]).
     test_mode: bool,
+    /// The archive's own web mark, when the run was asked to propagate it and
+    /// the archive has one. Copied onto every file the run writes.
+    motw_mark: Option<Vec<u8>>,
+    /// How many files could not hold the mark (their filesystem refused it).
+    motw_unmarked: AtomicU32,
+    /// How many files got it.
+    motw_marked: AtomicU32,
     /// Test mode: the entry whose bytes the handler is decoding right now, so
     /// the verdict in `SetOperationResult` can name it. The handler serializes
     /// `GetStream`/`SetOperationResult`, so one slot is enough.
@@ -447,6 +454,9 @@ struct PendingWrite {
     tmp: PathBuf,
     dest: PathBuf,
     mtime: Option<std::time::SystemTime>,
+    /// The archive's web mark to copy onto the finished file, when the run was
+    /// asked to propagate one.
+    motw: Option<Vec<u8>>,
     /// The archive's own name for this entry, so a failed commit can be
     /// reported with the name the user sees in the archive.
     raw: String,
@@ -909,8 +919,21 @@ fn commit_pending(pw: &PendingWrite) -> std::io::Result<u64> {
             let _ = f.set_modified(mtime);
         }
     }
+    // The web mark goes on last, after the rename and the timestamp, so the
+    // stream belongs to the finished file (and a mark write cannot be undone by
+    // a later step failing).
+    if let Some(mark) = &pw.motw {
+        let marked = crate::motw::write_to(Path::new(&pw.dest), mark);
+        PW_MARKED.store(marked, Ordering::Relaxed);
+    }
     Ok(len)
 }
+
+/// Set by `commit_pending`: did the last commit manage to write the web mark?
+/// (`commit_pending` has no channel back to `DiskState`, and the caller reads
+/// this immediately after the call on the same thread — the handler serializes
+/// `SetOperationResult`.)
+static PW_MARKED: AtomicBool = AtomicBool::new(true);
 
 // ===========================================================================
 // Test mode: decode every selected entry, write nothing
@@ -1202,6 +1225,7 @@ unsafe extern "system" fn disk_get_stream(
             tmp,
             dest: target,
             mtime: meta.mtime,
+            motw: st.motw_mark.clone(),
             raw: meta.raw_path.clone(),
         });
     }
@@ -1272,10 +1296,20 @@ unsafe extern "system" fn disk_op_result(this: *mut c_void, op_res: i32) -> Hres
             && st.cancelled.load(Ordering::SeqCst) == 0
             && st.blocked.load(Ordering::SeqCst) == BLOCK_NONE;
         if complete {
+            // Assume a mark write will succeed; `commit_pending` flips this to
+            // false when the filesystem refused it.
+            PW_MARKED.store(true, Ordering::Relaxed);
             match commit_pending(&pw) {
                 Ok(len) => {
                     st.files_committed.fetch_add(1, Ordering::Relaxed);
                     st.bytes_committed.fetch_add(len, Ordering::Relaxed);
+                    if st.motw_mark.is_some() {
+                        if PW_MARKED.load(Ordering::Relaxed) {
+                            st.motw_marked.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            st.motw_unmarked.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
                 Err(e) => {
                     // The entry's bytes never reached their destination (target
@@ -1496,7 +1530,19 @@ pub(crate) fn extract_to_disk(
         })
         .collect();
 
+    // Read the archive's own web mark once, up front (A5). The source file is
+    // still open and readable here; a filesystem that cannot answer is simply
+    // "no mark to propagate".
+    let motw_mark = if opts.preserve_motw && !opts.test_mode {
+        let src = std::path::Path::new(arc.source_path());
+        crate::motw::read_from(src)
+    } else {
+        None
+    };
     let state = Arc::new(DiskState {
+        motw_mark,
+        motw_unmarked: AtomicU32::new(0),
+        motw_marked: AtomicU32::new(0),
         dest: opts.dest.clone(),
         on_conflict: opts.on_conflict,
         test_mode: opts.test_mode,
@@ -1634,6 +1680,10 @@ pub(crate) fn extract_to_disk(
             .collect(),
         conflict_renamed,
         failed,
+        motw: state.motw_mark.as_ref().map(|_| crate::types::MotwStats {
+            marked: state.motw_marked.load(Ordering::Relaxed),
+            unmarked: state.motw_unmarked.load(Ordering::Relaxed),
+        }),
     })
 }
 
@@ -1685,6 +1735,7 @@ mod tests {
             max_total_bytes: u64::MAX,
             on_conflict: OnConflict::Rename,
             test_mode: false,
+            preserve_motw: false,
         }
     }
 

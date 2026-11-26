@@ -1769,6 +1769,10 @@ struct App {
     /// the question and the deletion cannot disagree (the selection can change
     /// under a repaint).
     confirm_remove_names: Vec<String>,
+    /// Files the last extraction could not mark as downloaded (A5): the
+    /// destination filesystem has no alternate data streams. Reported, not a
+    /// failure — the files are all there.
+    motw_unmarked: u64,
     /// The "files or folder?" chooser behind 添加文件… is on screen.
     add_files_choice: Option<bool>,
     error: Option<String>,
@@ -2113,6 +2117,7 @@ impl App {
             quick_add_queue: Vec::new(),
             confirm_remove: false,
             confirm_remove_names: Vec::new(),
+            motw_unmarked: 0,
             add_files_choice: None,
             error: None,
             notice_until: None,
@@ -2408,6 +2413,12 @@ impl App {
                     // its listing is the old archive; reopen it once the job
                     // lets go of the mutex (handled in `logic`).
                     self.reopen_after_update_pending = true;
+                }
+                "extract_motw_unmarked" => {
+                    // Files extracted without the "came from the internet" mark
+                    // because the destination filesystem cannot hold one. Not a
+                    // failure; worth one line in the result window.
+                    self.motw_unmarked = payload["count"].as_u64().unwrap_or(0);
                 }
                 "extract_conflict_renamed" => {
                     // The destination already had these names; the files are
@@ -4636,6 +4647,7 @@ impl App {
         // Last job's rename/failure lists belong to the last job.
         self.renamed_entries.clear();
         self.conflict_renamed_entries.clear();
+        self.motw_unmarked = 0;
         self.error_detail.clear();
         // 跳过链接的列表是创建任务的产物；解压窗口不该把它当成自己的。
         self.skipped_links.clear();
@@ -4674,6 +4686,7 @@ impl App {
         // 上一次任务的名字改写 / 失败列表属于上一次任务。
         self.renamed_entries.clear();
         self.conflict_renamed_entries.clear();
+        self.motw_unmarked = 0;
         self.error_detail.clear();
         self.skipped_links.clear();
         match self.svc.test_archive(req.archive_id, req.sources, password) {
@@ -5643,6 +5656,18 @@ impl App {
                                         ui.label("MB");
                                     });
                                     self.help_hint(ui, mark, &label, &hint);
+                                    ui.add_space(theme::FIELD_GAP);
+                                    // A5: keep SmartScreen / Office's "came from
+                                    // the internet" mark on extracted files.
+                                    let motw_label = self.t("settings.motw");
+                                    let motw_hint = self.t("settings.motw.hint");
+                                    let mark = theme::check_field(
+                                        ui,
+                                        &motw_label,
+                                        &mut self.settings.preserve_motw,
+                                        true,
+                                    );
+                                    self.help_hint(ui, mark, &motw_label, &motw_hint);
                                 });
 
                                 theme::section(ui, &self.t("settings.section.integration"));
@@ -5972,6 +5997,7 @@ impl App {
             default_extract_dir: Some(self.settings.default_extract_dir.clone()),
             preview_max_bytes: Some(self.settings.preview_max_bytes),
             max_extract_bytes: Some(self.settings.max_extract_bytes),
+            preserve_motw: Some(self.settings.preserve_motw),
             theme_mode: Some(self.settings.theme_mode.clone()),
             ui_zoom: Some(self.settings.ui_zoom),
             auto_check_update: Some(self.settings.auto_check_update),
@@ -6451,6 +6477,22 @@ impl App {
                         // 已经进包了。
                         if !skipped_links.is_empty() {
                             self.skipped_links_list(ui, &skipped_links);
+                        }
+                        if self.motw_unmarked > 0 {
+                            ui.add_space(2.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(
+                                        self.t("job.motw_unmarked").replace(
+                                            "{count}",
+                                            &self.motw_unmarked.to_string(),
+                                        ),
+                                    )
+                                    .size(theme::TEXT_SMALL)
+                                    .color(theme::secondary(ui)),
+                                )
+                                .wrap(),
+                            );
                         }
                         // Entries moved aside because the folder already held
                         // their name. Same shape as the cleaned-name list
