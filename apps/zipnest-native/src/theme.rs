@@ -250,6 +250,28 @@ fn rgb(r: u8, g: u8, b: u8) -> Color32 {
 /// file-type badge that made the three-letter label fainter than plain accent
 /// (measured 1.66:1 light / 1.50:1 dark on the ZIP badge, against 2.35 / 1.93
 /// at full accent). Multiplying `r`/`g`/`b` instead keeps alpha at 255.
+/// `color` washed towards `surface`: the accent mixed into the panel fill at
+/// `strength` of itself, still fully opaque.
+///
+/// Same reason as [`shade`] for not using `gamma_multiply`: that scales alpha,
+/// and a translucent accent over a dark panel composites to nearly the panel
+/// itself. Mixing RGB towards the known surface keeps the result opaque and
+/// identical in both themes, because the caller passes the surface it is
+/// actually painting on.
+pub fn tint(color: Color32, surface: Color32, strength: f32) -> Color32 {
+    let s = strength.clamp(0.0, 1.0);
+    let mix = |c: u8, base: u8| {
+        (f32::from(base) + (f32::from(c) - f32::from(base)) * s)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgb(
+        mix(color.r(), surface.r()),
+        mix(color.g(), surface.g()),
+        mix(color.b(), surface.b()),
+    )
+}
+
 pub fn shade(color: Color32, factor: f32) -> Color32 {
     let channel = |c: u8| (f32::from(c) * factor).round().clamp(0.0, 255.0) as u8;
     Color32::from_rgb(channel(color.r()), channel(color.g()), channel(color.b()))
@@ -1071,5 +1093,62 @@ mod tests {
         assert_eq!(usable_face_index(&segoe, 0), Some(0));
         // A `.ttf` asked for face 1 has no such face: fall back to 0.
         assert_eq!(usable_face_index(&segoe, 1), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod tint_tests {
+    use super::{tint, Mode};
+    use eframe::egui::Color32;
+
+    /// 0 strength = the surface itself; 1 = the accent; halfway = a real mix.
+    /// A translucent accent (the old `gamma_multiply` habit) would have
+    /// returned something that composites back to the surface in dark mode,
+    /// which is why this stays opaque and mixes RGB.
+    #[test]
+    fn tint_mixes_towards_the_accent_and_stays_opaque() {
+        let accent = Color32::from_rgb(0, 103, 192);
+        let surface = Color32::from_rgb(243, 243, 243);
+        assert_eq!(tint(accent, surface, 0.0), surface);
+        assert_eq!(tint(accent, surface, 1.0), accent);
+        let mid = tint(accent, surface, 0.5);
+        assert_eq!(mid.a(), 255, "the wash must be opaque");
+        assert!(mid.r() < surface.r() && mid.r() > accent.r());
+        // In dark mode the same call against the dark panel lightens instead:
+        // the direction belongs to the surface, not to a hard-coded "darker".
+        let dark_surface = Color32::from_rgb(32, 32, 32);
+        let dark_accent = Color32::from_rgb(88, 166, 255);
+        let dark_mid = tint(dark_accent, dark_surface, 0.5);
+        assert!(dark_mid.r() > dark_surface.r() && dark_mid.r() < dark_accent.r());
+    }
+
+    /// The wash must stay a whisper: at 6% the empty-state plate may not
+    /// compete with the text drawn on it (body text is near-black in light
+    /// mode, near-white in dark).
+    #[test]
+    fn the_empty_state_wash_stays_faint() {
+        for mode in [Mode::Light, Mode::Dark] {
+            let (surface, accent, ink) = if mode.is_dark() {
+                (
+                    Color32::from_rgb(32, 32, 32),
+                    Color32::from_rgb(88, 166, 255),
+                    Color32::from_rgb(229, 229, 229),
+                )
+            } else {
+                (
+                    Color32::from_rgb(243, 243, 243),
+                    Color32::from_rgb(0, 103, 192),
+                    Color32::from_rgb(27, 27, 27),
+                )
+            };
+            let plate = tint(accent, surface, 0.06);
+            let ink_ratio = super::contrast::ratio(ink, plate);
+            assert!(
+                ink_ratio >= 4.5,
+                "{mode:?}: body ink on the 6% wash is {ink_ratio:.2}:1"
+            );
+            // ...and the wash is still visibly different from the bare panel.
+            assert_ne!(plate, surface, "{mode:?}: the plate is invisible");
+        }
     }
 }

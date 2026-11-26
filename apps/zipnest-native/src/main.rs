@@ -1835,6 +1835,10 @@ impl App {
             settings.context_menu = r.context_menu;
             settings.integration_applied = true;
         }
+        // The one launch that claimed the associations on a fresh profile.
+        // `apply_integration` already records "this happened" in
+        // `integration_applied`, so the notice needs no setting of its own.
+        let first_run = boot.as_ref().is_some_and(|r| r.associate);
         let assoc_rows = zipnest_ipc::shell::assoc_states(&zipnest_ipc::shell::WindowsRegistry);
         // Theme: light, dark, or whatever the system is set to. Applied here
         // rather than next to install_fonts because it needs the settings.
@@ -2022,7 +2026,8 @@ impl App {
             error: None,
             notice: settings_backup
                 .as_ref()
-                .map(|_| "settings.corrupt".to_string()),
+                .map(|_| "settings.corrupt".to_string())
+                .or_else(|| first_run.then(|| "first_run.default_set".to_string())),
             settings_backup,
             copied_at: None,
             lang,
@@ -3753,11 +3758,17 @@ impl App {
         let text = ui.visuals().text_color();
         {
             let painter = ui.painter().clone();
-            dashed_rect(
-                &painter,
+            // A tinted plate behind the dashed border: the old empty state was
+            // a hairline on the same fill as everything else, and read as "the
+            // list is broken" rather than "drop something here". `shade` keeps
+            // the accent opaque; the fill is the accent at a whisper of its
+            // RGB so it works on both themes without a second palette entry.
+            painter.rect_filled(
                 border,
-                ui.visuals().widgets.inactive.bg_stroke.color,
+                egui::CornerRadius::same(10),
+                theme::tint(accent, ui.visuals().panel_fill, 0.06),
             );
+            dashed_rect(&painter, border, accent);
             painter.text(
                 border.center() - egui::vec2(0.0, 30.0),
                 egui::Align2::CENTER_CENTER,
