@@ -1158,6 +1158,21 @@ fn should_close_when_done(
     auto_close && (ok || cancelled) && !incomplete && closes_window(kind)
 }
 
+/// The label of the finished-job window's sole button.
+///
+/// A successful test says 完成 ("Done") because the click only acknowledges the
+/// verdict and dismisses the window. Everything else says 关闭 ("Close"), the
+/// long-standing wording; for create/extract with auto-close on that click also
+/// ends the process. A *failed* test keeps 关闭 too — 完成 over a failed run
+/// reads as "passed".
+fn finished_button_label(kind: JobKind, ok: bool) -> &'static str {
+    if kind == JobKind::Test && ok {
+        "job.done"
+    } else {
+        "job.close"
+    }
+}
+
 #[derive(Default, Clone)]
 struct JobState {
     job_id: u64,
@@ -1725,6 +1740,11 @@ struct App {
     /// closed once its job is done when `settings.auto_close_after_job` is on.
     /// When to close after a finished job (short delay so the result is read).
     close_at: Option<std::time::Instant>,
+    /// What kind of job ran last. A cancel clears `self.job` immediately, so
+    /// the later `job_finished` event finds no job to ask — it needs this to
+    /// decide whether the auto-close rule covers that run. Without it a
+    /// cancelled *test* looked like the default `Extract` and the window quit.
+    last_job_kind: JobKind,
     /// Next attempt to take the primary role once the current holder is gone.
     primary_retry_at: std::time::Instant,
     /// Last window geometry written to settings (size + position) and when, so
@@ -2120,6 +2140,7 @@ impl App {
             published_busy: None,
             show_on_first_frame: true,
             close_at: None,
+            last_job_kind: JobKind::Extract,
             primary_retry_at: std::time::Instant::now(),
             saved_geometry: None,
             geometry_saved_at: None,
@@ -2402,13 +2423,13 @@ impl App {
         for (name, payload) in pending {
             match name.as_str() {
                 "job_progress" => {
-                    let j = self.job.get_or_insert_with(|| JobState {
-                        job_id: payload["job_id"].as_u64().unwrap_or(0),
-                        total_items: payload["total_items"].as_u64().unwrap_or(0),
-                        total_bytes: payload["total_bytes"].as_u64().unwrap_or(0),
-                        title: String::new(),
-                        ..Default::default()
-                    });
+                    // Events can trail in after the user cancelled (the job
+                    // thread reports a last tick on its way out). Rebuilding a
+                    // job from one would pop the window back up — and with
+                    // `JobState::default()` it would look like an Extract,
+                    // which is how a cancelled test could still quit the app.
+                    // A report is only ever an update of a job that exists.
+                    let Some(j) = self.job.as_mut() else { continue };
                     j.done_items = payload["done_items"].as_u64().unwrap_or(0);
                     j.total_items = payload["total_items"].as_u64().unwrap_or(0);
                     j.done_bytes = payload["done_bytes"].as_u64().unwrap_or(0);
@@ -2543,8 +2564,11 @@ impl App {
                     let ok = payload["ok"].as_bool().unwrap_or(false);
                     let err_key = payload["error_key"].as_str().map(|s| s.to_string());
                     let skipped = self.extract_skipped;
-                    {
-                        let j = self.job.get_or_insert_with(JobState::default);
+                    // A window the user dismissed is gone for good: a late
+                    // cancel result must not pop it back up as a fresh
+                    // "done" box. Only a job that is still on screen (or one
+                    // this event itself creates, below) may be updated.
+                    if let Some(j) = self.job.as_mut() {
                         j.ok = ok;
                         j.finished = true;
                         j.error_key = err_key.clone();
@@ -2700,7 +2724,7 @@ impl App {
                     // 测试同样不自动关：测完的那句话（哪些文件坏了）正是用户
                     // 决定「要不要真解压」所看的，关掉等于把问题答案一起关掉。
                     // 就地增删也不关：窗口关了用户就得自己把包重新打开一遍。
-                    let kind = self.job.as_ref().map(|j| j.kind).unwrap_or_default();
+                    let kind = self.job.as_ref().map(|j| j.kind).unwrap_or(self.last_job_kind);
                     let incomplete = self
                         .job
                         .as_ref()
@@ -4687,6 +4711,7 @@ impl App {
     /// new job begun inside that window used to inherit it and vanish mid-run.
     fn begin_job(&mut self, job: JobState) {
         self.close_at = None;
+        self.last_job_kind = job.kind;
         self.job = Some(job);
     }
 
@@ -6603,7 +6628,12 @@ impl App {
                             self.skipped_links_list(ui, &skipped_links);
                         }
                     }
-                    if ui.button(self.t("job.close")).clicked() {
+                    // A finished test says 完成, not 关闭: the click means "I have read
+                    // the verdict", and for a test it must only dismiss this
+                    // window — never end the app. Every other job keeps 关闭,
+                    // whose auto-close behaviour below is unchanged.
+                    let done_label = finished_button_label(j.kind, j.ok);
+                    if ui.button(self.t(done_label)).clicked() {
                         close = true;
                     }
                 } else {
@@ -6654,10 +6684,23 @@ impl App {
                 let _ = self.svc.cancel(j.job_id);
             }
             self.job = None;
+            // A cancelled *test* is over: tear its window down now instead of
+            // waiting for the job_finished event to flip it to a result view.
+            // Clearing self.job above is what made the event find no job at
+            // all — it then fell back to the default Extract, and with
+            // auto-close on, the whole window quit two seconds later.
+            if j.kind == JobKind::Test {
+                self.notice = Some("error.cancelled".into());
+            }
         }
         if close {
             self.job = None;
-            if self.settings.auto_close_after_job {
+            // Dismissing a finished window only ends the process for the two
+            // job kinds the auto-close switch is about (create / extract),
+            // and only when it is on. A test's 完成 must never take the app
+            // with it: the user is still browsing the archive to decide what
+            // to extract, and an in-place edit leaves them in the listing.
+            if self.settings.auto_close_after_job && closes_window(j.kind) {
                 self.close_at = None;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 // Do not make the user wait for the next scheduled frame: an
@@ -8850,7 +8893,7 @@ mod nav_tests {
 
 #[cfg(test)]
 mod auto_close_tests {
-    use super::{closes_window, should_close_when_done, JobKind};
+    use super::{closes_window, finished_button_label, should_close_when_done, JobKind};
 
     #[test]
     fn a_finished_test_never_closes_the_window() {
@@ -8900,6 +8943,29 @@ mod auto_close_tests {
         // 失败要人看错误；有链接没进包时那几条路径只在这个窗口里。
         assert!(!should_close_when_done(true, JobKind::Extract, false, false, false));
         assert!(!should_close_when_done(true, JobKind::Create, true, false, true));
+    }
+
+    #[test]
+    fn a_cancelled_job_still_follows_its_own_kind() {
+        // 点「取消」之后 `self.job` 立刻清空，`job_finished` 到得比界面晚；
+        // 判断种类必须回退到 `last_job_kind`。不然一次取消掉的测试会被当成
+        // 默认的解压：开着自动关闭时，用户只是想停下测试，整个软件却退了。
+        assert!(!should_close_when_done(true, JobKind::Test, false, true, false));
+        assert!(!should_close_when_done(true, JobKind::Update, false, true, false));
+        assert!(should_close_when_done(true, JobKind::Extract, false, true, false));
+        assert!(should_close_when_done(true, JobKind::Create, false, true, false));
+    }
+
+    #[test]
+    fn the_finished_button_says_done_for_a_test_and_close_otherwise() {
+        // 测试窗口的按钮是「完成」：它只收起窗口。压缩/解压仍然是「关闭」，
+        // 那个按钮在自动关闭开关打开时结束进程，是用户自己选的行为。
+        for kind in [JobKind::Extract, JobKind::Create, JobKind::Update] {
+            assert_eq!(finished_button_label(kind, true), "job.close", "{kind:?}");
+        }
+        assert_eq!(finished_button_label(JobKind::Test, true), "job.done");
+        // 测试失败时按钮仍是「关闭」——"完成"会读成"通过"。
+        assert_eq!(finished_button_label(JobKind::Test, false), "job.close");
     }
 }
 

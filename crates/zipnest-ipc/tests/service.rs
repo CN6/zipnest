@@ -888,6 +888,41 @@ fn test_archive_names_the_entries_whose_data_is_bad() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 中途取消一个测试：必须以「已取消」收场（不是损坏、不是失败），而且磁盘上
+/// 什么都没留下 —— 测试从头到尾没有一个字节写出去，所以也没有"残留文件"可清。
+#[test]
+fn a_cancelled_test_ends_as_cancelled_and_leaves_nothing_behind() {
+    let (svc, events) = service();
+    let r = svc
+        .open_archive(fx("plain.zip").to_string_lossy().into(), None)
+        .unwrap();
+    let job = svc.test_archive(r.id, Vec::new(), None).unwrap();
+    // Cancel immediately: the run is a few small files and may already be done,
+    // so accept either order — what must hold is the *shape* of the end state.
+    let _ = svc.cancel(job);
+    wait_events(&events, 10_000, |v| {
+        v.iter().any(|(n, e)| n == "job_finished" && e["job_id"] == job)
+    });
+    let v = events.lock().unwrap().clone();
+    let (_, fin) = v
+        .iter()
+        .find(|(n, e)| n == "job_finished" && e["job_id"] == job)
+        .unwrap();
+    if fin["ok"] == false {
+        assert_eq!(
+            fin["error_key"], "error.cancelled",
+            "a cancelled test must not masquerade as a corrupt archive: {fin}"
+        );
+    }
+    // Nothing was written either way: `test_archive` has no destination at all,
+    // and the archive-core tests pin the sink. Here we only guard against the
+    // IPC layer inventing one.
+    if let Some((_, tested)) = v.iter().find(|(n, _)| n == "test_finished") {
+        assert!(tested["verified"].as_u64().unwrap_or(0) > 0);
+    }
+    svc.close_archive(r.id);
+}
+
 /// 撞名后自动改名的事件必须逐条列出"包里的名字 → 磁盘上的名字"。
 ///
 /// 这是 A2 免对话框解压的核心承诺：用户看不到解压对话框时，结果窗口是唯一

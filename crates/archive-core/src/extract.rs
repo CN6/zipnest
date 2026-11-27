@@ -2013,4 +2013,76 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// Test mode must not create a single file, however many entries there are
+    /// — and that is the answer to "will the test leave files behind?": the
+    /// engine decodes each entry into a sink that only counts bytes, so there
+    /// is no partial output to clean up on success, failure or cancel.
+    #[test]
+    fn test_mode_writes_nothing_into_the_destination() {
+        let dir = scratch("test-mode-nothing");
+        let zip = make_zip(
+            &dir,
+            "a.zip",
+            &[("a.txt", b"one"), ("sub/b.txt", b"two"), ("sub/deep/c.bin", &[7u8; 4096])],
+        );
+        let arc = open(&zip);
+        let dest = dir.join("out");
+        // Deliberately does NOT pre-create the destination: a test that wrote
+        // anything at all would have to create it first.
+        let mut options = opts(&dest);
+        options.test_mode = true;
+        options.preserve_motw = true;
+
+        let mut calls = 0u32;
+        let stats = arc
+            .extract(&options, None, &mut |_p| {
+                calls += 1;
+                true
+            })
+            .expect("a clean archive tests fine");
+
+        assert_eq!(stats.files, 3, "all three files decoded and matched their CRC");
+        assert!(stats.failed.is_empty());
+        assert!(calls > 0, "progress was reported");
+        assert!(
+            !dest.exists(),
+            "test mode must not even create the destination directory: {}",
+            dest.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same on the cancel path: a test stopped midway leaves nothing behind
+    /// because there was never anywhere for bytes to go.
+    #[test]
+    fn a_cancelled_test_mode_run_leaves_no_files() {
+        let dir = scratch("test-mode-cancel");
+        // One entry per chunk is not controllable from here, so use several
+        // entries and stop on the first progress callback: enough to prove the
+        // cancel path never touches the destination.
+        let zip = make_zip(
+            &dir,
+            "a.zip",
+            &[("a.txt", b"one"), ("b.txt", b"two"), ("c.txt", b"three")],
+        );
+        let arc = open(&zip);
+        let dest = dir.join("out");
+        let mut options = opts(&dest);
+        options.test_mode = true;
+
+        let err = arc
+            .extract(&options, None, &mut |_p| false)
+            .expect_err("a callback that returns false cancels the run");
+        assert!(
+            matches!(err, crate::ZipnestError::Cancelled),
+            "cancel must surface as Cancelled, not a data error: {err:?}"
+        );
+        assert!(
+            !dest.exists(),
+            "a cancelled test must not create the destination either: {}",
+            dest.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
