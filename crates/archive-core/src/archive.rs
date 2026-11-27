@@ -23,6 +23,19 @@ const MAX_PREALLOC_ENTRIES: u32 = 4096;
 pub struct Archive {
     raw: *mut c_void,   // IInArchive (owned)
     stream: *mut c_void, // IInStream retained by the handler (owned)
+    /// The `Split` handler that assembled a multi-volume set, when this archive
+    /// was opened from `<base>.001`.
+    ///
+    /// It must stay open for as long as the archive is used: the combined
+    /// `IInStream` obtained through `IInArchiveGetStream` is a `CMultiStream`
+    /// that reads its volumes *through the Split handler's own state*.
+    /// 7-Zip 26.06 changed this — calling `Close` on the Split archive right
+    /// after `GetStream` (which is what this code did, and what 26.03–26.04
+    /// tolerated) makes every later decode of that stream fail as
+    /// `S_FALSE` + `IsNotArc`. CI caught it because the runner image carries
+    /// 26.06; the local machine had 26.04. Closed in `Drop`, after `raw` and
+    /// after the combined stream has been released.
+    split: Option<*mut c_void>,
     /// Full listing, enumerated on first use and shared from then on.
     ///
     /// Every entry costs six `GetProperty` round trips, and callers re-list on
@@ -181,6 +194,7 @@ impl Archive {
                 return Ok(Archive {
                     raw,
                     stream: stream.into_raw(),
+                    split: None,
                     entries: OnceLock::new(),
                     key_verified: key_verified_for(clsid),
                     source: path.to_path_buf(),
@@ -271,6 +285,9 @@ impl Archive {
         }
 
         // --- Stage 2: fetch the combined, seekable stream. ---
+        // The Split archive is NOT closed here: `combined` reads its volumes
+        // through that object's state (see `Archive::split`). It moves into the
+        // returned `Archive` and is closed in `Drop`.
         let mut combined: *mut c_void = std::ptr::null_mut();
         let hr = unsafe {
             let qi_vt = &**(split_raw as *const *const InArchiveVt);
@@ -287,11 +304,10 @@ impl Archive {
             let gs_vt = &**(gs_iface as *const *const InArchiveGetStreamVt);
             let ghr = (gs_vt.get_stream)(gs_iface, 0, &mut combined);
             (gs_vt.release)(gs_iface);
-            (qi_vt.close)(split_raw);
-            (qi_vt.release)(split_raw);
             ghr
         };
         if hr_failed(hr) || combined.is_null() {
+            close_split(split_raw);
             return Err(ZipnestError::NotAnArchive);
         }
 
@@ -325,6 +341,9 @@ impl Archive {
                 return Ok(Archive {
                     raw,
                     stream: combined,
+                    // Ownership passes to the Archive: `Drop` closes this after
+                    // the combined stream has been released.
+                    split: Some(split_raw),
                     entries: OnceLock::new(),
                     key_verified: key_verified_for(clsid),
                     source: path.to_path_buf(),
@@ -340,7 +359,10 @@ impl Archive {
             }
             last_err = map_open_error(hr, &state, error_flags);
         }
+        // Same order as `Drop`: the combined stream is released while the
+        // Split handler it reads through is still open.
         unsafe { instream::release_raw(combined) };
+        close_split(split_raw);
         Err(last_err)
     }
 
@@ -642,10 +664,16 @@ impl Drop for Archive {
             let vt = &**(self.raw as *const *const InArchiveVt);
             (vt.close)(self.raw);
             (vt.release)(self.raw);
-            // Release the retained input stream last. Dispatch through the
-            // object's own vtable: it may be ours (single file) or the engine's
-            // `CMultiStream` (assembled volumes).
+            // Release the retained input stream before the Split handler it
+            // reads through: the stream's destructor may still touch it. Then
+            // the Split archive, which must have stayed alive for every read
+            // of that stream (see `Archive::split`).
             instream::release_raw(self.stream);
+            if let Some(split) = self.split.take() {
+                let svt = &**(split as *const *const InArchiveVt);
+                (svt.close)(split);
+                (svt.release)(split);
+            }
         }
     }
 }

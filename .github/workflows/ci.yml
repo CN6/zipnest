@@ -50,6 +50,19 @@ jobs:
       - name: cargo test (workspace)
         run: cargo test --workspace
 
+      # The suite above uses whatever 7-Zip the runner image ships (26.06 on
+      # windows-2025-vs2026), and the app ships the vendored 26.03. Those two
+      # diverged on multi-volume support once already: from 26.06 on, the
+      # combined `IInArchiveGetStream` stream stops working as soon as its
+      # Split archive is closed, so every `.001` open failed on CI while the
+      # maintainer's 26.04 machine stayed green (2026-11-27). Run the archive
+      # tests again against the DLL the installer actually ships, so neither
+      # side of that gap can go silent again.
+      - name: cargo test against the vendored 7z.dll
+        env:
+          SEVENZIP_DLL_PATH: ${{ github.workspace }}\vendor\7zip-bin\7z.dll
+        run: cargo test -p archive-core -p zipnest-ipc
+
       - name: cargo clippy (workspace, warnings are errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
