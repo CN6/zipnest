@@ -148,7 +148,9 @@ impl Archive {
         if candidates.is_empty() {
             return Err(ZipnestError::NotAnArchive);
         }
-        let file = std::fs::File::open(path)?;
+        // Validate the file is readable once; each candidate below opens its
+        // own handle.
+        std::fs::File::open(path)?;
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let file_name = path
             .file_name()
@@ -157,7 +159,15 @@ impl Archive {
 
         let mut last_err = ZipnestError::NotAnArchive;
         for clsid in &candidates {
-            let stream = FileStreamOwner::new(file.try_clone()?)?;
+            // A fresh handle per handler, not `try_clone()`: on Windows a
+            // duplicated handle shares the file pointer, so the second
+            // candidate would start reading where the first one stopped and
+            // reject a file whose bytes it would have recognised. That is
+            // invisible for a common extension (one candidate, no prior read)
+            // and breaks every probe for an extension the table does not know
+            // — an extensionless `.zst` failed every handler including zstd's
+            // own, CI 2026-11-27).
+            let stream = FileStreamOwner::new(std::fs::File::open(path)?)?;
             let mut raw: *mut c_void = std::ptr::null_mut();
             let hr = unsafe {
                 dll.create_object(
