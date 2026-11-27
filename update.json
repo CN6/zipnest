@@ -1,19 +1,19 @@
 {
   "assets": [
     {
-      "name": "ZipNest_0.5.5_x64-setup.exe",
-      "sha256": "88da9593d540c29be2348227ad781e95044ab6ab1b4464e6714441621e556961",
-      "size": 5283202
+      "name": "ZipNest_0.5.6_x64-setup.exe",
+      "sha256": "cf06a7bf3e51b84cf57ed61994be22d78cfdceb216429bf7aca16b6bdf9600e2",
+      "size": 5282114
     },
     {
-      "name": "ZipNest_0.5.5_x64_portable.zip",
-      "sha256": "8b74c9a6365ad020d243cb3a769e7ef43fb90d3fa7aae57d8f9cbf6d9270ab57",
-      "size": 6698159
+      "name": "ZipNest_0.5.6_x64_portable.zip",
+      "sha256": "4c5c581467cf5633e4b30d1a87008585e0e645506e781508f6205b1aecd50c62",
+      "size": 6698541
     }
   ],
   "date": "2026-11-27",
   "min_version": "0.4.0",
-  "notes_en": "测试完点「完成」只关窗口，取消也不会退出软件",
-  "notes_zh": "测试完点「完成」只关窗口，取消也不会退出软件",
-  "version": "0.5.5"
+  "notes_en": "分卷压缩包在最新 7-Zip 引擎下能正常打开了",
+  "notes_zh": "分卷压缩包在最新 7-Zip 引擎下能正常打开了",
+  "version": "0.5.6"
 }
