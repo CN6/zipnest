@@ -193,6 +193,40 @@ fn cut_to_max(s: &mut String) {
     *s = format!("{}{}", &head[..cut], tail);
 }
 
+/// Append `infix` to a component and cut the base name so the result still fits
+/// in [`MAX_COMPONENT`] bytes, keeping the extension readable.
+///
+/// Both the collision renamer (`plan_entry_paths`) and the on-disk
+/// `OnConflict::Rename` policy need the same property: a component may already
+/// be 255 bytes, so appending anything produces a name Windows refuses with
+/// `ERROR_INVALID_NAME` — and the file is never written. `infix` goes before a
+/// short trailing extension (`.txt` stays visible, as `name (2).txt`).
+pub fn append_cut(comp: &str, infix: &str) -> String {
+    let (head, tail) = match comp.rfind('.') {
+        // Same "short trailing group is an extension" rule as `cut_to_max`.
+        Some(dot) if dot > 0 && comp.len() - dot <= 24 => (&comp[..dot], &comp[dot..]),
+        _ => (comp, ""),
+    };
+    let mut cut = (MAX_COMPONENT.saturating_sub(infix.len() + tail.len())).min(head.len());
+    while cut > 0 && !head.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{}{}", &head[..cut], infix, tail)
+}
+
+/// Append `suffix` to the end of a whole component (extension included) and cut
+/// the component so the result fits in [`MAX_COMPONENT`] bytes.
+///
+/// For suffixes that do not want to split a name from its extension — e.g. the
+/// temp-file marker, where the whole original name is just the base.
+pub fn append_cut_end(comp: &str, suffix: &str) -> String {
+    let mut cut = (MAX_COMPONENT.saturating_sub(suffix.len())).min(comp.len());
+    while cut > 0 && !comp.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{}", &comp[..cut], suffix)
+}
+
 /// Clean one path component. `None` means the component could not name
 /// anything at all and is dropped.
 fn clean_component(comp: &str, fixes: &mut Vec<EntryPathFix>) -> Option<String> {
@@ -275,12 +309,15 @@ pub fn plan_entry_path(raw: &str) -> (String, Vec<EntryPathFix>) {
 }
 
 /// `name (n).ext` for a collision, keeping the extension readable.
+///
+/// The source component may itself be [`MAX_COMPONENT`] bytes (an over-long
+/// archive name was already cut by [`clean_component`]), so appending the
+/// suffix naively would produce a 259-byte component that Windows rejects with
+/// `ERROR_INVALID_NAME` — the collided file would never be written. The base
+/// name is shortened instead, exactly like [`cut_to_max`] does for the
+/// over-long case, so the result always fits.
 fn rename_component(comp: &str, n: usize) -> String {
-    let suffix = format!(" ({n})");
-    match comp.rfind('.') {
-        Some(dot) if dot > 0 => format!("{}{}{}", &comp[..dot], suffix, &comp[dot..]),
-        _ => format!("{comp}{suffix}"),
-    }
+    append_cut(comp, &format!(" ({n})"))
 }
 
 /// Index of the first component that stops `path` from being usable, or `None`
@@ -585,5 +622,88 @@ mod tests {
         assert_eq!(planned[1].path, "sub", "a second directory entry is the same directory");
         assert_eq!(planned[2].path, "sub");
         assert_eq!(planned[3].path, "sub/x.txt");
+    }
+
+    // ---- collision renames must stay writable (255-byte components) ----
+
+    #[test]
+    fn append_cut_keeps_the_extension_and_the_limit() {
+        let long = format!("{}.txt", "x".repeat(251)); // 255 bytes
+        let renamed = append_cut(&long, " (2)");
+        assert_eq!(renamed.len(), MAX_COMPONENT, "must land exactly on the limit");
+        assert!(renamed.ends_with(" (2).txt"), "{renamed}");
+        // No extension: the suffix still fits and the head is cut.
+        let bare = "y".repeat(255);
+        let renamed = append_cut(&bare, " (2)");
+        assert_eq!(renamed.len(), MAX_COMPONENT);
+        assert!(renamed.ends_with(" (2)"));
+        // Multi-byte heads are cut on a char boundary, never inside a char.
+        let wide = "宽".repeat(85); // 255 bytes, no extension
+        let renamed = append_cut(&wide, " (2)");
+        assert!(renamed.len() <= MAX_COMPONENT);
+        assert_eq!(renamed, format!("{} (2)", "宽".repeat(83)));
+        // A short name is untouched apart from the suffix.
+        assert_eq!(append_cut("a.txt", " (2)"), "a (2).txt");
+        assert_eq!(append_cut("a", " (2)"), "a (2)");
+    }
+
+    #[test]
+    fn append_cut_end_keeps_whole_component_in_limit() {
+        assert_eq!(append_cut_end("a.txt", ".part"), "a.txt.part");
+        let long = "z".repeat(255);
+        let out = append_cut_end(&long, ".part");
+        assert_eq!(out.len(), MAX_COMPONENT);
+        assert!(out.ends_with(".part"));
+        let wide = "宽".repeat(85);
+        let out = append_cut_end(&wide, ".part");
+        assert!(out.len() <= MAX_COMPONENT);
+        assert!(out.ends_with(".part"));
+    }
+
+    #[test]
+    fn two_max_length_names_still_get_distinct_writable_paths() {
+        // Two entries whose names are both exactly 255 bytes and that clean to
+        // the same path (a trailing dot is stripped, so both plan to `a…a`).
+        // The second must move aside — and the renamed component must still fit
+        // in 255 bytes, or Windows rejects it (`os error 123`) and the file is
+        // never written.
+        let a = "a".repeat(255);
+        let same_with_dot = format!("{a}.");
+        let entries: Vec<(String, bool)> = vec![(a.clone(), false), (same_with_dot, false)];
+        let planned = plan_entry_paths(&entries);
+        assert_eq!(planned[0].path, a);
+        assert_ne!(planned[1].path, a);
+        assert!(
+            planned[1].fixes.contains(&EntryPathFix::Collision),
+            "fixes: {:?}",
+            planned[1].fixes
+        );
+        for p in &planned {
+            for comp in p.path.split('/') {
+                assert!(comp.len() <= MAX_COMPONENT, "{comp:?} is {} bytes", comp.len());
+            }
+        }
+        // With an extension: `…(255 bytes).txt` renamed keeps `.txt` visible.
+        let ext_long = format!("{}.txt", "e".repeat(251));
+        let entries: Vec<(String, bool)> = vec![(ext_long.clone(), false), (ext_long.clone(), false)];
+        let planned = plan_entry_paths(&entries);
+        assert_eq!(planned[0].path, ext_long);
+        assert!(planned[1].path.len() <= MAX_COMPONENT);
+        assert!(planned[1].path.ends_with(" (2).txt"), "{}", planned[1].path);
+    }
+
+    #[test]
+    fn a_hundred_max_length_collisions_all_fit() {
+        // Attempt numbers grow the suffix; every one must stay writable and
+        // distinct (this is where a naive append would blow the limit first).
+        let long = format!("{}.dat", "f".repeat(251));
+        let entries: Vec<(String, bool)> = (0..100).map(|_| (long.clone(), false)).collect();
+        let planned = plan_entry_paths(&entries);
+        let unique: HashSet<String> = planned.iter().map(|p| p.path.to_lowercase()).collect();
+        assert_eq!(unique.len(), planned.len());
+        for p in &planned {
+            assert!(p.path.len() <= MAX_COMPONENT, "{} is {} bytes", p.path, p.path.len());
+            assert!(p.path.ends_with(".dat"));
+        }
     }
 }

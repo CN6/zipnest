@@ -836,7 +836,6 @@ fn has_link_ancestor(root: &std::path::Path, path: &std::path::Path) -> bool {
 /// (`os error 123`) and that file would never be written.
 fn temp_sibling(dest: &std::path::Path) -> Option<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
-    const MAX_COMPONENT: usize = 255;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = dest.file_name()?;
     let suffix = format!(
@@ -844,17 +843,8 @@ fn temp_sibling(dest: &std::path::Path) -> Option<PathBuf> {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     );
-    let mut base = name.to_string_lossy().into_owned();
-    if base.len() + suffix.len() > MAX_COMPONENT {
-        let mut cut = MAX_COMPONENT.saturating_sub(suffix.len());
-        while cut > 0 && !base.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        base.truncate(cut);
-    }
-    let mut tmp = std::ffi::OsString::from(base);
-    tmp.push(suffix);
-    Some(dest.with_file_name(tmp))
+    let base = archive_security::append_cut_end(&name.to_string_lossy(), &suffix);
+    Some(dest.with_file_name(std::ffi::OsString::from(base)))
 }
 
 /// First free `name (n).ext` next to `dest`; used by [`OnConflict::Rename`].
@@ -875,7 +865,12 @@ fn unique_dest(dest: &std::path::Path) -> Option<PathBuf> {
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
     for n in 2..10_000u32 {
-        let cand = parent.join(format!("{stem} ({n}){ext}"));
+        // The base name can itself be 255 bytes; appending ` (n)` without
+        // cutting would make a component Windows rejects (`os error 123`).
+        let cand = parent.join(archive_security::append_cut(
+            &format!("{stem}{ext}"),
+            &format!(" ({n})"),
+        ));
         if !os_exists(&cand) {
             return Some(cand);
         }
@@ -1695,7 +1690,7 @@ fn _future_use(_: &PropVariant, _: fn() -> ZipnestError) {
 
 #[cfg(test)]
 mod tests {
-    use super::{conflicts_in, conflicts_on_disk, has_link_ancestor};
+    use super::{conflicts_in, conflicts_on_disk, has_link_ancestor, unique_dest};
     use crate::archive::Archive;
     use crate::types::{ArchiveEntry, ArchiveOpenOptions, ExtractOptions, OnConflict};
     use std::path::{Path, PathBuf};
@@ -2083,6 +2078,35 @@ mod tests {
             "a cancelled test must not create the destination either: {}",
             dest.display()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_dest_never_returns_an_over_long_component() {
+        let dir = scratch("unique-dest-long");
+        // A 255-byte file already in the way; the renamed candidate must still
+        // be a component Windows accepts, or `os error 123` loses the entry.
+        let long_name = format!("{}.txt", "q".repeat(251));
+        std::fs::write(dir.join(&long_name), b"taken").unwrap();
+        let cand = unique_dest(&dir.join(&long_name)).expect("a free name exists");
+        let comp = cand.file_name().unwrap().to_str().unwrap();
+        assert!(comp.len() <= 255, "{comp:?} is {} bytes", comp.len());
+        assert!(comp.ends_with(" (2).txt"), "{comp:?}");
+        // It must not collide with the file already there, either.
+        assert_ne!(comp, long_name);
+        // And it has to be writable for real, not just shorter than a constant.
+        std::fs::write(&cand, b"ok").expect("the renamed candidate is writable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_dest_walks_past_names_already_taken() {
+        let dir = scratch("unique-dest-walk");
+        let base = dir.join("a.txt");
+        std::fs::write(&base, b"one").unwrap();
+        std::fs::write(dir.join("a (2).txt"), b"two").unwrap();
+        let cand = unique_dest(&base).expect("a free name exists");
+        assert_eq!(cand.file_name().unwrap(), "a (3).txt");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
