@@ -1,19 +1,19 @@
 {
   "assets": [
     {
-      "name": "ZipNest_0.5.3_x64-setup.exe",
-      "sha256": "43afad6779da9260165685850f4cdfeb489a42e466bea56db6c1cf3ad963b3c1",
-      "size": 5283367
+      "name": "ZipNest_0.5.4_x64-setup.exe",
+      "sha256": "88c1054964f9fc3a745198b4b1c815de15f3876b6e569ff4710621b339ae2e39",
+      "size": 5284025
     },
     {
-      "name": "ZipNest_0.5.3_x64_portable.zip",
-      "sha256": "a86749f9a38cdf5e2233eb7147594b3d8a65303819e3d4bf461ecdb571f836c5",
-      "size": 6699777
+      "name": "ZipNest_0.5.4_x64_portable.zip",
+      "sha256": "45dc57dd1cbe5955add67b7035b483124ae2bbec2bec6f9422b833e4edd737de",
+      "size": 6698731
     }
   ],
   "date": "2026-11-27",
   "min_version": "0.4.0",
-  "notes_en": "解压前先验一遍、能改压缩包、更多格式",
-  "notes_zh": "解压前先验一遍、能改压缩包、更多格式",
-  "version": "0.5.3"
+  "notes_en": "测试完的结论会留在窗口里，不再一闪而过",
+  "notes_zh": "测试完的结论会留在窗口里，不再一闪而过",
+  "version": "0.5.4"
 }
