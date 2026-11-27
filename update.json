@@ -1,19 +1,19 @@
 {
   "assets": [
     {
-      "name": "ZipNest_0.5.6_x64-setup.exe",
-      "sha256": "cf06a7bf3e51b84cf57ed61994be22d78cfdceb216429bf7aca16b6bdf9600e2",
-      "size": 5282114
+      "name": "ZipNest_0.5.7_x64-setup.exe",
+      "sha256": "9bea3c23aaaec4f07eb05ffafb832fadf0aa5535103591236f619eaabe40f8d8",
+      "size": 5282564
     },
     {
-      "name": "ZipNest_0.5.6_x64_portable.zip",
-      "sha256": "4c5c581467cf5633e4b30d1a87008585e0e645506e781508f6205b1aecd50c62",
-      "size": 6698541
+      "name": "ZipNest_0.5.7_x64_portable.zip",
+      "sha256": "c913f8724d911a83558863a37f6d5a2a8c5022c4192ba80a4b332958a9f41c02",
+      "size": 6698046
     }
   ],
   "date": "2026-11-27",
   "min_version": "0.4.0",
-  "notes_en": "分卷压缩包在最新 7-Zip 引擎下能正常打开了",
-  "notes_zh": "分卷压缩包在最新 7-Zip 引擎下能正常打开了",
-  "version": "0.5.6"
+  "notes_en": "超长文件名的同名文件不再解不出来",
+  "notes_zh": "超长文件名的同名文件不再解不出来",
+  "version": "0.5.7"
 }
