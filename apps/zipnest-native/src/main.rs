@@ -1121,7 +1121,7 @@ fn run_apply_update(args: &[String]) -> i32 {
     0
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 enum JobKind {
     /// The default: an extract started from the archive view.
     #[default]
@@ -1132,6 +1132,30 @@ enum JobKind {
     Test,
     /// An in-place edit of the open archive (add files / remove entries).
     Update,
+}
+
+/// Whether the auto-close setting covers this kind of job.
+///
+/// The setting says 压缩或解压 / "create or extract", and the result window is
+/// why: it is where the outcome and the destination are read. A test is
+/// deliberately outside it — its verdict is exactly what the user looks at
+/// before deciding whether to extract at all — and so is an in-place edit,
+/// which leaves the user sitting in the archive view it just rewrote.
+fn closes_window(kind: JobKind) -> bool {
+    matches!(kind, JobKind::Extract | JobKind::Create)
+}
+
+/// The whole "close the window when the job ends" rule in one place, so every
+/// clause has a test. [`closes_window`] holds the kind rule; the call site
+/// comments why an incomplete create never closes.
+fn should_close_when_done(
+    auto_close: bool,
+    kind: JobKind,
+    ok: bool,
+    cancelled: bool,
+    incomplete: bool,
+) -> bool {
+    auto_close && (ok || cancelled) && !incomplete && closes_window(kind)
 }
 
 #[derive(Default, Clone)]
@@ -1165,6 +1189,13 @@ struct JobState {
     /// Number of entries the last test run verified intact (`test_finished`).
     /// Only meaningful when `kind == JobKind::Test`.
     test_verified: u64,
+    /// The wording this job's result window shows, chosen when the job
+    /// finished. It is kept on the job rather than read from `App::notice`
+    /// because that is a three-second status-bar toast: the window can outlive
+    /// it, and once the toast expired every finished job fell back to a bare
+    /// 完成 — a test in particular lost its whole point ("checked, N files
+    /// intact"). `None` until the job ends.
+    result_key: Option<String>,
     /// The entry the engine is on right now, shown under the progress bar.
     /// Empty until the first named report.
     current_path: String,
@@ -2271,6 +2302,13 @@ impl App {
 
     fn notice_text(&self) -> Option<String> {
         let key = self.notice.as_deref()?;
+        Some(self.expand_result_key(key))
+    }
+
+    /// Render a result key with its `{count}` / `{path}` placeholders filled
+    /// from the current job. Shared by the status-bar toast and the result
+    /// window, which must say the same thing even after the toast is gone.
+    fn expand_result_key(&self, key: &str) -> String {
         let mut text = self.t(key);
         if key == "job.ok_skipped" {
             let n = self.job.as_ref().map(|j| j.skipped).unwrap_or(0);
@@ -2296,7 +2334,7 @@ impl App {
             let path = self.settings_backup.clone().unwrap_or_default();
             text = text.replace("{path}", &path);
         }
-        Some(text)
+        text
     }
 
     /// Attach an explanation to a field's help mark.
@@ -2580,8 +2618,7 @@ impl App {
                             .as_ref()
                             .map(|j| j.kind == JobKind::Test)
                             .unwrap_or(false);
-                        self.notice = Some(
-                            if is_update {
+                        let result_key: &str = if is_update {
                                 "job.update.ok"
                             } else if is_test {
                                 // A test does not unpack anything, so none of
@@ -2603,9 +2640,13 @@ impl App {
                                 "job.ok_skipped"
                             } else {
                                 "job.ok"
-                            }
-                            .into(),
-                        );
+                            };
+                        self.notice = Some(result_key.into());
+                        // The result window outlives the toast below, so it
+                        // gets its own copy of the wording.
+                        if let Some(j) = self.job.as_mut() {
+                            j.result_key = Some(result_key.into());
+                        }
                         // Three seconds, then the line goes away. The result
                         // window (still open, if the user has not closed it)
                         // holds the same words plus the destination, so
@@ -2655,12 +2696,23 @@ impl App {
                     //
                     // 有链接没进包时窗口不自动关：那几条路径和「哪些没打进去」
                     // 只在这个窗口里，两秒后就没了，用户会以为备份是完整的。
+                    //
+                    // 测试同样不自动关：测完的那句话（哪些文件坏了）正是用户
+                    // 决定「要不要真解压」所看的，关掉等于把问题答案一起关掉。
+                    // 就地增删也不关：窗口关了用户就得自己把包重新打开一遍。
+                    let kind = self.job.as_ref().map(|j| j.kind).unwrap_or_default();
                     let incomplete = self
                         .job
                         .as_ref()
                         .map(|j| j.create_skipped > 0)
                         .unwrap_or(false);
-                    if self.settings.auto_close_after_job && (ok || cancelled) && !incomplete {
+                    if should_close_when_done(
+                        self.settings.auto_close_after_job,
+                        kind,
+                        ok,
+                        cancelled,
+                        incomplete,
+                    ) {
                         self.close_at =
                             Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
                     }
@@ -2803,7 +2855,7 @@ impl App {
             self.error = Some(self.t("error.io"));
             return;
         };
-        self.job = Some(JobState {
+        self.begin_job(JobState {
             job_id: 0,
             kind: JobKind::Create,
             title: self.t("create.title"),
@@ -2918,7 +2970,7 @@ impl App {
 
     /// Start the in-place edit job.
     fn begin_update(&mut self, id: u64, add: Vec<String>, remove: Vec<String>) {
-        self.job = Some(JobState {
+        self.begin_job(JobState {
             job_id: 0,
             kind: JobKind::Update,
             title: self.t("edit.title"),
@@ -4629,6 +4681,15 @@ impl App {
         }
     }
 
+    /// Put a job on screen. Every start goes through here so a timer left over
+    /// from the previous job cannot close the window out from under this one:
+    /// `close_at` is two seconds away at the end of an auto-closed run, and a
+    /// new job begun inside that window used to inherit it and vanish mid-run.
+    fn begin_job(&mut self, job: JobState) {
+        self.close_at = None;
+        self.job = Some(job);
+    }
+
     /// Start an extract job and point the progress window at it.
     ///
     /// Returns the error key when the job was refused. A refusal for want of a
@@ -4637,7 +4698,7 @@ impl App {
     /// error the user can do nothing about.
     fn begin_extract(&mut self, req: ExtractRequest, password: Option<String>) -> Option<String> {
         self.last_extract = Some(req.clone());
-        self.job = Some(JobState {
+        self.begin_job(JobState {
             job_id: 0,
             title: self.t("extract.title"),
             delete_archive: req.delete_archive,
@@ -4677,7 +4738,7 @@ impl App {
     /// Returns the error key when the job was refused; a password refusal is
     /// left to the caller, which re-arms the prompt with the request intact.
     fn begin_test(&mut self, req: TestRequest, password: Option<String>) -> Option<String> {
-        self.job = Some(JobState {
+        self.begin_job(JobState {
             job_id: 0,
             kind: JobKind::Test,
             title: self.t("test.title"),
@@ -5461,7 +5522,7 @@ impl App {
                         None
                     },
                 };
-                self.job = Some(JobState {
+                self.begin_job(JobState {
                     job_id: 0,
                     kind: JobKind::Create,
                     title: self.t("create.title"),
@@ -6455,7 +6516,10 @@ impl App {
                         };
                         ui.colored_label(
                             colour,
-                            self.notice_text().unwrap_or_else(|| self.t("job.ok")),
+                            j.result_key
+                                .as_deref()
+                                .map(|k| self.expand_result_key(k))
+                                .unwrap_or_else(|| self.t("job.ok")),
                         );
                         // Where the files went. The app picks the folder, so it
                         // is the one thing the user cannot work out themselves.
@@ -8781,6 +8845,61 @@ mod nav_tests {
         assert_eq!(anchor, 1);
         let names: Vec<_> = sel.iter().cloned().collect();
         assert_eq!(names, vec!["b"]);
+    }
+}
+
+#[cfg(test)]
+mod auto_close_tests {
+    use super::{closes_window, should_close_when_done, JobKind};
+
+    #[test]
+    fn a_finished_test_never_closes_the_window() {
+        // 测试的结论就是用户决定「要不要真解压」的依据，自动关窗等于把答案
+        // 一起关掉。设置项自己写的是「压缩或解压完成后」，测试不在其中。
+        for ok in [true, false] {
+            for cancelled in [true, false] {
+                assert!(
+                    !should_close_when_done(true, JobKind::Test, ok, cancelled, false),
+                    "test job must stay open (ok={ok}, cancelled={cancelled})"
+                );
+            }
+        }
+        assert!(!closes_window(JobKind::Test));
+    }
+
+    #[test]
+    fn an_in_place_edit_never_closes_the_window() {
+        // 增删条目之后用户还站在那个包的列表上；窗口一关，得自己重新打开。
+        assert!(!should_close_when_done(true, JobKind::Update, true, false, false));
+        assert!(!closes_window(JobKind::Update));
+    }
+
+    #[test]
+    fn extract_and_create_still_close_when_the_setting_is_on() {
+        for kind in [JobKind::Extract, JobKind::Create] {
+            assert!(should_close_when_done(true, kind, true, false, false), "{kind:?}");
+            // A cancel is the user's own doing; it keeps the old behaviour.
+            assert!(should_close_when_done(true, kind, false, true, false), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_setting_off_means_nothing_closes() {
+        for kind in [
+            JobKind::Extract,
+            JobKind::Create,
+            JobKind::Test,
+            JobKind::Update,
+        ] {
+            assert!(!should_close_when_done(false, kind, true, false, false), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_failure_or_an_incomplete_create_keeps_the_window() {
+        // 失败要人看错误；有链接没进包时那几条路径只在这个窗口里。
+        assert!(!should_close_when_done(true, JobKind::Extract, false, false, false));
+        assert!(!should_close_when_done(true, JobKind::Create, true, false, true));
     }
 }
 
